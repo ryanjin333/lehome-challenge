@@ -425,14 +425,17 @@ peft_wheel="/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.w
 PYTHONSAFEPATH=1 PYTHONPATH="$peft_wheel" "$python_bin" "$root/scripts/verify_native_reference_evaluator_gate.py" \
   prepare-peft-overlay --receipt "$2" >/dev/null
 flash_wheel="/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+dm_tree_wheel="/mnt/lehome/reference-native/dependencies/dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
 PYTHONSAFEPATH=1 "$python_bin" "$root/scripts/verify_native_reference_evaluator_gate.py" \
   prepare-flash-attention-overlay --receipt "$3" >/dev/null
 mkdir -m 0700 /flash/site-packages
-"$python_bin" - /deps/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl /flash/site-packages <<'PY'
-import os, sys, zipfile
+"$python_bin" - "$flash_wheel" "$dm_tree_wheel" /flash/site-packages <<'PY'
+import hashlib, os, sys, zipfile
 from pathlib import Path
 
-flash_wheel, target = map(Path, sys.argv[1:])
+flash_wheel, dm_tree_wheel, target = map(Path, sys.argv[1:])
+if hashlib.sha256(dm_tree_wheel.read_bytes()).hexdigest() != "294dc1cecf87552a45cdd5ddb215e7f5295a5a47c46f1f0a0463c3dd02a527d7":
+    raise SystemExit("dm-tree wheel identity mismatch")
 lerobot_wheel = Path("/runtime/lerobot-0.4.3-py3-none-any.whl")
 with zipfile.ZipFile(lerobot_wheel) as archive:
     archive.extractall(target)
@@ -443,17 +446,22 @@ with zipfile.ZipFile(flash_wheel) as archive:
             top_level.startswith("flash_attn-") and top_level.endswith(".dist-info")
         ):
             archive.extract(item, target)
+with zipfile.ZipFile(dm_tree_wheel) as archive:
+    archive.extractall(target)
 PY
 PYTHONPATH="$pythonpath" "$python_bin" -c 'import lerobot.scripts.lerobot_train'
 PYTHONPATH="$pythonpath" "$python_bin" - "$4" "$5" "$6" <<'PY'
 import importlib.metadata, importlib.util, json, os, sys
 from pathlib import Path
 
-import flash_attn, torch
+import flash_attn, torch, tree
 from flash_attn import flash_attn_func
+from lerobot.policies.groot import groot_n1
 
 if importlib.metadata.version("flash_attn") != "2.8.3":
     raise SystemExit("FlashAttention package metadata identity is invalid")
+if importlib.metadata.version("dm-tree") != "0.1.9":
+    raise SystemExit("dm-tree package metadata identity is invalid")
 if torch.__version__ != "2.7.0+cu128" or torch.version.cuda != "12.8":
     raise SystemExit("FlashAttention requires torch 2.7.0+cu128 with CUDA 12.8")
 if bool(torch._C._GLIBCXX_USE_CXX11_ABI) is not True:
@@ -464,6 +472,14 @@ origin = str(Path(flash_attn.__file__).resolve())
 expected = "/flash/site-packages/flash_attn/__init__.py"
 if origin != expected:
     raise SystemExit("FlashAttention installed runtime identity is invalid")
+tree_origin = str(Path(tree.__file__).resolve())
+expected_tree = "/flash/site-packages/tree/__init__.py"
+if tree_origin != expected_tree:
+    raise SystemExit("dm-tree installed runtime identity is invalid")
+if tree.map_structure(lambda left, right: left + right, {"joint": 1}, {"joint": 2}) != {"joint": 3}:
+    raise SystemExit("dm-tree map_structure runtime probe failed")
+if groot_n1.tree is not tree:
+    raise SystemExit("LeRobot GR00T did not import the verified dm-tree module")
 query = torch.randn((1, 2, 4, 64), dtype=torch.float16, device="cuda")
 output = flash_attn_func(query, query, query, causal=False)
 torch.cuda.synchronize()
@@ -578,15 +594,19 @@ sudo -n docker run --rm -i --pull never --gpus all --network none \
   --mount "type=bind,src=$dataset_blobs,dst=$dataset_blobs,readonly" \
   --mount "type=bind,src=$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl,dst=/runtime/lerobot-0.4.3-py3-none-any.whl,readonly" \
   --mount "type=bind,src=/mnt/lehome/reference-native/dependencies,dst=/deps,readonly" \
+  --mount "type=bind,src=/mnt/lehome/reference-native/dependencies,dst=/mnt/lehome/reference-native/dependencies,readonly" \
   --entrypoint bash "$runtime_image_id" -s -- "$source_root" "$eagle_home" "$hf_cache" "$staging_root" <<'CONTAINER' 2>&1 | tee "$staging_root/logs/train.log"
 set -euo pipefail
 source_root="$1"; eagle_home="$2"; hf_cache="$3"; staging_root="$4"
 python_bin=/opt/lehome-challenge/.venv/bin/python
 mkdir -m 0700 /flash/site-packages
-"$python_bin" - /deps/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl /flash/site-packages <<'PY'
-import sys, zipfile
+dm_tree_wheel="/mnt/lehome/reference-native/dependencies/dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+"$python_bin" - /deps/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl "$dm_tree_wheel" /flash/site-packages <<'PY'
+import hashlib, sys, zipfile
 from pathlib import Path
-flash_wheel, target = map(Path, sys.argv[1:])
+flash_wheel, dm_tree_wheel, target = map(Path, sys.argv[1:])
+if hashlib.sha256(dm_tree_wheel.read_bytes()).hexdigest() != "294dc1cecf87552a45cdd5ddb215e7f5295a5a47c46f1f0a0463c3dd02a527d7":
+    raise SystemExit("dm-tree wheel identity mismatch")
 lerobot_wheel = Path("/runtime/lerobot-0.4.3-py3-none-any.whl")
 with zipfile.ZipFile(lerobot_wheel) as archive:
     archive.extractall(target)
@@ -597,10 +617,29 @@ with zipfile.ZipFile(flash_wheel) as archive:
             top_level.startswith("flash_attn-") and top_level.endswith(".dist-info")
         ):
             archive.extract(item, target)
+with zipfile.ZipFile(dm_tree_wheel) as archive:
+    archive.extractall(target)
 PY
 cd "$source_root"
 export HF_HOME="$eagle_home" HF_LEROBOT_HOME="$eagle_home/lerobot" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"
 PYTHONPATH="/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl" /opt/lehome-challenge/.venv/bin/python -c 'import lerobot.scripts.lerobot_train'
+PYTHONPATH="/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl" /opt/lehome-challenge/.venv/bin/python - <<'PY'
+import importlib.metadata
+from pathlib import Path
+
+import tree
+from lerobot.policies.groot import groot_n1
+
+if importlib.metadata.version("dm-tree") != "0.1.9":
+    raise SystemExit("dm-tree package metadata identity is invalid")
+expected_tree = "/flash/site-packages/tree/__init__.py"
+if str(Path(tree.__file__).resolve()) != expected_tree:
+    raise SystemExit("dm-tree installed runtime identity is invalid")
+if tree.map_structure(lambda left, right: left + right, {"joint": 1}, {"joint": 2}) != {"joint": 3}:
+    raise SystemExit("dm-tree map_structure runtime probe failed")
+if groot_n1.tree is not tree:
+    raise SystemExit("LeRobot GR00T did not import the verified dm-tree module")
+PY
 PYTHONPATH="/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl" /opt/lehome-challenge/.venv/bin/lerobot-train --config_path=configs/train_groot.yaml --wandb.mode=offline
 CONTAINER
 test -d "$upstream_output" && test ! -L "$upstream_output"

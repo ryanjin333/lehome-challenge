@@ -125,6 +125,8 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'prepare-flash-attention-overlay --receipt "$3"' in text
     assert '"$staging_root/evidence/flash-attention-overlay-receipt.json"' in text
     assert 'flash_wheel="/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"' in text
+    assert 'dm_tree_wheel="/mnt/lehome/reference-native/dependencies/dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"' in text
+    assert '294dc1cecf87552a45cdd5ddb215e7f5295a5a47c46f1f0a0463c3dd02a527d7' in text
     pinned_preflight = text.index('sudo -n docker run --rm -i --pull never --gpus all --network none')
     preflight_command = text[pinned_preflight:text.index("<<'CONTAINER'", pinned_preflight)]
     assert '--user "$(id -u):$(id -g)"' not in preflight_command
@@ -141,6 +143,14 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'importlib.metadata.version("flash_attn")' in text
     assert 'lerobot_wheel = Path("/runtime/lerobot-0.4.3-py3-none-any.whl")' in text
     assert 'with zipfile.ZipFile(lerobot_wheel) as archive:' in text
+    assert text.count('with zipfile.ZipFile(dm_tree_wheel) as archive:') == 2
+    assert 'import tree' in text
+    assert 'importlib.metadata.version("dm-tree")' in text
+    assert 'expected_tree = "/flash/site-packages/tree/__init__.py"' in text
+    assert 'tree.map_structure(lambda left, right: left + right, {"joint": 1}, {"joint": 2})' in text
+    assert 'groot_n1.tree is not tree' in text
+    assert '"dm_tree_version":' not in text
+    assert '"dm_tree_origin":' not in text
     assert "import lerobot.scripts.lerobot_train" in text
     assert '--mount "type=bind,src=$hf_cache,dst=$hf_cache,readonly"' in text
     assert 'dataset_blobs="$(' in text
