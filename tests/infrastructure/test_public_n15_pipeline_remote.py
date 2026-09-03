@@ -135,6 +135,9 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert "prepare-peft-overlay" not in host_preflight
     assert "prepare-flash-attention-overlay" not in host_preflight
     assert 'flash_attn_2_cuda' in text
+    assert 'top_level.startswith("flash_attn-")' in text
+    assert 'top_level.endswith(".dist-info")' in text
+    assert 'importlib.metadata.version("flash_attn")' in text
     assert 'lerobot_wheel = Path("/runtime/lerobot-0.4.3-py3-none-any.whl")' in text
     assert 'with zipfile.ZipFile(lerobot_wheel) as archive:' in text
     assert "import lerobot.scripts.lerobot_train" in text

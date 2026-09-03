@@ -438,17 +438,22 @@ with zipfile.ZipFile(lerobot_wheel) as archive:
     archive.extractall(target)
 with zipfile.ZipFile(flash_wheel) as archive:
     for item in archive.infolist():
-        if item.filename.startswith(("flash_attn/", "flash_attn_2_cuda")):
+        top_level = item.filename.partition("/")[0]
+        if item.filename.startswith(("flash_attn/", "flash_attn_2_cuda")) or (
+            top_level.startswith("flash_attn-") and top_level.endswith(".dist-info")
+        ):
             archive.extract(item, target)
 PY
 PYTHONPATH="$pythonpath" "$python_bin" -c 'import lerobot.scripts.lerobot_train'
 PYTHONPATH="$pythonpath" "$python_bin" - "$4" "$5" "$6" <<'PY'
-import importlib.util, json, os, sys
+import importlib.metadata, importlib.util, json, os, sys
 from pathlib import Path
 
 import flash_attn, torch
 from flash_attn import flash_attn_func
 
+if importlib.metadata.version("flash_attn") != "2.8.3":
+    raise SystemExit("FlashAttention package metadata identity is invalid")
 if torch.__version__ != "2.7.0+cu128" or torch.version.cuda != "12.8":
     raise SystemExit("FlashAttention requires torch 2.7.0+cu128 with CUDA 12.8")
 if bool(torch._C._GLIBCXX_USE_CXX11_ABI) is not True:
@@ -586,7 +591,10 @@ with zipfile.ZipFile(lerobot_wheel) as archive:
     archive.extractall(target)
 with zipfile.ZipFile(flash_wheel) as archive:
     for item in archive.infolist():
-        if item.filename.startswith(("flash_attn/", "flash_attn_2_cuda")):
+        top_level = item.filename.partition("/")[0]
+        if item.filename.startswith(("flash_attn/", "flash_attn_2_cuda")) or (
+            top_level.startswith("flash_attn-") and top_level.endswith(".dist-info")
+        ):
             archive.extract(item, target)
 PY
 cd "$source_root"
