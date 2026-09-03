@@ -2354,6 +2354,140 @@ run_pipeline_after_runtime
     assert not list(Path(env["LEHOME_N15_PIPELINE_ROOT"]).glob(".harvest-*.??????"))
 
 
+@pytest.mark.parametrize("hang_point", ["runtime", "reconcile", "publication"])
+def test_aggregate_watchdog_reaps_hung_post_start_lifecycle_before_stop_and_unlock(
+    tmp_path: Path, hang_point: str,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, f"n15-aggregate-{hang_point}")
+    pipeline = Path(env["LEHOME_N15_PIPELINE_ROOT"])
+    trace = tmp_path / "trace"
+    started_marker = tmp_path / "provider-started"
+    stopped_marker = tmp_path / "provider-stopped"
+    descendant_pid = tmp_path / "hung-descendant-pid"
+    module = _load_cli()
+    plan = pipeline / "lifecycle-plan.json"
+    assert module.main([
+        "lifecycle-plan", "--run-id", env["LEHOME_N15_RUN_ID"],
+        "--repository", env["LEHOME_N15_PUBLIC_HF_REPOSITORY"],
+        "--remote-pipeline-root", env["LEHOME_N15_REMOTE_PIPELINE_ROOT"],
+        "--budget-usd", "100", "--estimated-cost-usd", "72",
+        "--output", str(plan),
+    ]) == 0
+    started = int(time.time()) - 86_397
+    paid_deadline = {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_paid_deadline_v1",
+        "run_id": env["LEHOME_N15_RUN_ID"],
+        "lifecycle_plan_sha256": hashlib.sha256(plan.read_bytes()).hexdigest(),
+        "started_unix_seconds": started,
+        "deadline_unix_seconds": started + 86_400,
+    }
+    deadline_path = pipeline / "paid-deadline.json"
+    deadline_path.write_bytes(_canonical_json_bytes(paid_deadline)); deadline_path.chmod(0o444)
+    deadline_before = deadline_path.read_bytes()
+    harness = r'''
+source "$WRAPPER_PATH"
+acquire_controller_lock() { printf 'lock\n' >> "$TRACE"; }
+release_controller_lock() {
+  [[ -f "$STOPPED_MARKER" ]] || { printf 'unlock-before-stop\n' >> "$TRACE"; return 92; }
+  printf 'unlock\n' >> "$TRACE"
+}
+capture_exact_provider_state() {
+  case "$1" in
+    STOPPED) [[ ! -f "$STARTED_MARKER" ]] || return 1 ;;
+    RUNNING) [[ -f "$STARTED_MARKER" ]] || return 1 ;;
+    *) return 1 ;;
+  esac
+  : > "$2"
+}
+nebius() {
+  [[ "$*" == "compute instance start"* ]] || return 93
+  printf 'start\n' >> "$TRACE"; : > "$STARTED_MARKER"
+}
+stop_exact_vm() {
+  if [[ -f "$DESCENDANT_PID" ]]; then
+    child="$(cat "$DESCENDANT_PID")"
+    state="$(ps -o stat= -p "$child" 2>/dev/null || true)"
+    [[ -z "$state" || "$state" == Z* ]] || { printf 'stop-before-reap\n' >> "$TRACE"; return 1; }
+  fi
+  printf 'stop\n' >> "$TRACE"; : > "$STOPPED_MARKER"
+}
+host_next_unfinished_stage() { printf 'train\n'; }
+wait_for_ssh_readiness() { :; }
+hang_lifecycle() {
+  command python3 - "$DESCENDANT_PID" <<'PY' &
+import os
+from pathlib import Path
+import signal
+import sys
+
+os.setsid()
+Path(sys.argv[1]).write_text(f"{os.getpid()}\n", encoding="ascii")
+signal.signal(signal.SIGTERM, lambda *_args: None)
+while True:
+    signal.pause()
+PY
+  child=$!
+  while [[ ! -f "$DESCENDANT_PID" ]]; do /bin/sleep 0.01; done
+  printf 'hang:%s\n' "$HANG_POINT" >> "$TRACE"
+  wait "$child"
+}
+if [[ "$HANG_POINT" == runtime ]]; then
+  wait_for_remote_runtime() { hang_lifecycle; }
+else
+  wait_for_remote_runtime() { :; }
+fi
+if [[ "$HANG_POINT" == reconcile ]]; then
+  reconcile_remote_stage_seals() { hang_lifecycle; }
+else
+  reconcile_remote_stage_seals() { :; }
+fi
+remote_file_exists() { [[ "$1" == "$TRAINING_IDENTITY_RECEIPT" ]]; }
+verify_remote_training_chain() { :; }
+if [[ "$HANG_POINT" == publication ]]; then
+  publish_training_readback() { hang_lifecycle; }
+else
+  publish_training_readback() { return 94; }
+fi
+main
+'''
+    process = subprocess.Popen(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env,
+            "WRAPPER_PATH": str(WRAPPER),
+            "TRACE": str(trace),
+            "STARTED_MARKER": str(started_marker),
+            "STOPPED_MARKER": str(stopped_marker),
+            "DESCENDANT_PID": str(descendant_pid),
+            "HANG_POINT": hang_point,
+        },
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        if descendant_pid.exists():
+            try:
+                os.kill(int(descendant_pid.read_text(encoding="ascii")), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        stdout, stderr = process.communicate(timeout=3)
+        pytest.fail(f"aggregate watchdog did not terminate {hang_point}: {stdout!r} {stderr!r}")
+
+    assert process.returncode != 0
+    lines = trace.read_text(encoding="ascii").splitlines()
+    assert lines[:3] == ["lock", "start", f"hang:{hang_point}"]
+    assert "stop-before-reap" not in lines
+    assert lines[-2:] == ["stop", "unlock"]
+    assert deadline_path.read_bytes() == deadline_before
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(descendant_pid.read_text(encoding="ascii")), 0)
+
+
 def test_running_observation_waits_for_cloud_init_after_ssh_is_ready(tmp_path: Path) -> None:
     """A transient runtime gate must not stop a guest that has already accepted SSH."""
     fake_bin = tmp_path / "bin"; fake_bin.mkdir()

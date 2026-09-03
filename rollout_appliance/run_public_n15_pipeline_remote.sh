@@ -73,6 +73,9 @@ PIPELINE_COMPLETE=0
 PROVIDER_CLEANUP_REQUIRED=0
 ACTIVE_PAID_STAGE_PID=""
 ACTIVE_PAID_STAGE_PGID=""
+ACTIVE_LIFECYCLE_PID=""
+ACTIVE_LIFECYCLE_PGID=""
+ACTIVE_LIFECYCLE_ROOT=""
 CONTROLLER_LOCK_FD=""
 CONTROLLER_LOCK_PATH=""
 PRESTART_ADMITTED_STAGE=""
@@ -338,11 +341,114 @@ PY
   ACTIVE_PAID_STAGE_PGID=""
 }
 
+lifecycle_descendant_groups() {
+  command python3 - "$1" <<'PY'
+import subprocess
+import sys
+
+root = int(sys.argv[1])
+rows = []
+for line in subprocess.run(
+    ["ps", "-axo", "pid=,ppid=,pgid="],
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout.splitlines():
+    fields = line.split()
+    if len(fields) == 3:
+        rows.append(tuple(map(int, fields)))
+descendants = {root}
+changed = True
+while changed:
+    changed = False
+    for pid, parent, _group in rows:
+        if parent in descendants and pid not in descendants:
+            descendants.add(pid)
+            changed = True
+groups = {group for pid, _parent, group in rows if pid in descendants and group > 0}
+for group in sorted(groups):
+    print(group)
+PY
+}
+
+terminate_active_lifecycle() {
+  local attempt discovered_pgid="" descendant_groups="" group
+  if [[ -z "$ACTIVE_LIFECYCLE_PGID" && -n "$ACTIVE_LIFECYCLE_PID" ]]; then
+    discovered_pgid="$(command python3 - "$ACTIVE_LIFECYCLE_PID" <<'PY' || true
+import os
+import sys
+
+pid = int(sys.argv[1])
+try:
+    pgid = os.getpgid(pid)
+    session = os.getsid(pid)
+except ProcessLookupError:
+    raise SystemExit(0)
+if pgid == pid and session == pid:
+    print(pgid)
+PY
+)"
+    if [[ "$discovered_pgid" == "$ACTIVE_LIFECYCLE_PID" ]]; then
+      ACTIVE_LIFECYCLE_PGID="$discovered_pgid"
+    fi
+  fi
+  if [[ -n "$ACTIVE_LIFECYCLE_PGID" ]]; then
+    descendant_groups="$(lifecycle_descendant_groups "$ACTIVE_LIFECYCLE_PID" || true)"
+    # Signal nested sessions first while their ancestry is still observable.
+    # This includes the existing paid-stage setsid group, but never the
+    # controller, which is the lifecycle leader's parent rather than child.
+    for group in $descendant_groups; do
+      [[ "$group" == "$ACTIVE_LIFECYCLE_PGID" ]] \
+        || kill -TERM -- "-$group" 2>/dev/null || true
+    done
+    kill -TERM -- "-$ACTIVE_LIFECYCLE_PGID" 2>/dev/null || true
+    # The lifecycle child reaps any nested detached paid-stage group in its
+    # EXIT trap.  Its existing TERM grace is five seconds; leave enough room
+    # for that cleanup before escalating the outer group.
+    for (( attempt = 1; attempt <= 30; attempt++ )); do
+      paid_stage_group_has_live_member "$ACTIVE_LIFECYCLE_PGID" || break
+      sleep 0.2
+    done
+    if paid_stage_group_has_live_member "$ACTIVE_LIFECYCLE_PGID"; then
+      kill -KILL -- "-$ACTIVE_LIFECYCLE_PGID" 2>/dev/null || true
+    fi
+    # A TERM-ignoring nested session may outlive the outer shell's trap.  Kill
+    # every group captured from the controller-owned ancestry before waiting
+    # or allowing provider cleanup/singleton release.
+    for group in $descendant_groups; do
+      if paid_stage_group_has_live_member "$group"; then
+        kill -KILL -- "-$group" 2>/dev/null || true
+      fi
+    done
+  elif [[ -n "$ACTIVE_LIFECYCLE_PID" ]]; then
+    kill -TERM "$ACTIVE_LIFECYCLE_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$ACTIVE_LIFECYCLE_PID" ]]; then
+    wait "$ACTIVE_LIFECYCLE_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$ACTIVE_LIFECYCLE_PGID" ]] \
+    && paid_stage_group_has_live_member "$ACTIVE_LIFECYCLE_PGID"; then
+    return 1
+  fi
+  for group in $descendant_groups; do
+    paid_stage_group_has_live_member "$group" && return 1
+  done
+  [[ -z "$ACTIVE_LIFECYCLE_ROOT" ]] || rm -rf -- "$ACTIVE_LIFECYCLE_ROOT"
+  ACTIVE_LIFECYCLE_PID=""
+  ACTIVE_LIFECYCLE_PGID=""
+  ACTIVE_LIFECYCLE_ROOT=""
+}
+
 controller_cleanup() {
   local status=$?
   local cleanup_failed=0
   trap - EXIT
   trap '' INT TERM
+  while ! terminate_active_lifecycle; do
+    cleanup_failed=1
+    printf 'error: post-start lifecycle group survived cleanup; retaining controller lock and retrying\n' >&2
+    sleep 1
+  done
   while ! terminate_active_paid_stage; do
     cleanup_failed=1
     printf 'error: paid-stage process group survived cleanup; retaining controller lock and retrying\n' >&2
@@ -1709,6 +1815,168 @@ run_pipeline_after_runtime() {
   PIPELINE_COMPLETE=1
 }
 
+post_start_lifecycle() {
+  local aggregate_deadline="$1" response running_observed reconciled_stage admitted_timeout admitted_deadline
+  response="$PIPELINE_ROOT/.provider-start.$$.json"
+  running_observed=0
+  for _ in {1..60}; do
+    if capture_exact_provider_state RUNNING "$response"; then running_observed=1; break; fi
+    rm -f -- "$response"; sleep 2
+  done
+  (( running_observed == 1 )) && [[ -f "$response" && ! -L "$response" ]] \
+    || fail "exact VM did not reach RUNNING"
+  rm -f -- "$response"
+  wait_for_ssh_readiness || fail "exact VM did not become SSH-ready"
+  wait_for_remote_runtime || fail "runtime/cloud-init/workspace/GPU/upstream gate failed"
+  reconcile_remote_stage_seals
+  reconciled_stage="$(host_next_unfinished_stage)" \
+    || fail "reconciled host-sealed stage is invalid"
+  if [[ "$reconciled_stage" != "$PRESTART_ADMITTED_STAGE" ]]; then
+    PRESTART_ADMITTED_STAGE="$reconciled_stage"
+    case "$PRESTART_ADMITTED_STAGE" in
+      train) admitted_timeout="$TRAIN_TIMEOUT_SECONDS" ;;
+      focused_gate) admitted_timeout="$FOCUSED_TIMEOUT_SECONDS" ;;
+      harvest) admitted_timeout="$HARVEST_TIMEOUT_SECONDS" ;;
+      *) fail "reconciled host-sealed stage is invalid" ;;
+    esac
+    # Re-read and validate the immutable receipt, but never mint or substitute
+    # a later aggregate deadline after the provider has started.
+    verify_conservative_task_budget "$DEADLINE_RECEIPT" \
+      || fail "conservative provider budget admission failed"
+    (( $(date +%s) < aggregate_deadline )) || fail "aggregate paid deadline has expired"
+    admitted_deadline="$(initialize_stage_deadline "$PRESTART_ADMITTED_STAGE" "$admitted_timeout" "$aggregate_deadline")" \
+      || fail "$PRESTART_ADMITTED_STAGE deadline receipt is invalid"
+    (( $(date +%s) < admitted_deadline )) \
+      || fail "$PRESTART_ADMITTED_STAGE deadline has expired"
+  fi
+  if [[ "$RESUME_PARTIAL" == 1 ]] \
+    && remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; then
+    fail "explicit partial resume is forbidden after canonical training publication exists"
+  fi
+  run_pipeline_after_runtime
+}
+
+lifecycle_child_cleanup() {
+  local status=$?
+  trap - EXIT
+  trap '' INT TERM
+  terminate_active_paid_stage || status=2
+  exit "$status"
+}
+
+run_aggregate_supervised_lifecycle() {
+  local aggregate_deadline="$1"
+  local launcher_root definitions driver ready ack acknowledged pid ready_pid acknowledged_pid now status attempt
+  launcher_root="$(mktemp -d "$PIPELINE_ROOT/.lifecycle-launcher.XXXXXX")"
+  definitions="$launcher_root/functions.sh"
+  driver="$launcher_root/driver.sh"
+  ready="$launcher_root/ready"
+  ack="$launcher_root/ack"
+  acknowledged="$launcher_root/acknowledged"
+  declare -f > "$definitions"
+  chmod 0600 "$definitions"
+  command printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'source "$1"' \
+    'source "$2"' \
+    'PRESTART_ADMITTED_STAGE="$3"' \
+    'trap '\''exit 130'\'' INT' \
+    'trap '\''exit 143'\'' TERM' \
+    'trap lifecycle_child_cleanup EXIT' \
+    'post_start_lifecycle "$4"' > "$driver"
+  chmod 0700 "$driver"
+  command python3 - "$driver" "$SCRIPT_DIR/run_public_n15_pipeline_remote.sh" "$definitions" \
+    "$PRESTART_ADMITTED_STAGE" "$aggregate_deadline" "$ready" "$ack" "$acknowledged" <<'PY' &
+import os
+from pathlib import Path
+import sys
+import time
+
+driver, wrapper, definitions, admitted_stage, aggregate_deadline = sys.argv[1:6]
+ready, ack, acknowledged = map(Path, sys.argv[6:9])
+os.setsid()
+descriptor = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+    stream.write(f"{os.getpid()}\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    try:
+        value = ack.read_text(encoding="ascii")
+    except FileNotFoundError:
+        value = ""
+    if value == f"{os.getpid()}\n":
+        descriptor = os.open(
+            acknowledged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+            stream.write(f"{os.getpid()}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        break
+    if value:
+        raise SystemExit(74)
+    time.sleep(0.01)
+else:
+    raise SystemExit(75)
+os.execv(
+    driver,
+    [driver, wrapper, definitions, admitted_stage, aggregate_deadline],
+)
+PY
+  pid=$!
+  ACTIVE_LIFECYCLE_PID="$pid"
+  ACTIVE_LIFECYCLE_PGID=""
+  ACTIVE_LIFECYCLE_ROOT="$launcher_root"
+  ready_pid=""
+  for (( attempt = 1; attempt <= 250; attempt++ )); do
+    if [[ -f "$ready" && ! -L "$ready" ]]; then
+      ACTIVE_LIFECYCLE_PGID="$pid"
+      IFS= read -r ready_pid < "$ready"
+      [[ "$ready_pid" == "$pid" ]] || { terminate_active_lifecycle || true; return 1; }
+      break
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    now="$(date +%s)"
+    (( now < aggregate_deadline )) || { terminate_active_lifecycle || true; return 124; }
+    sleep 0.02
+  done
+  [[ "$ready_pid" == "$pid" ]] || { terminate_active_lifecycle || true; return 1; }
+  ( umask 077; set -o noclobber; printf '%s\n' "$pid" > "$ack" ) \
+    || { terminate_active_lifecycle || true; return 1; }
+  acknowledged_pid=""
+  for (( attempt = 1; attempt <= 250; attempt++ )); do
+    if [[ -f "$acknowledged" && ! -L "$acknowledged" ]]; then
+      IFS= read -r acknowledged_pid < "$acknowledged"
+      [[ "$acknowledged_pid" == "$pid" ]] \
+        || { terminate_active_lifecycle || true; return 1; }
+      break
+    fi
+    paid_stage_group_has_live_member "$pid" || break
+    now="$(date +%s)"
+    (( now < aggregate_deadline )) || { terminate_active_lifecycle || true; return 124; }
+    sleep 0.02
+  done
+  [[ "$acknowledged_pid" == "$pid" ]] \
+    || { terminate_active_lifecycle || true; return 1; }
+  while paid_stage_group_has_live_member "$pid"; do
+    now="$(date +%s)"
+    if (( now >= aggregate_deadline )); then
+      terminate_active_lifecycle || return 125
+      return 124
+    fi
+    sleep 1
+  done
+  if wait "$pid"; then status=0; else status=$?; fi
+  ACTIVE_LIFECYCLE_PID=""
+  ACTIVE_LIFECYCLE_PGID=""
+  ACTIVE_LIFECYCLE_ROOT=""
+  rm -rf -- "$launcher_root"
+  return "$status"
+}
+
 main() {
 [[ $# -eq 0 ]] || fail "this wrapper accepts no positional arguments"
 [[ "$RESUME_PARTIAL" == 0 || "$RESUME_PARTIAL" == 1 ]] || fail "resume-partial mode must be explicitly 0 or 1"
@@ -1778,39 +2046,14 @@ admitted_deadline="$(initialize_stage_deadline "$PRESTART_ADMITTED_STAGE" "$admi
 response="$PIPELINE_ROOT/.provider-start.$$.json"; capture_exact_provider_state STOPPED "$response" || fail "Nebius Compute API is unavailable or exact VM is not stopped"; rm -f -- "$response"
 PROVIDER_CLEANUP_REQUIRED=1
 nebius compute instance start --id "$EXACT_VM_ID" --format json --no-browser --no-progress --no-check-update --retries 1 --timeout 60s >/dev/null
-running_observed=0
-for _ in {1..60}; do
-  if capture_exact_provider_state RUNNING "$response"; then running_observed=1; break; fi
-  rm -f -- "$response"; sleep 2
-done
-(( running_observed == 1 )) && [[ -f "$response" && ! -L "$response" ]] || fail "exact VM did not reach RUNNING"
+run_aggregate_supervised_lifecycle "$aggregate_deadline" \
+  || fail "post-start lifecycle failed or exceeded the immutable aggregate deadline"
+response="$PIPELINE_ROOT/.provider-terminal-confirmation.$$.json"
+capture_exact_provider_state STOPPED "$response" \
+  || fail "post-start lifecycle completed without an exact STOPPED VM"
 rm -f -- "$response"
-wait_for_ssh_readiness || fail "exact VM did not become SSH-ready"
-wait_for_remote_runtime || fail "runtime/cloud-init/workspace/GPU/upstream gate failed"
-reconcile_remote_stage_seals
-reconciled_stage="$(host_next_unfinished_stage)" \
-  || fail "reconciled host-sealed stage is invalid"
-if [[ "$reconciled_stage" != "$PRESTART_ADMITTED_STAGE" ]]; then
-  PRESTART_ADMITTED_STAGE="$reconciled_stage"
-  case "$PRESTART_ADMITTED_STAGE" in
-    train) admitted_timeout="$TRAIN_TIMEOUT_SECONDS" ;;
-    focused_gate) admitted_timeout="$FOCUSED_TIMEOUT_SECONDS" ;;
-    harvest) admitted_timeout="$HARVEST_TIMEOUT_SECONDS" ;;
-    *) fail "reconciled host-sealed stage is invalid" ;;
-  esac
-  aggregate_deadline="$(initialize_deadline)" || fail "aggregate paid deadline is invalid"
-  verify_conservative_task_budget "$DEADLINE_RECEIPT" \
-    || fail "conservative provider budget admission failed"
-  (( $(date +%s) < aggregate_deadline )) || fail "aggregate paid deadline has expired"
-  admitted_deadline="$(initialize_stage_deadline "$PRESTART_ADMITTED_STAGE" "$admitted_timeout" "$aggregate_deadline")" \
-    || fail "$PRESTART_ADMITTED_STAGE deadline receipt is invalid"
-  (( $(date +%s) < admitted_deadline )) \
-    || fail "$PRESTART_ADMITTED_STAGE deadline has expired"
-fi
-if [[ "$RESUME_PARTIAL" == 1 ]] && remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; then
-  fail "explicit partial resume is forbidden after canonical training publication exists"
-fi
-run_pipeline_after_runtime
+PROVIDER_CLEANUP_REQUIRED=0
+PIPELINE_COMPLETE=1
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
