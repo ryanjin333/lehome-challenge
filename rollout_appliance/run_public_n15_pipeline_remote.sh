@@ -781,6 +781,7 @@ if (
     receipt.is_symlink() or not stat.S_ISREG(receipt_metadata.st_mode)
     or stat.S_IMODE(receipt_metadata.st_mode) != 0o444
     or training.is_symlink() or not stat.S_ISDIR(training_metadata.st_mode)
+    or training.resolve(strict=True) != training
 ):
     raise SystemExit("training publication receipt or root is unsafe")
 cache_metadata = cache_root.lstat()
@@ -805,7 +806,138 @@ if (
     or stat.S_IMODE(readback_metadata.st_mode) & 0o077
 ):
     raise SystemExit("training publication readback cache is unsafe")
-raw = receipt.read_bytes(); value = json.loads(raw)
+
+def bounded_regular_bytes(path, maximum):
+    metadata = path.lstat()
+    if (
+        path.is_symlink() or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size > maximum or path.resolve(strict=True) != path
+    ):
+        raise SystemExit("training publication metadata file is unsafe or oversized")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(descriptor)
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, maximum + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > maximum:
+                raise SystemExit("training publication metadata file exceeds its size bound")
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        ):
+            raise SystemExit("training publication metadata changed while reading")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+def streaming_sha256(path, allowed_root, *, allow_internal_symlink=False):
+    path, allowed_root = Path(path), Path(allowed_root).resolve(strict=True)
+    try:
+        path.absolute().relative_to(allowed_root)
+    except ValueError:
+        raise SystemExit("training publication artifact escaped its protected root") from None
+    if path.is_symlink():
+        if not allow_internal_symlink:
+            raise SystemExit("training publication artifact is an unsafe symlink")
+        source = path.resolve(strict=True)
+    else:
+        source = path
+        if source.resolve(strict=True) != source:
+            raise SystemExit("training publication artifact path contains a symlink")
+    try:
+        source.relative_to(allowed_root)
+    except ValueError:
+        raise SystemExit("training publication artifact symlink escaped its cache") from None
+    metadata = source.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit("training publication artifact is not regular")
+    descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(descriptor)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        ):
+            raise SystemExit("training publication artifact changed while hashing")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+def verified_training_tree(training, receipt):
+    root = os.open(
+        training,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW,
+    )
+    current = {}
+    def hash_entry(parent, name):
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise SystemExit("training publication tree contains an unsafe entry")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            if (
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            ):
+                raise SystemExit("training publication artifact changed while hashing")
+            return digest.hexdigest()
+        finally:
+            os.close(descriptor)
+    def visit(parent, parts):
+        for entry in sorted(os.scandir(parent), key=lambda candidate: candidate.name):
+            if entry.name in {"", ".", ".."} or "/" in entry.name:
+                raise SystemExit("training publication tree name is unsafe")
+            relative = PurePosixPath(*parts, entry.name).as_posix()
+            metadata = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
+                if relative == "checkpoints/last" and os.readlink(entry.name, dir_fd=parent) == "012000":
+                    continue
+                raise SystemExit("training publication tree contains an unsafe symlink")
+            if stat.S_ISDIR(metadata.st_mode):
+                child = os.open(
+                    entry.name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW,
+                    dir_fd=parent,
+                )
+                try:
+                    visit(child, (*parts, entry.name))
+                finally:
+                    os.close(child)
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise SystemExit("training publication tree contains an unsafe entry")
+            if relative == "training-publication.json" or relative.startswith(".training-publication.json."):
+                continue
+            current[relative] = hash_entry(parent, entry.name)
+    try:
+        visit(root, ())
+        return current
+    finally:
+        os.close(root)
+
+raw = bounded_regular_bytes(receipt, 64 * 1024 * 1024); value = json.loads(raw)
 if raw != (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii"):
     raise SystemExit("training publication is not canonical")
 if (
@@ -833,18 +965,8 @@ for item in value["entries"]:
     ):
         raise SystemExit("training publication entry is invalid")
     expected[relative] = digest
-current = {}
-for path in sorted(training.rglob("*")):
-    relative = path.relative_to(training).as_posix()
-    metadata = path.lstat()
-    if path.is_symlink() or stat.S_ISDIR(metadata.st_mode):
-        continue
-    if not stat.S_ISREG(metadata.st_mode) or path == receipt or relative.startswith(".training-publication.json."):
-        if path != receipt:
-            raise SystemExit("training publication tree contains an unsafe entry")
-        continue
-    current[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
-if current != expected or expected.get("training-identity.json") != hashlib.sha256((training / "training-identity.json").read_bytes()).hexdigest():
+current = verified_training_tree(training, receipt)
+if current != expected:
     raise SystemExit("training publication does not bind the current verified training tree")
 revision = value["immutable_revision"]
 tree = HfApi(token=False).list_repo_tree(
@@ -863,7 +985,7 @@ for relative, digest in expected.items():
         repo_id=repository, repo_type="model", filename=prefix + "/" + relative,
         revision=revision, token=False, cache_dir=str(readback_cache),
     )
-    if hashlib.sha256(Path(fetched).read_bytes()).hexdigest() != digest:
+    if streaming_sha256(fetched, readback_cache, allow_internal_symlink=True) != digest:
         raise SystemExit("immutable publication revision byte mismatch")
 PY
 SH
@@ -1715,19 +1837,20 @@ publish_training_readback() {
 set -euo pipefail
 root="$1"; repository="$2"; prefix="$3"; token_file="$4"; cache_root="$5"; test -f "$token_file" && test ! -L "$token_file"; export HF_TOKEN="$(cat "$token_file")"
 python3 - "$root" "$repository" "$prefix" "$cache_root" <<'PY'
-import hashlib, json, os, re, sys, tempfile
-import stat
-from pathlib import Path
+import hashlib, json, os, re, shutil, stat, sys, tempfile
+from pathlib import Path, PurePosixPath
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError
 root, repository, prefix, cache_root = sys.argv[1:]
 directory, cache_root = Path(root), Path(cache_root)
 receipt = directory / "training-publication.json"
-if receipt.exists(): raise SystemExit("training publication receipt already exists")
+if receipt.exists() or receipt.is_symlink(): raise SystemExit("training publication receipt already exists")
 directory_metadata = directory.lstat()
 cache_metadata = cache_root.lstat()
 if (
-    directory.is_symlink() or not stat.S_ISDIR(directory_metadata.st_mode)
+    not directory.is_absolute() or directory.is_symlink()
+    or not stat.S_ISDIR(directory_metadata.st_mode)
+    or directory.resolve(strict=True) != directory
     or not cache_root.is_absolute() or cache_root.is_symlink()
     or not stat.S_ISDIR(cache_metadata.st_mode)
     or cache_root.resolve(strict=True) != cache_root
@@ -1748,11 +1871,356 @@ if (
     or stat.S_IMODE(readback_metadata.st_mode) & 0o077
 ):
     raise SystemExit("training publication readback cache is unsafe")
-for scratch in directory.glob(".training-publication.json.*"):
-    scratch.unlink(missing_ok=True)
-entries = [{"path": str(path.relative_to(directory)), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()} for path in sorted(directory.rglob("*")) if path.is_file() and path != receipt]
-expected = {entry["path"]: entry["sha256"] for entry in entries}
+
+if not hasattr(os, "O_NOFOLLOW") or not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+    raise SystemExit("safe no-follow training snapshot support is unavailable")
+
+def fsync_descriptor(descriptor):
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        raise SystemExit("training publication directory sync failed") from error
+
+def fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
+    try:
+        fsync_descriptor(descriptor)
+    finally:
+        os.close(descriptor)
+
+root_descriptor = os.open(
+    directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+)
+
+def open_beneath(root, relative, flags=os.O_RDONLY, mode=0o400):
+    pure = PurePosixPath(relative)
+    if pure.is_absolute() or not pure.parts or any(part in {"", ".", ".."} for part in pure.parts):
+        raise SystemExit("training publication path is unsafe")
+    current = os.dup(root)
+    try:
+        for part in pure.parts[:-1]:
+            following = os.open(
+                part,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW,
+                dir_fd=current,
+            )
+            os.close(current)
+            current = following
+        return os.open(pure.parts[-1], flags | os.O_NOFOLLOW, mode, dir_fd=current)
+    finally:
+        os.close(current)
+
+def mkdir_beneath(root, relative):
+    pure = PurePosixPath(relative)
+    if pure.is_absolute() or not pure.parts or any(part in {"", ".", ".."} for part in pure.parts):
+        raise SystemExit("training publication path is unsafe")
+    current = os.dup(root)
+    try:
+        for index, part in enumerate(pure.parts):
+            try:
+                os.mkdir(part, 0o700, dir_fd=current)
+            except FileExistsError:
+                if index == len(pure.parts) - 1:
+                    raise SystemExit("training publication snapshot path already exists") from None
+            following = os.open(
+                part,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW,
+                dir_fd=current,
+            )
+            os.close(current)
+            current = following
+            metadata = os.fstat(current)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_dev != directory_metadata.st_dev
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise SystemExit("training publication snapshot directory is unsafe")
+    finally:
+        os.close(current)
+
+def scan_tree():
+    regular, directories, links = set(), set(), {}
+    def visit(descriptor, parents):
+        for item in sorted(os.scandir(descriptor), key=lambda entry: entry.name):
+            if item.name in {".", ".."} or "/" in item.name:
+                raise SystemExit("training publication tree name is unsafe")
+            relative = PurePosixPath(*parents, item.name).as_posix()
+            metadata = item.stat(follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
+                links[relative] = os.readlink(item.name, dir_fd=descriptor)
+            elif stat.S_ISDIR(metadata.st_mode):
+                directories.add(relative)
+                child = os.open(
+                    item.name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+                try:
+                    if os.fstat(child).st_dev != directory_metadata.st_dev:
+                        raise SystemExit("training publication tree crosses filesystems")
+                    visit(child, (*parents, item.name))
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(metadata.st_mode):
+                regular.add(relative)
+            else:
+                raise SystemExit("training publication tree contains an unsafe entry")
+    visit(root_descriptor, ())
+    return regular, directories, links
+
+def read_regular(relative, expected_digest=None, *, collect=False, max_bytes=None):
+    descriptor = open_beneath(root_descriptor, relative)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_dev != directory_metadata.st_dev:
+            raise SystemExit("training publication source is not a protected regular file")
+        if collect and (max_bytes is None or before.st_size > max_bytes):
+            raise SystemExit("training publication metadata file exceeds its size bound")
+        digest = hashlib.sha256()
+        chunks = [] if collect else None
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            if chunks is not None:
+                chunks.append(chunk)
+        after = os.fstat(descriptor)
+        stable = (
+            before.st_dev, before.st_ino, before.st_mode, before.st_size,
+            before.st_mtime_ns, before.st_ctime_ns,
+        ) == (
+            after.st_dev, after.st_ino, after.st_mode, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns,
+        )
+        if not stable or (expected_digest is not None and digest.hexdigest() != expected_digest):
+            raise SystemExit("training publication source changed or failed identity validation")
+        return (b"".join(chunks) if chunks is not None else None), digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+for item in os.scandir(root_descriptor):
+    if not item.name.startswith(".training-publication.json."):
+        continue
+    metadata = item.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+        or metadata.st_dev != directory_metadata.st_dev
+    ):
+        raise SystemExit("training publication receipt scratch is unsafe")
+    os.unlink(item.name, dir_fd=root_descriptor)
+fsync_directory(directory)
+
+def training_identity():
+    regular, directories, links = scan_tree()
+    if links != {"checkpoints/last": "012000"}:
+        raise SystemExit("training publication tree contains an unsafe symlink")
+    identity_raw, identity_digest = read_regular(
+        "training-identity.json", collect=True, max_bytes=16 * 1024 * 1024
+    )
+    checksums_raw, checksums_digest = read_regular(
+        "checksums.sha256", collect=True, max_bytes=64 * 1024 * 1024
+    )
+    try:
+        identity = json.loads(identity_raw)
+    except (UnicodeError, json.JSONDecodeError):
+        raise SystemExit("training publication identity is invalid") from None
+    canonical_identity = (
+        json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("ascii")
+    if (
+        identity_raw != canonical_identity
+        or identity.get("schema_version") != 1
+        or identity.get("kind") != "lehome_public_n15_verified_training_output_v1"
+        or identity.get("training_root") != str(directory)
+        or identity.get("checkpoint_root") != str(directory / "checkpoints/012000")
+        or identity.get("step") != 12000
+        or re.fullmatch(r"[0-9a-f]{64}", str(identity.get("checksums_sha256"))) is None
+        or identity["checksums_sha256"] != checksums_digest
+    ):
+        raise SystemExit("training publication identity does not bind the canonical final tree")
+    checksums = {}
+    try:
+        checksum_lines = checksums_raw.decode("ascii").splitlines()
+    except UnicodeError:
+        raise SystemExit("training publication checksums are invalid") from None
+    for line in checksum_lines:
+        match = re.fullmatch(r"([0-9a-f]{64})  (\S+)", line)
+        if match is None:
+            raise SystemExit("training publication checksums are invalid")
+        digest, relative = match.groups()
+        pure = PurePosixPath(relative)
+        if (
+            pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts)
+            or relative in checksums
+        ):
+            raise SystemExit("training publication checksum path is unsafe or duplicated")
+        checksums[relative] = digest
+    expected_regular = set(checksums) | {"checksums.sha256", "training-identity.json"}
+    expected_directories = {
+        PurePosixPath(*PurePosixPath(relative).parts[:index]).as_posix()
+        for relative in expected_regular | {"checkpoints/last"}
+        for index in range(1, len(PurePosixPath(relative).parts))
+    }
+    if (
+        not checksums or regular != expected_regular or directories != expected_directories
+        or type(identity.get("artifact_count")) is not int
+        or identity["artifact_count"] != len(checksums)
+    ):
+        raise SystemExit("training publication tree is not the exact identity-bound file set")
+    expected = {
+        **checksums,
+        "checksums.sha256": checksums_digest,
+        "training-identity.json": identity_digest,
+    }
+    for relative, digest in expected.items():
+        read_regular(relative, digest)
+    return expected, expected_directories
+
+snapshot_name = f".{directory.name}.publication-snapshot"
+snapshot = directory.parent / snapshot_name
+parent_descriptor = os.open(
+    directory.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+)
+
+def remove_snapshot():
+    try:
+        metadata = os.stat(snapshot_name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISDIR(metadata.st_mode) or metadata.st_dev != directory_metadata.st_dev
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise SystemExit("training publication snapshot is unsafe")
+    shutil.rmtree(snapshot_name, dir_fd=parent_descriptor)
+    fsync_descriptor(parent_descriptor)
+
+remove_snapshot()
+
+expected, expected_directories = training_identity()
+
+def build_snapshot():
+    try:
+        os.mkdir(snapshot_name, 0o700, dir_fd=parent_descriptor)
+    except FileExistsError:
+        raise SystemExit("training publication snapshot already exists") from None
+    snapshot_descriptor = os.open(
+        snapshot_name,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW,
+        dir_fd=parent_descriptor,
+    )
+    if (
+        not stat.S_ISDIR(os.fstat(snapshot_descriptor).st_mode)
+        or os.fstat(snapshot_descriptor).st_dev != directory_metadata.st_dev
+        or os.fstat(snapshot_descriptor).st_uid != os.getuid()
+        or stat.S_IMODE(os.fstat(snapshot_descriptor).st_mode) != 0o700
+    ):
+        os.close(snapshot_descriptor)
+        raise SystemExit("training publication snapshot could not be sealed safely")
+    try:
+        for relative in sorted(expected_directories):
+            mkdir_beneath(snapshot_descriptor, relative)
+        for relative, digest in sorted(expected.items()):
+            source = open_beneath(root_descriptor, relative)
+            descriptor = open_beneath(
+                snapshot_descriptor,
+                relative,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o400,
+            )
+            try:
+                before = os.fstat(source)
+                if not stat.S_ISREG(before.st_mode) or before.st_dev != directory_metadata.st_dev:
+                    raise SystemExit("training publication source is not a protected regular file")
+                copied = hashlib.sha256()
+                while True:
+                    chunk = os.read(source, 1024 * 1024)
+                    if not chunk:
+                        break
+                    copied.update(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(descriptor, view)
+                        view = view[written:]
+                os.fsync(descriptor)
+                after = os.fstat(source)
+                stable = (
+                    before.st_dev, before.st_ino, before.st_mode, before.st_size,
+                    before.st_mtime_ns, before.st_ctime_ns,
+                ) == (
+                    after.st_dev, after.st_ino, after.st_mode, after.st_size,
+                    after.st_mtime_ns, after.st_ctime_ns,
+                )
+                if not stable or copied.hexdigest() != digest:
+                    raise SystemExit("training publication source changed while sealing snapshot")
+            finally:
+                os.close(descriptor)
+                os.close(source)
+        for relative in sorted(
+            expected_directories,
+            key=lambda value: len(PurePosixPath(value).parts),
+            reverse=True,
+        ):
+            descriptor = open_beneath(
+                snapshot_descriptor,
+                relative,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                fsync_descriptor(descriptor)
+            finally:
+                os.close(descriptor)
+        fsync_descriptor(snapshot_descriptor)
+    finally:
+        os.close(snapshot_descriptor)
+    training_identity()
+
+entries = [{"path": relative, "sha256": digest} for relative, digest in sorted(expected.items())]
 api = HfApi(token=os.environ["HF_TOKEN"])
+
+def cached_sha256(path):
+    allowed_root = readback_cache.resolve(strict=True)
+    path = Path(path)
+    try:
+        path.absolute().relative_to(allowed_root)
+    except ValueError:
+        raise SystemExit("training publication readback escaped its protected cache") from None
+    if path.is_symlink():
+        source = path.resolve(strict=True)
+    else:
+        source = path
+        if source.resolve(strict=True) != source:
+            raise SystemExit("training publication readback path contains a symlink")
+    try:
+        source.relative_to(allowed_root)
+    except ValueError:
+        raise SystemExit("training publication readback symlink escaped its protected cache") from None
+    metadata = source.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit("training publication readback is not a regular file")
+    descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(descriptor)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        ):
+            raise SystemExit("training publication readback changed while hashing")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
 
 def verify_revision(revision):
     try:
@@ -1771,48 +2239,54 @@ def verify_revision(revision):
             repo_id=repository, repo_type="model", filename=prefix + "/" + relative,
             revision=revision, token=False, cache_dir=str(readback_cache),
         )
-        if hashlib.sha256(Path(fetched).read_bytes()).hexdigest() != digest:
+        if cached_sha256(fetched) != digest:
             return False
     return True
 
-revision = None
-prefix_seen = False
-for prior in api.list_repo_commits(repo_id=repository, repo_type="model", token=os.environ["HF_TOKEN"]):
-    candidate = str(prior.commit_id)
-    if re.fullmatch(r"[0-9a-f]{40}", candidate) is None:
-        raise SystemExit("repository commit history contains an invalid immutable revision")
-    match = verify_revision(candidate)
-    prefix_seen = prefix_seen or match is not None
-    if match is True:
-        revision = candidate
-        break
-if revision is None:
-    if prefix_seen:
-        raise SystemExit("training publication prefix already exists with different bytes")
-    commit = api.upload_folder(repo_id=repository, repo_type="model", folder_path=str(directory), path_in_repo=prefix, commit_message="public N1.5 training " + prefix)
-    revision = str(commit.oid)
-    if re.fullmatch(r"[0-9a-f]{40}", revision) is None or verify_revision(revision) is not True:
-        raise SystemExit("uploaded training revision failed exact anonymous readback")
-value = {"schema_version": 1, "kind": "lehome_public_n15_training_publication_v1", "repository": repository, "remote_prefix": prefix, "immutable_revision": revision, "entries": entries, "anonymous_byte_readback_verified": True}
-payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
-descriptor, temporary_name = tempfile.mkstemp(prefix=".training-publication.json.", dir=directory)
-temporary = Path(temporary_name)
 try:
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(payload); stream.flush(); os.fsync(stream.fileno()); os.fchmod(stream.fileno(), 0o444)
-    if (
-        os.environ.get("LEHOME_N15_TEST_PUBLICATION_RECEIPT_FAULT") == "after-temporary"
-        and os.environ.get("PYTEST_CURRENT_TEST", "").startswith("tests/infrastructure/test_public_n15_pipeline_remote.py::")
-    ):
-        os._exit(86)
-    os.link(temporary, receipt)
-    parent = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    revision = None
+    prefix_seen = False
+    for prior in api.list_repo_commits(repo_id=repository, repo_type="model", token=os.environ["HF_TOKEN"]):
+        candidate = str(prior.commit_id)
+        if re.fullmatch(r"[0-9a-f]{40}", candidate) is None:
+            raise SystemExit("repository commit history contains an invalid immutable revision")
+        match = verify_revision(candidate)
+        prefix_seen = prefix_seen or match is not None
+        if match is True:
+            revision = candidate
+            break
+    if revision is None:
+        if prefix_seen:
+            raise SystemExit("training publication prefix already exists with different bytes")
+        build_snapshot()
+        try:
+            commit = api.upload_folder(repo_id=repository, repo_type="model", folder_path=str(snapshot), path_in_repo=prefix, commit_message="public N1.5 training " + prefix)
+        finally:
+            remove_snapshot()
+        revision = str(commit.oid)
+        if re.fullmatch(r"[0-9a-f]{40}", revision) is None or verify_revision(revision) is not True:
+            raise SystemExit("uploaded training revision failed exact anonymous readback")
+    training_identity()
+    value = {"schema_version": 1, "kind": "lehome_public_n15_training_publication_v1", "repository": repository, "remote_prefix": prefix, "immutable_revision": revision, "entries": entries, "anonymous_byte_readback_verified": True}
+    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".training-publication.json.", dir=directory)
+    temporary = Path(temporary_name)
     try:
-        os.fsync(parent)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload); stream.flush(); os.fsync(stream.fileno()); os.fchmod(stream.fileno(), 0o444)
+        if (
+            os.environ.get("LEHOME_N15_TEST_PUBLICATION_RECEIPT_FAULT") == "after-temporary"
+            and os.environ.get("PYTEST_CURRENT_TEST", "").startswith("tests/infrastructure/test_public_n15_pipeline_remote.py::")
+        ):
+            os._exit(86)
+        os.link(temporary, receipt)
+        fsync_directory(directory)
     finally:
-        os.close(parent)
+        temporary.unlink(missing_ok=True)
 finally:
-    temporary.unlink(missing_ok=True)
+    remove_snapshot()
+    os.close(root_descriptor)
+    os.close(parent_descriptor)
 PY
 SH
 }

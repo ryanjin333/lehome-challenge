@@ -2106,9 +2106,13 @@ def test_training_publication_adopts_verified_upload_after_local_receipt_crash(
     download_log = tmp_path / "downloads.log"
     training_cache = tmp_path / "training-hf-cache"; training_cache.mkdir(mode=0o700)
     (fake_site / "huggingface_hub.py").write_text(
-        r'''import os, shutil
+        r'''import hashlib, os, shutil
 from pathlib import Path
 from types import SimpleNamespace
+
+def _forbid_whole_file_reads(path):
+    raise AssertionError(f"whole-file Path.read_bytes is forbidden: {path}")
+Path.read_bytes = _forbid_whole_file_reads
 
 class EntryNotFoundError(Exception): pass
 class HfApi:
@@ -2122,13 +2126,16 @@ class HfApi:
         return [SimpleNamespace(rfilename=f"{path_in_repo}/{p.relative_to(root).as_posix()}", size=p.stat().st_size) for p in sorted(root.rglob("*")) if p.is_file()]
     def upload_folder(self, *, folder_path, path_in_repo, **kwargs):
         log = Path(os.environ["FAKE_HF_UPLOAD_LOG"])
-        with log.open("a") as stream: stream.write("upload\n")
+        with log.open("a") as stream: stream.write(f"upload\t{folder_path}\n")
         revision = "a" * 40
         destination = Path(os.environ["FAKE_HF_STORE"]) / revision / path_in_repo
         if destination.exists(): shutil.rmtree(destination)
         source = Path(folder_path)
+        mutation = os.environ.get("FAKE_HF_MUTATE_SOURCE")
+        if mutation:
+            Path(mutation).write_bytes(b"concurrent mutation")
         for item in source.rglob("*"):
-            if item.is_file() and not item.is_symlink() and item.name != "training-publication.json":
+            if item.is_file() and item.name != "training-publication.json":
                 target = destination / item.relative_to(source)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(item, target)
@@ -2144,9 +2151,18 @@ def hf_hub_download(*, filename, revision, cache_dir, token, **kwargs):
     assert token is False
     assert cache == expected
     assert cache.is_dir() and not cache.is_symlink()
+    assert not Path(os.environ["FAKE_HF_SNAPSHOT"]).exists()
     with Path(os.environ["FAKE_HF_DOWNLOAD_LOG"]).open("a") as stream:
         stream.write(f"{filename}\t{cache}\n")
-    return str(Path(os.environ["FAKE_HF_STORE"]) / revision / filename)
+    source = Path(os.environ["FAKE_HF_STORE"]) / revision / filename
+    blob = cache / "blobs" / hashlib.sha256(filename.encode("utf-8")).hexdigest()
+    blob.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    shutil.copyfile(source, blob)
+    snapshot = cache / "snapshots" / revision / filename
+    snapshot.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    snapshot.unlink(missing_ok=True)
+    snapshot.symlink_to(os.path.relpath(blob, snapshot.parent))
+    return str(snapshot)
 ''',
         encoding="utf-8",
     )
@@ -2164,17 +2180,68 @@ def hf_hub_download(*, filename, revision, cache_dir, token, **kwargs):
         "FAKE_HF_UPLOAD_LOG": str(upload_log),
         "FAKE_HF_DOWNLOAD_LOG": str(download_log),
         "FAKE_HF_DOWNLOAD_CACHE": str(training_cache / "training-publication-readback"),
+        "FAKE_HF_SNAPSHOT": str(training.parent / f".{training.name}.publication-snapshot"),
         "LEHOME_N15_TRAINING_HF_CACHE_ROOT": str(training_cache),
         "PYTHONPATH": f"{fake_site}:{ROOT / 'source/lehome'}",
     })
     harness = 'source "$WRAPPER_PATH"; remote() { command "$@"; }; publish_training_readback'
 
-    first = subprocess.run(
+    publication_snapshot = training.parent / f".{training.name}.publication-snapshot"
+    publication_snapshot.mkdir(mode=0o700)
+    (publication_snapshot / "partial-copy").write_bytes(b"interrupted snapshot")
+
+    last = training / "checkpoints/last"
+    last.unlink()
+    last.symlink_to("009000")
+    wrong_last = subprocess.run(
         ["bash", "-c", harness], cwd=ROOT,
         env={**env, "WRAPPER_PATH": str(WRAPPER)}, text=True, capture_output=True,
     )
+    assert wrong_last.returncode != 0
+    assert not publication_snapshot.exists()
+    assert not upload_log.exists()
+    last.unlink()
+    last.symlink_to("012000")
+
+    external = tmp_path / "external-secret"
+    external.write_bytes(b"must never be read or uploaded")
+    external_link = training / "external-secret-link"
+    external_link.symlink_to(external)
+    unsafe = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={**env, "WRAPPER_PATH": str(WRAPPER)}, text=True, capture_output=True,
+    )
+    assert unsafe.returncode != 0
+    assert not upload_log.exists()
+    assert not any(
+        path.is_file() and path.read_bytes() == external.read_bytes()
+        for path in remote_store.rglob("*")
+    )
+    external_link.unlink()
+
+    mutable_relative = "checkpoints/012000/pretrained_model/model.safetensors"
+    mutable_artifact = training / mutable_relative
+    original_mutable_artifact = mutable_artifact.read_bytes()
+    first = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env,
+            "WRAPPER_PATH": str(WRAPPER),
+            "FAKE_HF_MUTATE_SOURCE": str(mutable_artifact),
+        },
+        text=True, capture_output=True,
+    )
     assert first.returncode != 0
     assert not (training / "training-publication.json").exists()
+    uploaded_mutable_artifact = (
+        remote_store / ("a" * 40) / "n15-public/n15-publication-adoption/training"
+        / mutable_relative
+    )
+    assert uploaded_mutable_artifact.exists(), first.stderr
+    assert uploaded_mutable_artifact.read_bytes() == original_mutable_artifact
+    assert mutable_artifact.read_bytes() == b"concurrent mutation"
+    mutable_artifact.write_bytes(original_mutable_artifact)
+    assert not publication_snapshot.exists()
     interrupted = subprocess.run(
         ["bash", "-c", harness], cwd=ROOT,
         env={
@@ -2186,7 +2253,7 @@ def hf_hub_download(*, filename, revision, cache_dir, token, **kwargs):
     )
     assert interrupted.returncode != 0
     assert not (training / "training-publication.json").exists()
-    assert list(training.glob(".training-publication.json.*"))
+    assert list(training.glob(".training-publication.json.*")), interrupted.stderr
 
     second = subprocess.run(
         ["bash", "-c", harness], cwd=ROOT,
@@ -2194,7 +2261,11 @@ def hf_hub_download(*, filename, revision, cache_dir, token, **kwargs):
     )
 
     assert second.returncode == 0, second.stderr
-    assert upload_log.read_text().splitlines() == ["upload"]
+    upload_rows = upload_log.read_text().splitlines()
+    assert len(upload_rows) == 1
+    _, upload_source = upload_rows[0].split("\t", 1)
+    assert Path(upload_source) != training
+    assert Path(upload_source).parent == training.parent
     receipt = json.loads((training / "training-publication.json").read_text())
     assert receipt["immutable_revision"] == "a" * 40
     assert receipt["anonymous_byte_readback_verified"] is True
@@ -2256,6 +2327,16 @@ def hf_hub_download(*, filename, revision, cache_dir, token, **kwargs):
     assert verify_publication().returncode != 0
     local_artifact.write_bytes(original_local)
 
+    linked_copy = tmp_path / "linked-local-artifact"
+    linked_copy.write_bytes(original_local)
+    local_artifact.unlink()
+    local_artifact.symlink_to(linked_copy)
+    downloads_before_link = download_log.read_bytes()
+    assert verify_publication().returncode != 0
+    assert download_log.read_bytes() == downloads_before_link
+    local_artifact.unlink()
+    local_artifact.write_bytes(original_local)
+
     remote_artifact = remote_store / ("a" * 40) / receipt["remote_prefix"] / relative
     original_remote = remote_artifact.read_bytes()
     remote_artifact.write_bytes(original_remote + b"tampered")
@@ -2263,7 +2344,7 @@ def hf_hub_download(*, filename, revision, cache_dir, token, **kwargs):
     remote_artifact.write_bytes(original_remote)
 
     readback_cache = training_cache / "training-publication-readback"
-    readback_cache.rmdir()
+    shutil.rmtree(readback_cache)
     symlink_target = tmp_path / "root-volume-cache"; symlink_target.mkdir()
     readback_cache.symlink_to(symlink_target, target_is_directory=True)
     before_unsafe = download_log.read_bytes()
