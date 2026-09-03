@@ -984,8 +984,65 @@ finalize_host_harvest_terminal() {
   python3 "$HARVEST_BUILDER" verify-terminal --manifest "$HARVEST_MANIFEST" --manifest-receipt "$HARVEST_MANIFEST_RECEIPT" --publication-receipt "$HARVEST_PUBLICATION_RECEIPT" --provider-receipt "$PROVIDER_STOPPED_RECEIPT" --output "$HARVEST_TERMINAL_RECEIPT" >/dev/null
 }
 
+resolve_terminal_provider_receipt() {
+  python3 - "$HARVEST_TERMINAL_RECEIPT" "$PIPELINE_ROOT" "$RUN_ID" <<'PY'
+import hashlib
+import json
+import re
+import stat
+import sys
+from pathlib import Path
+
+terminal, pipeline = map(Path, sys.argv[1:3])
+run_id = sys.argv[3]
+terminal_metadata = terminal.lstat()
+terminal_raw = terminal.read_bytes()
+value = json.loads(terminal_raw)
+canonical = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+name = value.get("provider_receipt_name")
+expected_digest = value.get("provider_receipt_sha256")
+expected_captured = value.get("provider_captured_unix_seconds")
+allowed_names = {"provider-stopped.json"}
+if isinstance(name, str) and re.fullmatch(
+    rf"provider-stopped-{re.escape(run_id)}-[0-9]+\.json", name
+):
+    allowed_names.add(name)
+if (
+    terminal.is_symlink()
+    or not stat.S_ISREG(terminal_metadata.st_mode)
+    or stat.S_IMODE(terminal_metadata.st_mode) != 0o444
+    or terminal_raw != canonical
+    or name not in allowed_names
+    or not isinstance(expected_digest, str)
+    or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+    or type(expected_captured) is not int
+    or expected_captured <= 0
+):
+    raise SystemExit("terminal provider receipt binding is invalid")
+provider = pipeline / name
+provider_metadata = provider.lstat()
+provider_raw = provider.read_bytes()
+provider_value = json.loads(provider_raw)
+provider_canonical = (
+    json.dumps(provider_value, sort_keys=True, separators=(",", ":")) + "\n"
+).encode("ascii")
+if (
+    provider.is_symlink()
+    or not stat.S_ISREG(provider_metadata.st_mode)
+    or stat.S_IMODE(provider_metadata.st_mode) != 0o444
+    or provider_raw != provider_canonical
+    or hashlib.sha256(provider_raw).hexdigest() != expected_digest
+    or provider_value.get("captured_unix_seconds") != expected_captured
+):
+    raise SystemExit("terminal provider receipt does not match its immutable binding")
+print(provider)
+PY
+}
+
 verify_host_harvest_terminal() {
-  local temporary_root expected status
+  local temporary_root expected status bound_provider_receipt
+  bound_provider_receipt="$(resolve_terminal_provider_receipt)" || return 1
+  PROVIDER_STOPPED_RECEIPT="$bound_provider_receipt"
   temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-verify-terminal.XXXXXX")"
   expected="$temporary_root/receipt.json"
   python3 "$HARVEST_BUILDER" verify-terminal --manifest "$HARVEST_MANIFEST" --manifest-receipt "$HARVEST_MANIFEST_RECEIPT" --publication-receipt "$HARVEST_PUBLICATION_RECEIPT" --provider-receipt "$PROVIDER_STOPPED_RECEIPT" --output "$expected" >/dev/null || { rm -rf -- "$temporary_root"; return 1; }

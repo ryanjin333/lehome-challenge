@@ -1047,10 +1047,14 @@ def test_terminal_contract_requires_public_immutable_byte_readback_and_exact_sto
         manifest_receipt=manifest_receipt,
         publication_receipt=publication,
         provider_receipt=provider,
+        provider_receipt_name="provider-stopped-public-n15-1788150400.json",
     )
     assert result["terminal"] is True
     assert result["provider_state"] == "STOPPED"
     assert result["immutable_revision"] == "d" * 40
+    assert result["provider_receipt_name"] == "provider-stopped-public-n15-1788150400.json"
+    assert result["provider_receipt_sha256"] == hashlib.sha256(_canonical(provider)).hexdigest()
+    assert result["provider_captured_unix_seconds"] == 1_788_150_400
 
     for mutate, match in (
         (lambda value: value.update(repository_private=True), "public"),
@@ -1066,6 +1070,7 @@ def test_terminal_contract_requires_public_immutable_byte_readback_and_exact_sto
                 manifest_receipt=manifest_receipt,
                 publication_receipt=changed,
                 provider_receipt=provider,
+                provider_receipt_name="provider-stopped-public-n15-1788150400.json",
             )
     running = dict(provider, state="RUNNING")
     with pytest.raises(HarvestError, match="STOPPED"):
@@ -1074,6 +1079,15 @@ def test_terminal_contract_requires_public_immutable_byte_readback_and_exact_sto
             manifest_receipt=manifest_receipt,
             publication_receipt=publication,
             provider_receipt=running,
+            provider_receipt_name="provider-stopped-public-n15-1788150400.json",
+        )
+    with pytest.raises(HarvestError, match="provider receipt name"):
+        terminal_receipt(
+            manifest=manifest,
+            manifest_receipt=manifest_receipt,
+            publication_receipt=publication,
+            provider_receipt=provider,
+            provider_receipt_name="../provider-stopped.json",
         )
     raw_provider = {
         "metadata": {"id": provider["vm_id"], "name": "lehome-rollout"},

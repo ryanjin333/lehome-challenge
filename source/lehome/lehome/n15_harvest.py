@@ -40,6 +40,7 @@ _CATEGORY_DATASET_ROOTS = {
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _REVISION = re.compile(r"[0-9a-f]{40}")
 _REPOSITORY = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+_RECEIPT_BASENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.json")
 _PROVIDER_SOURCE_IMAGE_ID = "computeimage-u00zf6w3yf72gakhcy"
 _ATTEMPT_ID = re.compile(
     r"n15-seen-(?:top-long|top-short|pant-long|pant-short)-g[0-9]{2}-e[0-9]{2}-s[0-9]{6}"
@@ -1851,6 +1852,7 @@ def terminal_receipt(
     manifest_receipt: object,
     publication_receipt: object,
     provider_receipt: object,
+    provider_receipt_name: str,
 ) -> dict[str, object]:
     """Verify immutable public readback and the exact terminal STOPPED state."""
 
@@ -1899,6 +1901,8 @@ def terminal_receipt(
     ):
         raise HarvestError("Hugging Face authenticated/anonymous byte readback failed")
     provider = validate_provider_stop_receipt(provider_receipt)
+    if _RECEIPT_BASENAME.fullmatch(provider_receipt_name) is None:
+        raise HarvestError("provider receipt name is unsafe")
     return {
         "schema_version": 1,
         "kind": "lehome_public_n15_harvest_terminal_v1",
@@ -1906,6 +1910,9 @@ def terminal_receipt(
         "manifest_sha256": _digest(verified),
         "immutable_revision": publication["immutable_revision"],
         "provider_state": "STOPPED",
+        "provider_receipt_name": provider_receipt_name,
+        "provider_receipt_sha256": _digest(provider),
+        "provider_captured_unix_seconds": provider["captured_unix_seconds"],
         "vm_id": CONTRACT.vm_id,
         "disk_id": CONTRACT.disk_id,
     }

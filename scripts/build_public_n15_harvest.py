@@ -349,6 +349,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 manifest_receipt=_load_json(args.manifest_receipt, label="manifest receipt"),
                 publication_receipt=_load_json(args.publication_receipt, label="publication receipt"),
                 provider_receipt=_load_json(args.provider_receipt, label="provider stopped receipt"),
+                provider_receipt_name=args.provider_receipt.name,
             )
             _write_output(args.output, result, label="terminal receipt")
         elif args.command == "publish-hf":

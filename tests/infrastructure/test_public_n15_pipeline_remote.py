@@ -1075,6 +1075,7 @@ def test_main_processes_verified_terminal_before_expired_aggregate_deadline(
 source "$WRAPPER_PATH"
 acquire_controller_lock() { return 0; }
 release_controller_lock() { :; }
+resolve_terminal_provider_receipt() { printf '%s\n' "$PROVIDER_STOPPED_RECEIPT"; }
 python3() {
   if [[ "$*" == *"verify-terminal"* ]]; then return 0; fi
   command python3 "$@"
@@ -1335,15 +1336,28 @@ def test_terminal_receipt_is_recomputed_and_requires_exact_immutable_bytes(
 ) -> None:
     fake_bin = tmp_path / "bin"; fake_bin.mkdir()
     env = _wrapper_env(tmp_path, fake_bin, "n15-terminal-canonical")
-    terminal = Path(env["LEHOME_N15_PIPELINE_ROOT"]) / "harvest-terminal.json"
-    terminal.write_bytes(b'{"terminal":true}\n'); terminal.chmod(0o444)
+    pipeline = Path(env["LEHOME_N15_PIPELINE_ROOT"])
+    provider = pipeline / "provider-stopped.json"
+    provider.write_bytes(_canonical_json_bytes({"captured_unix_seconds": 1_788_150_400}))
+    provider.chmod(0o444)
+    terminal_value = {
+        "terminal": True,
+        "provider_receipt_name": provider.name,
+        "provider_receipt_sha256": hashlib.sha256(provider.read_bytes()).hexdigest(),
+        "provider_captured_unix_seconds": 1_788_150_400,
+    }
+    terminal = pipeline / "harvest-terminal.json"
+    terminal.write_bytes(_canonical_json_bytes(terminal_value)); terminal.chmod(0o444)
+    expected_terminal = tmp_path / "expected-terminal.json"
+    expected_terminal.write_bytes(terminal.read_bytes())
     harness = r'''
 source "$WRAPPER_PATH"
 python3() {
   if [[ "$1" == "$HARVEST_BUILDER" ]]; then
     shift
     while [[ "$1" != --output ]]; do shift; done
-    command python3 -c 'import os,sys; from pathlib import Path; path=Path(sys.argv[1]); path.write_bytes(b"{\"terminal\":true}\n"); os.chmod(path,0o444)' "$2"
+    cp "$EXPECTED_TERMINAL" "$2"
+    chmod 0444 "$2"
   else
     command python3 "$@"
   fi
@@ -1354,14 +1368,93 @@ verify_host_harvest_terminal
     def verify() -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", "-c", harness], cwd=ROOT,
-            env={**env, "WRAPPER_PATH": str(WRAPPER)}, text=True, capture_output=True,
+            env={
+                **env,
+                "WRAPPER_PATH": str(WRAPPER),
+                "EXPECTED_TERMINAL": str(expected_terminal),
+            },
+            text=True, capture_output=True,
         )
 
     assert verify().returncode == 0
     terminal.chmod(0o644)
     assert verify().returncode != 0
-    terminal.write_bytes(b'{"terminal":false}\n'); terminal.chmod(0o444)
+    terminal_value["terminal"] = False
+    terminal.write_bytes(_canonical_json_bytes(terminal_value)); terminal.chmod(0o444)
     assert verify().returncode != 0
+
+
+def test_terminal_restart_uses_exact_bound_provider_stop_receipt_and_rejects_substitution(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, "n15-terminal-provider-binding")
+    pipeline = Path(env["LEHOME_N15_PIPELINE_ROOT"])
+    canonical_provider = pipeline / "provider-stopped.json"
+    final_provider = pipeline / "provider-stopped-n15-terminal-provider-binding-1788150401.json"
+    old_provider_value = {"captured_unix_seconds": 1_788_150_400, "marker": "old"}
+    final_provider_value = {"captured_unix_seconds": 1_788_150_401, "marker": "final"}
+    canonical_provider.write_bytes(_canonical_json_bytes(old_provider_value))
+    final_provider.write_bytes(_canonical_json_bytes(final_provider_value))
+    canonical_provider.chmod(0o444); final_provider.chmod(0o444)
+    terminal_value = {
+        "terminal": True,
+        "provider_receipt_name": final_provider.name,
+        "provider_receipt_sha256": hashlib.sha256(final_provider.read_bytes()).hexdigest(),
+        "provider_captured_unix_seconds": 1_788_150_401,
+    }
+    terminal = pipeline / "harvest-terminal.json"
+    terminal.write_bytes(_canonical_json_bytes(terminal_value)); terminal.chmod(0o444)
+    expected_terminal = tmp_path / "expected-terminal.json"
+    expected_terminal.write_bytes(terminal.read_bytes())
+    trace = tmp_path / "provider-paths"
+    harness = r'''
+source "$WRAPPER_PATH"
+python3() {
+  if [[ "$1" == "$HARVEST_BUILDER" ]]; then
+    shift
+    provider=""; output=""
+    while (( $# )); do
+      case "$1" in
+        --provider-receipt) provider="$2"; shift 2 ;;
+        --output) output="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf '%s\n' "$provider" >> "$TRACE"
+    [[ "$provider" == "$EXPECTED_PROVIDER" ]] || return 91
+    cp "$EXPECTED_TERMINAL" "$output"
+    chmod 0444 "$output"
+  else
+    command python3 "$@"
+  fi
+}
+verify_host_harvest_terminal
+'''
+
+    def verify() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "-c", harness], cwd=ROOT,
+            env={
+                **env,
+                "WRAPPER_PATH": str(WRAPPER),
+                "EXPECTED_PROVIDER": str(final_provider),
+                "EXPECTED_TERMINAL": str(expected_terminal),
+                "TRACE": str(trace),
+            },
+            text=True, capture_output=True,
+        )
+
+    accepted = verify()
+    assert accepted.returncode == 0, accepted.stderr
+    assert trace.read_text(encoding="ascii").splitlines() == [str(final_provider)]
+
+    final_provider.chmod(0o644)
+    final_provider.write_bytes(_canonical_json_bytes(old_provider_value))
+    final_provider.chmod(0o444)
+    rejected = verify()
+    assert rejected.returncode != 0
+    assert trace.read_text(encoding="ascii").splitlines() == [str(final_provider)]
 
 
 def test_terminal_stop_failure_retains_singleton_until_stopped(
@@ -1910,21 +2003,66 @@ def test_paid_stage_reaps_normally_exiting_setsid_leader_without_watchdog_delay(
     tmp_path: Path,
 ) -> None:
     fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    sleep_trace = tmp_path / "sleep-trace"
+    _write_executable(
+        fake_bin / "sleep",
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$SLEEP_TRACE"
+exec /bin/sleep "$@"
+""",
+    )
     env = _wrapper_env(tmp_path, fake_bin, "n15-paid-finite-success")
-    result = subprocess.run(
+    process = subprocess.Popen(
         ["bash", "-c", r'''
 source "$WRAPPER_PATH"
 initialize_deadline() { echo "$(( $(date +%s) + 30 ))"; }
 initialize_stage_deadline() { echo "$(( $(date +%s) + 30 ))"; }
 train_stage() { return 0; }
+trap controller_cleanup EXIT TERM
 run_paid_stage train 30 train_stage
 printf 'complete\n'
 '''],
-        cwd=ROOT, env={**env, "WRAPPER_PATH": str(WRAPPER)},
-        text=True, capture_output=True, timeout=5,
+        cwd=ROOT,
+        env={
+            **env,
+            "WRAPPER_PATH": str(WRAPPER),
+            "SLEEP_TRACE": str(sleep_trace),
+        },
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
     )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == "complete\n"
+    try:
+        # The controller/launcher acknowledgement is bounded at five seconds,
+        # and paid-stage cleanup gets a further five-second TERM grace period.
+        # Keep the harness watchdog strictly outside both bounds so scheduler
+        # load cannot kill only the controller and strand its detached child.
+        stdout, stderr = process.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        os.kill(process.pid, signal.SIGTERM)
+        try:
+            stdout, stderr = process.communicate(timeout=8)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate(timeout=3)
+        pytest.fail(f"finite paid stage exceeded lifecycle bounds: {stdout!r} {stderr!r}")
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=3)
+
+    assert process.returncode == 0, stderr
+    assert stdout == "complete\n"
+    # A normally exited leader may briefly be a zombie until Bash waits it;
+    # the watchdog must not mistake that for a live stage and sleep a second.
+    sleep_calls = (
+        sleep_trace.read_text(encoding="ascii").splitlines()
+        if sleep_trace.exists()
+        else []
+    )
+    assert "1" not in sleep_calls
 
 
 def test_training_publication_adopts_verified_upload_after_local_receipt_crash(
