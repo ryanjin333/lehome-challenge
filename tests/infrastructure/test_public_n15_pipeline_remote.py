@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -33,31 +34,6 @@ def _load_cli():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def _provider_rate_env(pipeline: Path) -> dict[str, str]:
-    rate_receipt = pipeline / "provider-rate.json"
-    if not rate_receipt.exists():
-        now = int(time.time())
-        rate_receipt.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "kind": "lehome_public_n15_exact_vm_rate_v1",
-                    "vm_id": "computeinstance-u00t6xfqhadrcmssa2",
-                    "currency": "USD",
-                    "hourly_rate_usd": 3.0,
-                    "source": "operator-staged-nebius-exact-vm-price",
-                    "observed_unix_seconds": now,
-                    "valid_until_unix_seconds": now + 86400,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ) + "\n",
-            encoding="ascii",
-        )
-        rate_receipt.chmod(0o444)
-    return {"LEHOME_N15_PROVIDER_RATE_RECEIPT": str(rate_receipt)}
 
 
 def _write_host_stage_seal(
@@ -118,7 +94,6 @@ def _wrapper_env(tmp_path: Path, fake_bin: Path, run_id: str) -> dict[str, str]:
         "LEHOME_N15_TRAINING_UV": "/mnt/uv",
         "LEHOME_N15_LEROBOT_WHEEL": "/mnt/lerobot.whl",
         "LEHOME_N15_TRAINING_ROOT": f"{remote_pipeline}/training",
-        **_provider_rate_env(pipeline),
     }
 
 
@@ -133,6 +108,12 @@ def _controller_lock_path(env: dict[str, str]) -> Path:
 def _write_executable(path: Path, payload: str) -> None:
     path.write_text(payload, encoding="utf-8")
     path.chmod(0o755)
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("ascii")
 
 
 def _remote_train_fixture(tmp_path: Path) -> tuple[dict[str, str], object, Path, Path, Path]:
@@ -800,12 +781,8 @@ def test_invalid_immutable_deadline_fails_before_any_provider_action(
     assert not provider_log.exists()
 
 
-@pytest.mark.parametrize(
-    "rate_kind",
-    ["missing", "mutable", "symlink", "wrong-vm", "expired", "over-ceiling"],
-)
-def test_invalid_exact_vm_rate_receipt_fails_before_any_provider_action(
-    tmp_path: Path, rate_kind: str,
+def test_conservative_budget_admission_needs_no_external_rate_receipt(
+    tmp_path: Path,
 ) -> None:
     fake_bin = tmp_path / "bin"; fake_bin.mkdir()
     provider_log = tmp_path / "provider.log"
@@ -814,39 +791,67 @@ def test_invalid_exact_vm_rate_receipt_fails_before_any_provider_action(
         "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$FAKE_PROVIDER_LOG\"\nexit 97\n",
     )
     _write_executable(fake_bin / "ssh", "#!/usr/bin/env bash\nexit 97\n")
-    env = _wrapper_env(tmp_path, fake_bin, f"n15-rate-{rate_kind}")
+    env = _wrapper_env(tmp_path, fake_bin, "n15-conservative-budget")
     env["FAKE_PROVIDER_LOG"] = str(provider_log)
-    receipt = Path(env["LEHOME_N15_PROVIDER_RATE_RECEIPT"])
-    value = json.loads(receipt.read_text(encoding="ascii"))
-    receipt.chmod(0o644)
-    if rate_kind == "missing":
-        receipt.unlink()
-    elif rate_kind == "mutable":
-        pass
-    elif rate_kind == "symlink":
-        target = receipt.with_suffix(".target.json")
-        receipt.replace(target)
-        receipt.symlink_to(target)
-    else:
-        if rate_kind == "wrong-vm":
-            value["vm_id"] = "computeinstance-wrong"
-        elif rate_kind == "expired":
-            value["observed_unix_seconds"] = 1
-            value["valid_until_unix_seconds"] = 86401
-        else:
-            value["hourly_rate_usd"] = 3.01
-        receipt.write_text(
-            json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
-            encoding="ascii",
-        )
-        receipt.chmod(0o444)
 
     result = subprocess.run(
         ["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True
     )
 
     assert result.returncode != 0
-    assert "rate" in result.stderr.lower() or "cost" in result.stderr.lower()
+    assert "rate receipt" not in result.stderr.lower()
+    assert provider_log.exists()
+
+
+@pytest.mark.parametrize("budget_case", ["maximum-window", "elapsed-window"])
+def test_conservative_ceiling_budget_rejects_before_any_provider_action(
+    tmp_path: Path, budget_case: str,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    provider_log = tmp_path / "provider.log"
+    _write_executable(
+        fake_bin / "nebius",
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$FAKE_PROVIDER_LOG\"\nexit 97\n",
+    )
+    _write_executable(fake_bin / "ssh", "#!/usr/bin/env bash\nexit 97\n")
+    env = _wrapper_env(tmp_path, fake_bin, f"n15-budget-{budget_case}")
+    env["FAKE_PROVIDER_LOG"] = str(provider_log)
+    pipeline = Path(env["LEHOME_N15_PIPELINE_ROOT"])
+    if budget_case == "maximum-window":
+        env["LEHOME_N15_MAX_BUDGET_USD"] = "71"
+    else:
+        module = _load_cli()
+        plan = pipeline / "lifecycle-plan.json"
+        assert module.main([
+            "lifecycle-plan", "--run-id", env["LEHOME_N15_RUN_ID"],
+            "--repository", env["LEHOME_N15_PUBLIC_HF_REPOSITORY"],
+            "--remote-pipeline-root", env["LEHOME_N15_REMOTE_PIPELINE_ROOT"],
+            "--budget-usd", "100", "--estimated-cost-usd", "72",
+            "--output", str(plan),
+        ]) == 0
+        plan_sha = hashlib.sha256(plan.read_bytes()).hexdigest()
+        started = int(time.time()) - 34 * 3600
+        deadline = {
+            "schema_version": 1,
+            "kind": "lehome_public_n15_paid_deadline_v1",
+            "run_id": env["LEHOME_N15_RUN_ID"],
+            "lifecycle_plan_sha256": plan_sha,
+            "started_unix_seconds": started,
+            "deadline_unix_seconds": started + 86400,
+        }
+        deadline_path = pipeline / "paid-deadline.json"
+        deadline_path.write_text(
+            json.dumps(deadline, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="ascii",
+        )
+        deadline_path.chmod(0o444)
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True
+    )
+
+    assert result.returncode != 0
+    assert "conservative provider budget" in result.stderr.lower()
     assert not provider_log.exists()
 
 
@@ -1035,6 +1040,73 @@ main
     assert trace.read_text(encoding="ascii").splitlines() == expected
 
 
+@pytest.mark.parametrize("completed_stage", ["training", "focused"])
+def test_remote_completed_stage_is_adopted_and_existing_seal_rechecks_bytes(
+    tmp_path: Path, completed_stage: str,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, f"n15-adopt-{completed_stage}")
+    remote_receipts = tmp_path / "remote-receipts"; remote_receipts.mkdir()
+    sources = {
+        "training-identity.json": _canonical_json_bytes({"receipt": "training-identity"}),
+        "training-publication.json": _canonical_json_bytes({"receipt": "training-publication"}),
+        "comparison-receipt.json": _canonical_json_bytes({"receipt": "comparison"}),
+        "publication.json": _canonical_json_bytes({"receipt": "focused-publication"}),
+        "promotion.json": _canonical_json_bytes({"receipt": "promotion"}),
+    }
+    for name, payload in sources.items():
+        if completed_stage == "training" and name in {
+            "comparison-receipt.json", "publication.json", "promotion.json",
+        }:
+            continue
+        (remote_receipts / name).write_bytes(payload)
+    harness = r'''
+source "$WRAPPER_PATH"
+remote_file_exists() { [[ -f "$FAKE_REMOTE_RECEIPTS/${1##*/}" ]]; }
+verify_remote_training_chain() { return 0; }
+verify_remote_training_publication() { return 0; }
+verify_remote_focused_chain() { return 0; }
+fetch_remote_immutable() {
+  cp "$FAKE_REMOTE_RECEIPTS/${1##*/}" "$2"
+  chmod 0444 "$2"
+}
+reconcile_remote_stage_seals
+'''
+    command = ["bash", "-c", harness]
+    command_env = {
+        **env,
+        "WRAPPER_PATH": str(WRAPPER),
+        "FAKE_REMOTE_RECEIPTS": str(remote_receipts),
+    }
+
+    adopted = subprocess.run(
+        command, cwd=ROOT, env=command_env, text=True, capture_output=True
+    )
+
+    assert adopted.returncode == 0, adopted.stderr
+    training_seal = Path(env["LEHOME_N15_PIPELINE_ROOT"]) / "host-stage-training-complete.json"
+    focused_seal = Path(env["LEHOME_N15_PIPELINE_ROOT"]) / "host-stage-focused-complete.json"
+    assert training_seal.is_file() and not training_seal.is_symlink()
+    assert focused_seal.exists() is (completed_stage == "focused")
+    seal = json.loads(
+        (focused_seal if completed_stage == "focused" else training_seal).read_text(
+            encoding="ascii"
+        )
+    )
+    for item in seal["remote_receipts"]:
+        assert item["sha256"] == hashlib.sha256(
+            (remote_receipts / Path(item["path"]).name).read_bytes()
+        ).hexdigest()
+
+    mutation = "promotion.json" if completed_stage == "focused" else "training-identity.json"
+    (remote_receipts / mutation).write_bytes(_canonical_json_bytes({"tampered": True}))
+    rejected = subprocess.run(
+        command, cwd=ROOT, env=command_env, text=True, capture_output=True
+    )
+    assert rejected.returncode != 0
+    assert "seal mismatch" in rejected.stderr.lower()
+
+
 def test_completed_terminal_chain_is_processed_before_stale_stage_deadlines(
     tmp_path: Path,
 ) -> None:
@@ -1113,10 +1185,11 @@ def test_atomic_controller_singleton_rejects_second_live_controller_without_stop
             "kind": "lehome_public_n15_controller_lock_v1",
             "run_id": "n15-singleton",
             "controller_pid": first.pid,
-            "holder_pid": owner["holder_pid"],
+            "acquisition_helper_pid": owner["acquisition_helper_pid"],
             "script_path": str(WRAPPER.resolve()),
         }
-        os.kill(owner["holder_pid"], 0)
+        with pytest.raises(ProcessLookupError):
+            os.kill(owner["acquisition_helper_pid"], 0)
 
         second = subprocess.run(
             ["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True,
@@ -1173,7 +1246,9 @@ def test_controller_singleton_contends_across_run_ids_and_pipeline_roots(
             first.communicate(timeout=5)
 
 
-def test_orphan_lock_holder_detects_abrupt_controller_death(tmp_path: Path) -> None:
+def test_abrupt_controller_death_leaves_safe_stale_file_and_releases_flock(
+    tmp_path: Path,
+) -> None:
     fake_bin = tmp_path / "bin"; fake_bin.mkdir()
     env = _wrapper_env(tmp_path, fake_bin, "n15-orphan-lock")
     process = subprocess.Popen(
@@ -1182,22 +1257,24 @@ def test_orphan_lock_holder_detects_abrupt_controller_death(tmp_path: Path) -> N
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
     )
     lock_path = _controller_lock_path(env)
-    holder_pid: int | None = None
     try:
         deadline = time.monotonic() + 5
         while not lock_path.is_file() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert lock_path.is_file()
-        holder_pid = json.loads(lock_path.read_text(encoding="ascii"))["holder_pid"]
-
         os.kill(process.pid, signal.SIGKILL)
         process.communicate(timeout=5)
-        deadline = time.monotonic() + 5
-        while lock_path.exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
+        assert lock_path.is_file()
+        retry = subprocess.run(
+            [
+                "bash", "-c",
+                'source "$WRAPPER_PATH"; acquire_controller_lock; release_controller_lock',
+            ],
+            cwd=ROOT, env={**env, "WRAPPER_PATH": str(WRAPPER)},
+            text=True, capture_output=True, timeout=5,
+        )
+        assert retry.returncode == 0, retry.stderr
         assert not lock_path.exists()
-        with pytest.raises(ProcessLookupError):
-            os.kill(holder_pid, 0)
     finally:
         if process.poll() is None:
             os.kill(process.pid, signal.SIGKILL)
@@ -1206,14 +1283,9 @@ def test_orphan_lock_holder_detects_abrupt_controller_death(tmp_path: Path) -> N
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.communicate(timeout=5)
-        if holder_pid is not None:
-            try:
-                os.kill(holder_pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
 
 
-def test_controller_fails_closed_and_cleans_up_when_lock_holder_dies(
+def test_dead_acquisition_helper_does_not_release_controller_owned_flock(
     tmp_path: Path,
 ) -> None:
     fake_bin = tmp_path / "bin"; fake_bin.mkdir()
@@ -1240,23 +1312,22 @@ while :; do /bin/sleep 1; done
         while (not lock_path.is_file() or not trace.exists()) and time.monotonic() < deadline:
             time.sleep(0.02)
         assert lock_path.is_file() and trace.read_text().splitlines() == ["working"]
-        holder_pid = json.loads(lock_path.read_text(encoding="ascii"))["holder_pid"]
-        os.kill(holder_pid, signal.SIGKILL)
-        try:
-            _stdout, stderr = process.communicate(timeout=5)
-            status = process.returncode
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.communicate(timeout=3)
-            status = None
-            stderr = ""
+        owner = json.loads(lock_path.read_text(encoding="ascii"))
+        with pytest.raises(ProcessLookupError):
+            os.kill(owner["acquisition_helper_pid"], 0)
+        contender = subprocess.run(
+            ["bash", "-c", 'source "$WRAPPER_PATH"; acquire_controller_lock'],
+            cwd=ROOT, env={**env, "WRAPPER_PATH": str(WRAPPER)},
+            text=True, capture_output=True, timeout=5,
+        )
+        assert contender.returncode != 0
+        assert process.poll() is None
+        assert trace.read_text().splitlines() == ["working"]
     finally:
         if process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process.pid, signal.SIGTERM)
             process.communicate(timeout=3)
 
-    assert status is not None
-    assert status != 0
     assert trace.read_text().splitlines() == ["working", "stop"]
     assert not lock_path.exists()
 
@@ -1506,6 +1577,19 @@ def hf_hub_download(*, filename, revision, **kwargs):
     )
     assert first.returncode != 0
     assert not (training / "training-publication.json").exists()
+    interrupted = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env,
+            "WRAPPER_PATH": str(WRAPPER),
+            "LEHOME_N15_TEST_PUBLICATION_RECEIPT_FAULT": "after-temporary",
+        },
+        text=True, capture_output=True,
+    )
+    assert interrupted.returncode != 0
+    assert not (training / "training-publication.json").exists()
+    assert list(training.glob(".training-publication.json.*"))
+
     second = subprocess.run(
         ["bash", "-c", harness], cwd=ROOT,
         env={**env, "WRAPPER_PATH": str(WRAPPER)}, text=True, capture_output=True,
@@ -1516,6 +1600,40 @@ def hf_hub_download(*, filename, revision, **kwargs):
     receipt = json.loads((training / "training-publication.json").read_text())
     assert receipt["immutable_revision"] == "a" * 40
     assert receipt["anonymous_byte_readback_verified"] is True
+
+
+def test_fetch_remote_immutable_cleans_partial_transfer_and_retries(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, "n15-fetch-atomic")
+    destination = tmp_path / "pipeline" / "fetched.json"
+    harness = r'''
+source "$WRAPPER_PATH"
+remote() {
+  attempt=0; [[ -f "$ATTEMPT_FILE" ]] && attempt=$(cat "$ATTEMPT_FILE")
+  attempt=$((attempt + 1)); printf '%s' "$attempt" > "$ATTEMPT_FILE"
+  if (( attempt == 1 )); then printf 'partial'; return 71; fi
+  printf '{"complete":true}\n'
+}
+if fetch_remote_immutable /remote/receipt.json "$DESTINATION"; then exit 80; fi
+[[ ! -e "$DESTINATION" && ! -L "$DESTINATION" ]]
+fetch_remote_immutable /remote/receipt.json "$DESTINATION"
+'''
+    result = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env, "WRAPPER_PATH": str(WRAPPER),
+            "DESTINATION": str(destination),
+            "ATTEMPT_FILE": str(tmp_path / "fetch-attempt"),
+        },
+        text=True, capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert destination.read_bytes() == b'{"complete":true}\n'
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o444
+    assert not list(destination.parent.glob(f".{destination.name}.*"))
 
 
 def test_running_observation_waits_for_cloud_init_after_ssh_is_ready(tmp_path: Path) -> None:
@@ -1580,11 +1698,10 @@ def test_running_observation_waits_for_cloud_init_after_ssh_is_ready(tmp_path: P
         "LEHOME_N15_NATIVE_DEPENDENCIES_ROOT": "/mnt/deps", "LEHOME_N15_FOCUSED_HF_CACHE_ROOT": "/mnt/cache", "LEHOME_N15_ROLLOUT_IMAGE_RECEIPT": "/mnt/image.json",
         "LEHOME_N15_TRAINING_HF_CACHE_ROOT": "/mnt/train-cache", "LEHOME_N15_TRAINING_UV": "/mnt/uv", "LEHOME_N15_LEROBOT_WHEEL": "/mnt/lerobot.whl",
         "LEHOME_N15_TRAINING_ROOT": "/mnt/lehome/runs/n15-running-observation/training",
-        **_provider_rate_env(pipeline),
     }
     result = subprocess.run(["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True)
     assert result.returncode != 0
-    assert trace.read_text(encoding="utf-8").splitlines() == ["start", *("readiness" for _ in range(7)), "runtime", "runtime", "runtime", "identity-check", "train", "train", "train", "stop"]
+    assert trace.read_text(encoding="utf-8").splitlines() == ["start", *("readiness" for _ in range(7)), "runtime", "runtime", "runtime", "identity-check", "train", "train", "train", "train", "stop"]
     assert state.read_text(encoding="utf-8") == "STOPPED"
 
 
@@ -1637,7 +1754,6 @@ def test_running_observation_hard_stops_a_hanging_ssh_readiness_probe(tmp_path: 
         "LEHOME_N15_NATIVE_DEPENDENCIES_ROOT": "/mnt/deps", "LEHOME_N15_FOCUSED_HF_CACHE_ROOT": "/mnt/cache", "LEHOME_N15_ROLLOUT_IMAGE_RECEIPT": "/mnt/image.json",
         "LEHOME_N15_TRAINING_HF_CACHE_ROOT": "/mnt/train-cache", "LEHOME_N15_TRAINING_UV": "/mnt/uv", "LEHOME_N15_LEROBOT_WHEEL": "/mnt/lerobot.whl",
         "LEHOME_N15_TRAINING_ROOT": "/mnt/lehome/runs/n15-hanging-readiness/training",
-        **_provider_rate_env(pipeline),
     }
     started = time.monotonic()
     process = subprocess.Popen(["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
@@ -1701,7 +1817,6 @@ def test_running_observation_reaps_a_term_ignoring_ssh_readiness_probe(tmp_path:
         "LEHOME_N15_NATIVE_RUNTIME_EVIDENCE_ROOT": "/mnt/evidence", "LEHOME_N15_NATIVE_DEPENDENCIES_ROOT": "/mnt/deps", "LEHOME_N15_FOCUSED_HF_CACHE_ROOT": "/mnt/cache",
         "LEHOME_N15_ROLLOUT_IMAGE_RECEIPT": "/mnt/image.json", "LEHOME_N15_TRAINING_HF_CACHE_ROOT": "/mnt/train-cache", "LEHOME_N15_TRAINING_UV": "/mnt/uv",
         "LEHOME_N15_LEROBOT_WHEEL": "/mnt/lerobot.whl", "LEHOME_N15_TRAINING_ROOT": "/mnt/lehome/runs/n15-interrupted-readiness/training",
-        **_provider_rate_env(pipeline),
     }
     process = subprocess.Popen(["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     deadline = time.monotonic() + 3

@@ -22,7 +22,6 @@ readonly MAX_BUDGET_USD="${LEHOME_N15_MAX_BUDGET_USD:-100}"
 # Code-owned conservative ceiling: 3 USD/hour times (12h train + 4h gate +
 # 8h harvest) = 72 USD. The live provider preflight must not exceed 3 USD/h.
 readonly PROVIDER_HOURLY_CEILING_USD=3
-readonly PROVIDER_RATE_RECEIPT="${LEHOME_N15_PROVIDER_RATE_RECEIPT:-}"
 readonly TRAIN_TIMEOUT_SECONDS=43200
 readonly FOCUSED_TIMEOUT_SECONDS=14400
 readonly HARVEST_TIMEOUT_SECONDS=28800
@@ -58,7 +57,6 @@ readonly FOCUSED_HF_CACHE="${LEHOME_N15_FOCUSED_HF_CACHE_ROOT:-}"
 readonly ROLLOUT_IMAGE_RECEIPT="${LEHOME_N15_ROLLOUT_IMAGE_RECEIPT:-}"
 readonly PLAN_RECEIPT="$PIPELINE_ROOT/lifecycle-plan.json"
 readonly DEADLINE_RECEIPT="$PIPELINE_ROOT/paid-deadline.json"
-readonly PROVIDER_RATE_ADMISSION_RECEIPT="$PIPELINE_ROOT/provider-rate-admission.json"
 readonly HOST_TRAINING_STAGE_RECEIPT="$PIPELINE_ROOT/host-stage-training-complete.json"
 readonly HOST_FOCUSED_STAGE_RECEIPT="$PIPELINE_ROOT/host-stage-focused-complete.json"
 readonly TRAINING_IDENTITY_RECEIPT="$TRAINING_ROOT/training-identity.json"
@@ -73,16 +71,46 @@ readonly HARVEST_TERMINAL_RECEIPT="$PIPELINE_ROOT/harvest-terminal.json"
 PROVIDER_STOPPED_RECEIPT="$PIPELINE_ROOT/provider-stopped.json"
 PIPELINE_COMPLETE=0
 PROVIDER_CLEANUP_REQUIRED=0
-CONTROLLER_LOCK_PID=""
-CONTROLLER_LOCK_READY=""
-CONTROLLER_LOCK_MONITOR_PID=""
-CONTROLLER_LOCK_RELEASE=""
+CONTROLLER_LOCK_FD=""
 CONTROLLER_LOCK_PATH=""
 PRESTART_ADMITTED_STAGE=""
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
 require_abs_dir() { [[ "$1" == /* && "$1" != *".."* && -d "$1" && ! -L "$1" ]] || fail "$2 is unavailable or unsafe"; }
 require_abs_file() { [[ "$1" == /* && "$1" != *".."* && -f "$1" && ! -L "$1" ]] || fail "$2 is unavailable or unsafe"; }
+verify_conservative_task_budget() {
+  python3 - "$MAX_BUDGET_USD" "$PROVIDER_HOURLY_CEILING_USD" "${1:-}" <<'PY'
+import json, math, stat, sys, time
+from pathlib import Path
+
+budget, ceiling = map(float, sys.argv[1:3])
+deadline_path = sys.argv[3]
+window_seconds = 86400
+if not math.isfinite(budget) or not (0 < budget <= 100):
+    raise SystemExit("conservative provider budget is invalid")
+maximum_cost = ceiling * window_seconds / 3600
+if maximum_cost > budget:
+    raise SystemExit("conservative provider budget is below the maximum paid window")
+if not deadline_path:
+    raise SystemExit(0)
+path = Path(deadline_path)
+metadata = path.lstat()
+raw = path.read_bytes()
+value = json.loads(raw)
+canonical = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+started, deadline = value.get("started_unix_seconds"), value.get("deadline_unix_seconds")
+if (
+    path.is_symlink() or not stat.S_ISREG(metadata.st_mode)
+    or stat.S_IMODE(metadata.st_mode) != 0o444 or raw != canonical
+    or type(started) is not int or type(deadline) is not int
+    or deadline != started + window_seconds
+):
+    raise SystemExit("conservative provider budget deadline is invalid")
+elapsed_seconds = int(time.time()) - started
+if elapsed_seconds < 0 or ceiling * elapsed_seconds / 3600 > budget:
+    raise SystemExit("conservative provider budget deadline elapsed time exceeds the task budget")
+PY
+}
 provider_get() { nebius compute instance get --id "$EXACT_VM_ID" --format json --no-browser --no-progress --no-check-update --retries 1 --timeout 60s; }
 capture_exact_provider_state() {
   local expected_state="$1" receipt="$2"
@@ -138,20 +166,13 @@ acquire_controller_lock() {
   local lock_root="$runtime_base/lehome-public-n15-controller-$(id -u)"
   local lock_path="$lock_root/$EXACT_VM_ID.lock"
   CONTROLLER_LOCK_PATH="$lock_path"
-  CONTROLLER_LOCK_READY="$lock_root/.ready.$$.$RANDOM"
-  CONTROLLER_LOCK_RELEASE="$lock_root/.release.$$.$RANDOM"
-  python3 - "$runtime_base" "$lock_root" "$lock_path" "$CONTROLLER_LOCK_READY" "$RUN_ID" "$SCRIPT_DIR/run_public_n15_pipeline_remote.sh" "$$" <<'PY' &
-import fcntl
-import json
+  python3 - "$runtime_base" "$lock_root" "$lock_path" <<'PY' || return 1
 import os
 from pathlib import Path
-import signal
 import stat
 import sys
-import time
 
-runtime_base, lock_root, lock_path, ready_path = map(Path, sys.argv[1:5])
-run_id, script_path, controller_pid = sys.argv[5], sys.argv[6], int(sys.argv[7])
+runtime_base, lock_root, lock_path = map(Path, sys.argv[1:4])
 if (
     not runtime_base.is_absolute()
     or runtime_base.is_symlink()
@@ -160,7 +181,6 @@ if (
     or lock_root.parent != runtime_base
     or lock_path.parent != lock_root
     or lock_path.name != "computeinstance-u00t6xfqhadrcmssa2.lock"
-    or ready_path.parent != lock_root
 ):
     raise SystemExit(73)
 try:
@@ -175,152 +195,102 @@ if (
 ):
     raise SystemExit(73)
 try:
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
 except OSError:
     raise SystemExit(73)
-acquired = False
 try:
-    lock_metadata = os.fstat(fd)
+    metadata = os.fstat(descriptor)
     if (
-        not stat.S_ISREG(lock_metadata.st_mode)
-        or lock_metadata.st_uid != os.getuid()
-        or stat.S_IMODE(lock_metadata.st_mode) != 0o600
-        or lock_metadata.st_nlink != 1
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
     ):
         raise SystemExit(73)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        raise SystemExit(73)
-    acquired = True
-    value = {
-        "schema_version": 1,
-        "kind": "lehome_public_n15_controller_lock_v1",
-        "run_id": run_id,
-        "controller_pid": controller_pid,
-        "holder_pid": os.getpid(),
-        "script_path": script_path,
-    }
-    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
-    os.ftruncate(fd, 0)
-    remaining = memoryview(payload)
-    while remaining:
-        remaining = remaining[os.write(fd, remaining):]
-    os.fsync(fd)
-    ready_fd = os.open(ready_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    os.close(ready_fd)
-    def stop(_signum, _frame):
-        nonlocal_stopped[0] = True
-    nonlocal_stopped = [False]
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
-    while not nonlocal_stopped[0]:
-        if os.getppid() != controller_pid:
-            break
-        try:
-            os.kill(controller_pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.1)
 finally:
-    if acquired:
-        try:
-            metadata = os.stat(lock_path, follow_symlinks=False)
-            held = os.fstat(fd)
-            if (metadata.st_dev, metadata.st_ino) == (held.st_dev, held.st_ino):
-                lock_path.unlink()
-        except FileNotFoundError:
-            pass
-    try:
-        ready_path.unlink()
-    except FileNotFoundError:
-        pass
-    os.close(fd)
+    os.close(descriptor)
 PY
-  CONTROLLER_LOCK_PID=$!
-  local attempt
-  for (( attempt = 1; attempt <= 100; attempt++ )); do
-    if [[ -f "$CONTROLLER_LOCK_READY" && ! -L "$CONTROLLER_LOCK_READY" ]]; then
-      python3 - "$CONTROLLER_LOCK_PID" "$$" "$CONTROLLER_LOCK_RELEASE" <<'PY' &
+  exec {CONTROLLER_LOCK_FD}<>"$lock_path" || return 1
+  if ! python3 - "$CONTROLLER_LOCK_FD" "$lock_path" "$RUN_ID" "$SCRIPT_DIR/run_public_n15_pipeline_remote.sh" "$$" <<'PY'
+import fcntl
+import json
 import os
 from pathlib import Path
-import signal
+import stat
 import sys
-import time
 
-holder_pid, controller_pid = map(int, sys.argv[1:3])
-release = Path(sys.argv[3])
-while True:
-    try:
-        os.kill(holder_pid, 0)
-    except ProcessLookupError:
-        break
-    time.sleep(0.05)
-if not release.exists():
-    try:
-        os.kill(controller_pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
+descriptor = int(sys.argv[1])
+lock_path = Path(sys.argv[2])
+run_id, script_path, controller_pid = sys.argv[3], sys.argv[4], int(sys.argv[5])
+metadata = os.fstat(descriptor)
+path_metadata = lock_path.lstat()
+if (
+    lock_path.is_symlink()
+    or not stat.S_ISREG(metadata.st_mode)
+    or metadata.st_uid != os.getuid()
+    or stat.S_IMODE(metadata.st_mode) != 0o600
+    or metadata.st_nlink != 1
+    or (metadata.st_dev, metadata.st_ino) != (path_metadata.st_dev, path_metadata.st_ino)
+):
+    raise SystemExit(73)
+try:
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit(73)
+value = {
+    "schema_version": 1,
+    "kind": "lehome_public_n15_controller_lock_v1",
+    "run_id": run_id,
+    "controller_pid": controller_pid,
+    "acquisition_helper_pid": os.getpid(),
+    "script_path": script_path,
+}
+payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+os.lseek(descriptor, 0, os.SEEK_SET)
+os.ftruncate(descriptor, 0)
+remaining = memoryview(payload)
+while remaining:
+    remaining = remaining[os.write(descriptor, remaining):]
+os.fsync(descriptor)
 PY
-      CONTROLLER_LOCK_MONITOR_PID=$!
-      return 0
-    fi
-    if ! kill -0 "$CONTROLLER_LOCK_PID" 2>/dev/null; then
-      wait "$CONTROLLER_LOCK_PID" || true
-      CONTROLLER_LOCK_PID=""
-      return 1
-    fi
-    sleep 0.02
-  done
-  kill -TERM "$CONTROLLER_LOCK_PID" 2>/dev/null || true
-  wait "$CONTROLLER_LOCK_PID" 2>/dev/null || true
-  CONTROLLER_LOCK_PID=""
-  return 1
+  then
+    exec {CONTROLLER_LOCK_FD}>&-
+    CONTROLLER_LOCK_FD=""
+    return 1
+  fi
+  return 0
 }
 
 release_controller_lock() {
-  if [[ -n "$CONTROLLER_LOCK_RELEASE" ]]; then
-    ( umask 077; : > "$CONTROLLER_LOCK_RELEASE" ) 2>/dev/null || true
-  fi
-  if [[ -n "$CONTROLLER_LOCK_PID" ]]; then
-    kill -TERM "$CONTROLLER_LOCK_PID" 2>/dev/null || true
-    wait "$CONTROLLER_LOCK_PID" 2>/dev/null || true
-    CONTROLLER_LOCK_PID=""
-  fi
-  if [[ -n "$CONTROLLER_LOCK_MONITOR_PID" ]]; then
-    kill -TERM "$CONTROLLER_LOCK_MONITOR_PID" 2>/dev/null || true
-    wait "$CONTROLLER_LOCK_MONITOR_PID" 2>/dev/null || true
-    CONTROLLER_LOCK_MONITOR_PID=""
-  fi
-  if [[ -n "$CONTROLLER_LOCK_PATH" && -f "$CONTROLLER_LOCK_PATH" && ! -L "$CONTROLLER_LOCK_PATH" ]]; then
-    python3 - "$CONTROLLER_LOCK_PATH" "$$" <<'PY' || true
-import fcntl
+  if [[ -n "$CONTROLLER_LOCK_FD" && -n "$CONTROLLER_LOCK_PATH" ]]; then
+    python3 - "$CONTROLLER_LOCK_FD" "$CONTROLLER_LOCK_PATH" "$$" <<'PY' || true
 import json
 import os
 from pathlib import Path
 import sys
 
-path, controller_pid = Path(sys.argv[1]), int(sys.argv[2])
+descriptor, path, controller_pid = int(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
 try:
-    descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
-except OSError:
-    raise SystemExit(0)
-try:
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        raise SystemExit(0)
-    with os.fdopen(os.dup(descriptor), encoding="ascii") as stream:
-        value = json.load(stream)
     metadata = os.stat(path, follow_symlinks=False)
     held = os.fstat(descriptor)
-    if value.get("controller_pid") == controller_pid and (metadata.st_dev, metadata.st_ino) == (held.st_dev, held.st_ino):
+    if (metadata.st_dev, metadata.st_ino) != (held.st_dev, held.st_ino):
+        raise SystemExit(0)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    with os.fdopen(os.dup(descriptor), encoding="ascii") as stream:
+        value = json.load(stream)
+    if value.get("controller_pid") == controller_pid:
         path.unlink()
-finally:
-    os.close(descriptor)
+        parent = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+except (FileNotFoundError, json.JSONDecodeError, OSError):
+    pass
 PY
+    exec {CONTROLLER_LOCK_FD}>&-
+    CONTROLLER_LOCK_FD=""
   fi
-  rm -f -- "$CONTROLLER_LOCK_RELEASE" "$CONTROLLER_LOCK_READY" 2>/dev/null || true
 }
 
 controller_cleanup() {
@@ -570,14 +540,43 @@ SH
 }
 
 fetch_remote_immutable() {
-  local remote_path="$1" local_path="$2"
+  local remote_path="$1" local_path="$2" temporary
   [[ ! -e "$local_path" && ! -L "$local_path" ]] || fail "local immutable receipt already exists"
-  remote bash -s -- "$remote_path" <<'SH' >"$local_path"
+  temporary="$(mktemp "$(dirname -- "$local_path")/.${local_path##*/}.XXXXXX")"
+  if ! remote bash -s -- "$remote_path" <<'SH' >"$temporary"
 set -euo pipefail
 test -f "$1" && test ! -L "$1"
 cat -- "$1"
 SH
-  chmod 0444 "$local_path"
+  then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  if [[ ! -s "$temporary" || -L "$temporary" ]]; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  chmod 0444 "$temporary"
+  if ! python3 - "$temporary" "$local_path" <<'PY'
+import os, sys
+temporary, destination = sys.argv[1:]
+descriptor = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+os.link(temporary, destination)
+parent = os.open(os.path.dirname(destination), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(parent)
+finally:
+    os.close(parent)
+PY
+  then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  rm -f -- "$temporary"
 }
 
 host_next_unfinished_stage() {
@@ -671,6 +670,11 @@ try:
     with os.fdopen(descriptor, "wb") as stream:
         stream.write(payload); stream.flush(); os.fsync(stream.fileno()); os.fchmod(stream.fileno(), 0o444)
     os.link(temporary, output)
+    parent = os.open(output.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
 finally:
     temporary.unlink(missing_ok=True)
 PY
@@ -678,32 +682,32 @@ PY
   trap - RETURN
 }
 
-validate_remote_admitted_stage() {
-  case "$PRESTART_ADMITTED_STAGE" in
-    train)
-      ! remote_file_exists "$TRAINING_IDENTITY_RECEIPT" \
-        && ! remote_file_exists "$TRAINING_PUBLICATION_RECEIPT" \
-        || fail "remote training state is ahead of its host completion seal"
-      ;;
-    focused_gate)
-      remote_file_exists "$TRAINING_IDENTITY_RECEIPT" \
-        && remote_file_exists "$TRAINING_PUBLICATION_RECEIPT" \
-        && verify_remote_training_chain \
-        && verify_remote_training_publication \
-        && ! remote_file_exists "$FOCUSED_PROMOTION_RECEIPT" \
-        || fail "remote focused state disagrees with host completion seals"
-      ;;
-    harvest)
-      remote_file_exists "$TRAINING_IDENTITY_RECEIPT" \
-        && remote_file_exists "$TRAINING_PUBLICATION_RECEIPT" \
-        && remote_file_exists "$FOCUSED_PROMOTION_RECEIPT" \
-        && verify_remote_training_chain \
-        && verify_remote_training_publication \
-        && verify_remote_focused_chain \
-        || fail "remote harvest state disagrees with host completion seals"
-      ;;
-    *) fail "host-sealed paid-stage admission is invalid" ;;
-  esac
+reconcile_remote_stage_seals() {
+  local training_identity=0 training_publication=0 focused=0
+  remote_file_exists "$TRAINING_IDENTITY_RECEIPT" && training_identity=1
+  remote_file_exists "$TRAINING_PUBLICATION_RECEIPT" && training_publication=1
+  (( training_identity == training_publication )) \
+    || fail "remote training completion receipts are incomplete"
+  if (( training_identity == 1 )); then
+    verify_remote_training_chain || fail "remote training completion is invalid"
+    verify_remote_training_publication || fail "remote training publication is invalid"
+    record_host_stage_completion training "$HOST_TRAINING_STAGE_RECEIPT" \
+      "$TRAINING_IDENTITY_RECEIPT" "$TRAINING_PUBLICATION_RECEIPT"
+  elif [[ -e "$HOST_TRAINING_STAGE_RECEIPT" || -L "$HOST_TRAINING_STAGE_RECEIPT" ]]; then
+    fail "host training completion seal has no matching remote completion"
+  fi
+
+  remote_file_exists "$FOCUSED_PROMOTION_RECEIPT" && focused=1
+  if (( focused == 1 )); then
+    (( training_identity == 1 )) \
+      || fail "remote focused completion lacks training ancestry"
+    verify_remote_focused_chain || fail "remote focused completion is invalid"
+    record_host_stage_completion focused "$HOST_FOCUSED_STAGE_RECEIPT" \
+      "$FOCUSED_OUTPUT_ROOT/comparison-receipt.json" \
+      "$FOCUSED_OUTPUT_ROOT/publication.json" "$FOCUSED_PROMOTION_RECEIPT"
+  elif [[ -e "$HOST_FOCUSED_STAGE_RECEIPT" || -L "$HOST_FOCUSED_STAGE_RECEIPT" ]]; then
+    fail "host focused completion seal has no matching remote completion"
+  fi
 }
 
 finalize_host_harvest_terminal() {
@@ -1190,12 +1194,14 @@ publish_training_readback() {
 set -euo pipefail
 root="$1"; repository="$2"; prefix="$3"; token_file="$4"; test -f "$token_file" && test ! -L "$token_file"; export HF_TOKEN="$(cat "$token_file")"
 python3 - "$root" "$repository" "$prefix" <<'PY'
-import hashlib, json, os, re, sys
+import hashlib, json, os, re, sys, tempfile
 from pathlib import Path
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError
 root, repository, prefix = sys.argv[1:]; directory = Path(root); receipt = directory / "training-publication.json"
 if receipt.exists(): raise SystemExit("training publication receipt already exists")
+for scratch in directory.glob(".training-publication.json.*"):
+    scratch.unlink(missing_ok=True)
 entries = [{"path": str(path.relative_to(directory)), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()} for path in sorted(directory.rglob("*")) if path.is_file() and path != receipt]
 expected = {entry["path"]: entry["sha256"] for entry in entries}
 api = HfApi(token=os.environ["HF_TOKEN"])
@@ -1237,8 +1243,25 @@ if revision is None:
     if re.fullmatch(r"[0-9a-f]{40}", revision) is None or verify_revision(revision) is not True:
         raise SystemExit("uploaded training revision failed exact anonymous readback")
 value = {"schema_version": 1, "kind": "lehome_public_n15_training_publication_v1", "repository": repository, "remote_prefix": prefix, "immutable_revision": revision, "entries": entries, "anonymous_byte_readback_verified": True}
-with receipt.open("x", encoding="utf-8") as stream: json.dump(value, stream, sort_keys=True, separators=(",", ":")); stream.write("\n")
-os.chmod(receipt, 0o444)
+payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+descriptor, temporary_name = tempfile.mkstemp(prefix=".training-publication.json.", dir=directory)
+temporary = Path(temporary_name)
+try:
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(payload); stream.flush(); os.fsync(stream.fileno()); os.fchmod(stream.fileno(), 0o444)
+    if (
+        os.environ.get("LEHOME_N15_TEST_PUBLICATION_RECEIPT_FAULT") == "after-temporary"
+        and os.environ.get("PYTEST_CURRENT_TEST", "").startswith("tests/infrastructure/test_public_n15_pipeline_remote.py::")
+    ):
+        os._exit(86)
+    os.link(temporary, receipt)
+    parent = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+finally:
+    temporary.unlink(missing_ok=True)
 PY
 SH
 }
@@ -1305,6 +1328,7 @@ require_abs_file "$PROVIDER_VERIFIER" "checked-in exact Nebius provider parser";
 [[ "$PUBLIC_REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && -n "$SSH_TARGET" && "$REMOTE_ROOT" == /* && "$REMOTE_PIPELINE_ROOT" == /* && -n "$ASSETS_ROOT" && -n "$METADATA_ROOT" && -n "$REFERENCE_CHECKPOINT" && -n "$REFERENCE_SANITIZED_CONFIG" && -n "$REFERENCE_COMPATIBILITY" && -n "$NATIVE_RUNTIME_EVIDENCE" && -n "$NATIVE_DEPENDENCIES" && -n "$FOCUSED_HF_CACHE" && -n "$ROLLOUT_IMAGE_RECEIPT" && -n "$TRAINING_HF_CACHE" && -n "$TRAINING_UV" && -n "$LEROBOT_WHEEL" ]] || fail "all canonical remote inputs are required"
 [[ "$TRAINING_ROOT" == "$REMOTE_PIPELINE_ROOT/training" ]] || fail "training root must be this run's canonical remote training directory"
 [[ "$REMOTE_PIPELINE_ROOT" == "$REMOTE_RUNS_BASE/$RUN_ID" ]] || fail "remote pipeline root must be the canonical run-specific directory"
+verify_conservative_task_budget || fail "conservative provider budget admission failed"
 # Immutable pre-start cost admission: run_public_n15_reproduction.py lifecycle-plan.
 if [[ ! -e "$PLAN_RECEIPT" ]]; then python3 "$BUILDER" lifecycle-plan --run-id "$RUN_ID" --repository "$PUBLIC_REPOSITORY" --remote-pipeline-root "$REMOTE_PIPELINE_ROOT" --budget-usd "$MAX_BUDGET_USD" --estimated-cost-usd "$ESTIMATED_COST_USD" --output "$PLAN_RECEIPT" >/dev/null; fi
 python3 "$BUILDER" verify-lifecycle-plan --run-id "$RUN_ID" --repository "$PUBLIC_REPOSITORY" --remote-pipeline-root "$REMOTE_PIPELINE_ROOT" --budget-usd "$MAX_BUDGET_USD" --estimated-cost-usd "$ESTIMATED_COST_USD" --output "$PLAN_RECEIPT" >/dev/null
@@ -1330,6 +1354,8 @@ if [[ -f "$HARVEST_TERMINAL_RECEIPT" ]]; then
   fail "existing terminal receipt chain is invalid"
 fi
 aggregate_deadline="$(initialize_deadline)" || fail "aggregate paid deadline is invalid"
+verify_conservative_task_budget "$DEADLINE_RECEIPT" \
+  || fail "conservative provider budget admission failed"
 (( $(date +%s) < aggregate_deadline )) || fail "aggregate paid deadline has expired"
 PRESTART_ADMITTED_STAGE="$(host_next_unfinished_stage)" \
   || fail "host-sealed next unfinished stage is invalid"
@@ -1343,18 +1369,6 @@ admitted_deadline="$(initialize_stage_deadline "$PRESTART_ADMITTED_STAGE" "$admi
   || fail "$PRESTART_ADMITTED_STAGE deadline receipt is invalid"
 (( $(date +%s) < admitted_deadline )) \
   || fail "$PRESTART_ADMITTED_STAGE deadline has expired"
-# The price is operator-staged because this local controller cannot safely
-# refresh provider billing data without external access.  It must be fresh,
-# immutable, exact-VM evidence and is bound to this task's elapsed paid window.
-[[ -n "$PROVIDER_RATE_RECEIPT" ]] || fail "exact VM provider rate receipt is required"
-python3 "$BUILDER" provider-rate-admission \
-  --rate-receipt "$PROVIDER_RATE_RECEIPT" \
-  --lifecycle-plan "$PLAN_RECEIPT" \
-  --paid-deadline "$DEADLINE_RECEIPT" \
-  --budget-usd "$MAX_BUDGET_USD" \
-  --hourly-ceiling-usd "$PROVIDER_HOURLY_CEILING_USD" \
-  --output "$PROVIDER_RATE_ADMISSION_RECEIPT" >/dev/null \
-  || fail "exact VM provider rate/cost admission failed"
 # A provider STOPPED observation is also the fail-closed proof that no trainer
 # or prior controller can already be live when this controller admits resume.
 # provider must be STOPPED before explicit partial resume.
@@ -1370,7 +1384,26 @@ done
 rm -f -- "$response"
 wait_for_ssh_readiness || fail "exact VM did not become SSH-ready"
 wait_for_remote_runtime || fail "runtime/cloud-init/workspace/GPU/upstream gate failed"
-validate_remote_admitted_stage
+reconcile_remote_stage_seals
+reconciled_stage="$(host_next_unfinished_stage)" \
+  || fail "reconciled host-sealed stage is invalid"
+if [[ "$reconciled_stage" != "$PRESTART_ADMITTED_STAGE" ]]; then
+  PRESTART_ADMITTED_STAGE="$reconciled_stage"
+  case "$PRESTART_ADMITTED_STAGE" in
+    train) admitted_timeout="$TRAIN_TIMEOUT_SECONDS" ;;
+    focused_gate) admitted_timeout="$FOCUSED_TIMEOUT_SECONDS" ;;
+    harvest) admitted_timeout="$HARVEST_TIMEOUT_SECONDS" ;;
+    *) fail "reconciled host-sealed stage is invalid" ;;
+  esac
+  aggregate_deadline="$(initialize_deadline)" || fail "aggregate paid deadline is invalid"
+  verify_conservative_task_budget "$DEADLINE_RECEIPT" \
+    || fail "conservative provider budget admission failed"
+  (( $(date +%s) < aggregate_deadline )) || fail "aggregate paid deadline has expired"
+  admitted_deadline="$(initialize_stage_deadline "$PRESTART_ADMITTED_STAGE" "$admitted_timeout" "$aggregate_deadline")" \
+    || fail "$PRESTART_ADMITTED_STAGE deadline receipt is invalid"
+  (( $(date +%s) < admitted_deadline )) \
+    || fail "$PRESTART_ADMITTED_STAGE deadline has expired"
+fi
 if [[ "$RESUME_PARTIAL" == 1 ]] && { remote_file_exists "$TRAINING_IDENTITY_RECEIPT" || remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; }; then
   fail "explicit partial resume is forbidden after canonical training receipts exist"
 fi

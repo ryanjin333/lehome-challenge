@@ -19,7 +19,7 @@ import stat
 import subprocess
 import tempfile
 from types import MappingProxyType
-from typing import Mapping
+from typing import Callable, Mapping, Sequence
 import zipfile
 from base64 import urlsafe_b64encode
 
@@ -1058,14 +1058,19 @@ def verify_inputs(
     )
 
 
-def _write_atomic_json(path: Path | str, value: object, label: str) -> tuple[Path, str]:
+def _write_atomic_bytes(
+    path: Path | str,
+    payload: bytes,
+    label: str,
+    *,
+    before_publish: Callable[[], None] | None = None,
+) -> tuple[Path, str]:
     destination = Path(path)
     if not destination.is_absolute():
         raise ReproductionError(f"{label} path is unsafe")
     if destination.exists() or destination.is_symlink():
         raise ReproductionError(f"{label} already exists")
     parent = _regular_directory(destination.parent, f"{label} parent")
-    payload = _canonical_bytes(value)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=parent)
     temporary = Path(temporary_name)
     try:
@@ -1074,6 +1079,8 @@ def _write_atomic_json(path: Path | str, value: object, label: str) -> tuple[Pat
             stream.flush()
             os.fsync(stream.fileno())
             os.fchmod(stream.fileno(), 0o444)
+        if before_publish is not None:
+            before_publish()
         try:
             os.link(temporary, destination)
         except FileExistsError:
@@ -1086,6 +1093,21 @@ def _write_atomic_json(path: Path | str, value: object, label: str) -> tuple[Pat
     finally:
         temporary.unlink(missing_ok=True)
     return destination.resolve(strict=True), _sha256_bytes(payload)
+
+
+def _write_atomic_json(
+    path: Path | str,
+    value: object,
+    label: str,
+    *,
+    before_publish: Callable[[], None] | None = None,
+) -> tuple[Path, str]:
+    return _write_atomic_bytes(
+        path,
+        _canonical_bytes(value),
+        label,
+        before_publish=before_publish,
+    )
 
 
 def write_receipt(
@@ -1725,50 +1747,74 @@ def _verified_resume_lineage(
     return lineage
 
 
-def _verify_resumed_checkpoint_advancement(
-    artifacts: Mapping[str, Path], contract: ReproductionContract
+def validate_resume_advancement_hashes(
+    *,
+    final_checkpoint_hashes: Mapping[str, str],
+    source_checkpoint_hashes: Sequence[Mapping[str, str]],
+    scheduler_last_epoch: object,
+    final_step: int,
 ) -> None:
-    """Prove native continuation changed weights and restored mutable state."""
+    """Require the same restored-state advancement at every trust boundary."""
 
-    final_prefix = f"checkpoints/{int(contract.training['steps']):06d}/"
     advancement_files = (
         "pretrained_model/model.safetensors",
         "training_state/optimizer_state.safetensors",
         "training_state/rng_state.safetensors",
         "training_state/scheduler_state.json",
     )
-    receipts = [
-        path for relative, path in artifacts.items()
-        if relative.startswith("evidence/resume-attempts/") and relative.endswith(".json")
-    ]
-    for receipt_path in receipts:
-        _, _, receipt = _load_receipt(receipt_path, "resume lineage receipt")
-        source_hashes = receipt.get("checkpoint_files")
-        if not isinstance(source_hashes, dict):
-            raise ReproductionError("resume checkpoint advancement evidence is invalid")
+    if not source_checkpoint_hashes:
+        raise ReproductionError("resume checkpoint advancement evidence is invalid")
+    for source_hashes in source_checkpoint_hashes:
         for relative in advancement_files:
-            final_path = artifacts.get(final_prefix + relative)
+            final_hash = final_checkpoint_hashes.get(relative)
             source_hash = source_hashes.get(relative)
             if (
-                final_path is None
+                not isinstance(final_hash, str)
+                or _SHA256.fullmatch(final_hash) is None
                 or not isinstance(source_hash, str)
                 or _SHA256.fullmatch(source_hash) is None
-                or _sha256_file(final_path) == source_hash
+                or final_hash == source_hash
             ):
                 raise ReproductionError(
                     f"resumed checkpoint did not advance {relative}"
                 )
+    if type(scheduler_last_epoch) is not int or scheduler_last_epoch != final_step:
+        raise ReproductionError("resumed scheduler did not advance to step 12000")
+
+
+def _verify_resumed_checkpoint_advancement(
+    artifacts: Mapping[str, Path], contract: ReproductionContract
+) -> None:
+    """Prove native continuation changed weights and restored mutable state."""
+
+    final_prefix = f"checkpoints/{int(contract.training['steps']):06d}/"
+    receipts = [
+        path for relative, path in artifacts.items()
+        if relative.startswith("evidence/resume-attempts/") and relative.endswith(".json")
+    ]
+    source_hashes = []
+    for receipt_path in receipts:
+        _, _, receipt = _load_receipt(receipt_path, "resume lineage receipt")
+        hashes = receipt.get("checkpoint_files")
+        if not isinstance(hashes, dict):
+            raise ReproductionError("resume checkpoint advancement evidence is invalid")
+        source_hashes.append(hashes)
+    final_hashes = {
+        relative.removeprefix(final_prefix): _sha256_file(path)
+        for relative, path in artifacts.items()
+        if relative.startswith(final_prefix)
+    }
     scheduler_path = artifacts.get(final_prefix + "training_state/scheduler_state.json")
     try:
         scheduler = json.loads(scheduler_path.read_text(encoding="utf-8"))
     except (AttributeError, OSError, UnicodeError, json.JSONDecodeError):
         raise ReproductionError("resumed scheduler advancement evidence is invalid") from None
-    if (
-        not isinstance(scheduler, dict)
-        or type(scheduler.get("last_epoch")) is not int
-        or scheduler["last_epoch"] != int(contract.training["steps"])
-    ):
-        raise ReproductionError("resumed scheduler did not advance to step 12000")
+    validate_resume_advancement_hashes(
+        final_checkpoint_hashes=final_hashes,
+        source_checkpoint_hashes=source_hashes,
+        scheduler_last_epoch=(scheduler.get("last_epoch") if isinstance(scheduler, dict) else None),
+        final_step=int(contract.training["steps"]),
+    )
 
 
 def verify_training_output(
@@ -2176,7 +2222,8 @@ def finalize_training_output(
 
     allowed_faults = {
         None, "manifest", "upstream", "evidence", "logs", "runtime",
-        "checksums", "identity", "before-rename", "after-rename",
+        "checksums-temporary", "checksums", "identity-temporary", "identity",
+        "before-rename", "after-rename",
     }
     if fault_after not in allowed_faults:
         raise ReproductionError("finalization fault point is invalid")
@@ -2360,14 +2407,21 @@ def finalize_training_output(
         raise ReproductionError("assembled training last checkpoint is invalid")
 
     checksum_path = finalizing / "checksums.sha256"
-    if not checksum_path.exists():
-        rows = []
-        for relative, path in sorted(_artifact_files(finalizing).items()):
-            if relative == "checksums.sha256":
-                continue
-            rows.append(f"{_sha256_file(path)}  {relative}\n")
-        checksum_path.write_text("".join(rows), encoding="ascii")
-        checksum_path.chmod(0o444)
+    rows = []
+    for relative, path in sorted(_artifact_files(finalizing).items()):
+        if relative == "checksums.sha256":
+            continue
+        rows.append(f"{_sha256_file(path)}  {relative}\n")
+    checksum_payload = "".join(rows).encode("ascii")
+    if not checksum_path.exists() and not checksum_path.is_symlink():
+        _write_atomic_bytes(
+            checksum_path,
+            checksum_payload,
+            "training checksums",
+            before_publish=lambda: hit("checksums-temporary"),
+        )
+    elif _regular_file(checksum_path, "training checksums").read_bytes() != checksum_payload:
+        raise ReproductionError("training finalization checksums mismatch")
     hit("checksums")
 
     identity = verify_training_output(
@@ -2377,11 +2431,12 @@ def finalize_training_output(
         contract=contract,
     )
     identity_path = finalizing / "training-identity.json"
-    if not identity_path.exists():
-        write_receipt(
-            output=identity_path,
-            value=identity,
-            label="verified training output receipt",
+    if not identity_path.exists() and not identity_path.is_symlink():
+        _write_atomic_json(
+            identity_path,
+            identity,
+            "verified training output receipt",
+            before_publish=lambda: hit("identity-temporary"),
         )
     elif _regular_file(identity_path, "training identity receipt").read_bytes() != _canonical_bytes(identity):
         raise ReproductionError("training finalization identity receipt mismatch")

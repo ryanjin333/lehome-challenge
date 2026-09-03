@@ -372,6 +372,7 @@ def validate_training_identity_receipt(
             raise TrainingIdentityError(f"training artifact checksum mismatch: {relative}")
 
     resume_lineage = receipt.get("resume_lineage")
+    resume_source_checkpoint_hashes: list[Mapping[str, str]] = []
     resume_logs = {
         match.group(1): (relative, path)
         for relative, path in artifacts.items()
@@ -471,6 +472,7 @@ def validate_training_identity_receipt(
                 artifact = checksums.get(f"{checkpoint_relative}/{relative}")
                 if artifact != digest or _SHA256.fullmatch(str(digest)) is None:
                     raise TrainingIdentityError("candidate resume checkpoint hashes mismatch")
+            resume_source_checkpoint_hashes.append(checkpoint_hashes)
             if not _REQUIRED_PRETRAINED.issubset(
                 relative.removeprefix("pretrained_model/")
                 for relative in checkpoint_hashes
@@ -571,6 +573,33 @@ def validate_training_identity_receipt(
     step_receipt = _json(training_state / "training_step.json", "training-step evidence")
     if set(step_receipt) != {"step"} or step_receipt.get("step") != 12000:
         raise TrainingIdentityError("training-step evidence does not prove step 12000")
+    if validated_lineage:
+        scheduler = _json(
+            training_state / "scheduler_state.json", "scheduler advancement evidence"
+        )
+        source_root = Path(__file__).resolve().parents[2] / "source/lehome"
+        if not source_root.is_dir():
+            raise TrainingIdentityError("resume advancement verifier is unavailable")
+        sys.path.insert(0, str(source_root))
+        try:
+            from lehome.n15_reproduction import (  # type: ignore[import-not-found]
+                ReproductionError,
+                validate_resume_advancement_hashes,
+            )
+
+            validate_resume_advancement_hashes(
+                final_checkpoint_hashes={
+                    relative.removeprefix("checkpoints/012000/"): digest
+                    for relative, digest in checkpoint_files.items()
+                },
+                source_checkpoint_hashes=resume_source_checkpoint_hashes,
+                scheduler_last_epoch=scheduler.get("last_epoch"),
+                final_step=12000,
+            )
+        except (ImportError, ReproductionError) as error:
+            raise TrainingIdentityError(
+                "resumed checkpoint did not prove restored-state advancement"
+            ) from error
 
     source_copy = _regular(training_root / "evidence/source-receipt.json", "training source receipt")
     snapshots_copy = _regular(

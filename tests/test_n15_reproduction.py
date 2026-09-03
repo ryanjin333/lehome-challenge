@@ -1380,7 +1380,8 @@ def _materialize_native_resume_completion(
     "fault_after",
     [
         "manifest", "upstream", "evidence", "logs", "runtime",
-        "checksums", "identity", "before-rename", "after-rename",
+        "checksums-temporary", "checksums", "identity-temporary", "identity",
+        "before-rename", "after-rename",
     ],
 )
 def test_training_finalization_recovers_every_boundary_with_one_atomic_publish(
@@ -1559,6 +1560,65 @@ def test_resumed_final_identity_authenticates_resume_lineage(tmp_path: Path) -> 
         validate_training_identity_receipt(
             identity_path, expected_contract=contract,
             expected_pretrained_root=training_root / "checkpoints/012000/pretrained_model",
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation", ["model", "optimizer", "rng", "scheduler", "scheduler-step"],
+)
+def test_task2_resumed_identity_enforces_final_state_advancement_parity(
+    tmp_path: Path, mutation: str,
+) -> None:
+    from lehome import n15_reproduction as reproduction
+    from rollout_appliance.native_reference_site.training_identity import (
+        TrainingIdentityError,
+        validate_training_identity_receipt,
+    )
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout, source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id, disk_id=contract.disk_id, contract=contract,
+    )
+    training_root, staging_root, upstream_output = _materialize_partial_training(
+        tmp_path, verified=verified, contract=contract
+    )
+    lineage = reproduction.verify_resume_checkpoint(
+        verified=verified, training_root=training_root, staging_root=staging_root,
+        upstream_output=upstream_output, requested_step=1500,
+        attempt_id=f"attempt-task2-{mutation}", contract=contract,
+    )
+    _complete_resumed_training(
+        training_root=training_root, staging_root=staging_root,
+        upstream_output=upstream_output, receipt=lineage,
+    )
+    receipt = reproduction.verify_training_output(
+        verified=verified, training_root=training_root, contract=contract
+    )
+    relative = {
+        "model": "pretrained_model/model.safetensors",
+        "optimizer": "training_state/optimizer_state.safetensors",
+        "rng": "training_state/rng_state.safetensors",
+        "scheduler": "training_state/scheduler_state.json",
+    }.get(mutation)
+    final = training_root / "checkpoints/012000"
+    source = training_root / "checkpoints/001500"
+    if relative is not None:
+        (final / relative).write_bytes((source / relative).read_bytes())
+    else:
+        (final / "training_state/scheduler_state.json").write_bytes(
+            _canonical({"last_epoch": 11999})
+        )
+    identity = tmp_path / f"task2-resume-{mutation}.json"
+    _rewrite_task1_identity(training_root, receipt, identity)
+
+    with pytest.raises(TrainingIdentityError, match="advance"):
+        validate_training_identity_receipt(
+            identity, expected_contract=contract,
+            expected_pretrained_root=final / "pretrained_model",
         )
 
 
