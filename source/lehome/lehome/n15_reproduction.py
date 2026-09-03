@@ -1725,15 +1725,73 @@ def _verified_resume_lineage(
     return lineage
 
 
+def _verify_resumed_checkpoint_advancement(
+    artifacts: Mapping[str, Path], contract: ReproductionContract
+) -> None:
+    """Prove native continuation changed weights and restored mutable state."""
+
+    final_prefix = f"checkpoints/{int(contract.training['steps']):06d}/"
+    advancement_files = (
+        "pretrained_model/model.safetensors",
+        "training_state/optimizer_state.safetensors",
+        "training_state/rng_state.safetensors",
+        "training_state/scheduler_state.json",
+    )
+    receipts = [
+        path for relative, path in artifacts.items()
+        if relative.startswith("evidence/resume-attempts/") and relative.endswith(".json")
+    ]
+    for receipt_path in receipts:
+        _, _, receipt = _load_receipt(receipt_path, "resume lineage receipt")
+        source_hashes = receipt.get("checkpoint_files")
+        if not isinstance(source_hashes, dict):
+            raise ReproductionError("resume checkpoint advancement evidence is invalid")
+        for relative in advancement_files:
+            final_path = artifacts.get(final_prefix + relative)
+            source_hash = source_hashes.get(relative)
+            if (
+                final_path is None
+                or not isinstance(source_hash, str)
+                or _SHA256.fullmatch(source_hash) is None
+                or _sha256_file(final_path) == source_hash
+            ):
+                raise ReproductionError(
+                    f"resumed checkpoint did not advance {relative}"
+                )
+    scheduler_path = artifacts.get(final_prefix + "training_state/scheduler_state.json")
+    try:
+        scheduler = json.loads(scheduler_path.read_text(encoding="utf-8"))
+    except (AttributeError, OSError, UnicodeError, json.JSONDecodeError):
+        raise ReproductionError("resumed scheduler advancement evidence is invalid") from None
+    if (
+        not isinstance(scheduler, dict)
+        or type(scheduler.get("last_epoch")) is not int
+        or scheduler["last_epoch"] != int(contract.training["steps"])
+    ):
+        raise ReproductionError("resumed scheduler did not advance to step 12000")
+
+
 def verify_training_output(
     *,
     verified: VerifiedInputs,
     training_root: Path | str,
+    canonical_training_root: Path | str | None = None,
     contract: ReproductionContract = CONTRACT,
 ) -> dict[str, object]:
     """Verify a complete step-12,000 upstream training output offline."""
 
     root = _regular_directory(Path(training_root), "training output root")
+    canonical_root = root
+    if canonical_training_root is not None:
+        requested = Path(canonical_training_root)
+        if not requested.is_absolute() or ".." in requested.parts:
+            raise ReproductionError("canonical training output root is invalid")
+        canonical_parent = _regular_directory(
+            requested.parent, "canonical training output parent"
+        )
+        canonical_root = canonical_parent / requested.name
+        if canonical_root.exists() or canonical_root.is_symlink():
+            raise ReproductionError("canonical training output root already exists")
     last = root / "checkpoints/last"
     if not last.is_symlink() or os.readlink(last) != "012000":
         raise ReproductionError("upstream last-checkpoint link is missing or invalid")
@@ -1926,7 +1984,7 @@ def verify_training_output(
         or runtime["kind"] != "lehome_public_n15_training_runtime_v1"
         or runtime["upstream_lerobot_wheel_sha256"] != contract.lerobot_wheel_sha256
         or runtime["dependency_lock_sha256"] != contract.dependency_lock_sha256
-        or runtime["dependency_lock_path"] != str(lock)
+        or Path(runtime["dependency_lock_path"]) != canonical_root / "evidence/uv.lock"
         or not isinstance(runtime["python_executable"], str)
         or not isinstance(runtime["upstream_lerobot_wheel_path"], str)
         or not isinstance(runtime["compatibility_wheel_path"], str)
@@ -1976,8 +2034,12 @@ def verify_training_output(
             f"training Python interpreter is not Python {contract.python_version}"
         )
 
+    expected_upstream_wheel = canonical_root / "evidence/upstream/lerobot-0.4.3-py3-none-any.whl"
+    if Path(runtime["upstream_lerobot_wheel_path"]) != expected_upstream_wheel:
+        raise ReproductionError("upstream training LeRobot wheel path is not canonical")
     upstream_wheel = _regular_file(
-        Path(runtime["upstream_lerobot_wheel_path"]), "upstream training LeRobot wheel"
+        root / "evidence/upstream/lerobot-0.4.3-py3-none-any.whl",
+        "upstream training LeRobot wheel",
     )
     if upstream_wheel != artifacts.get("evidence/upstream/lerobot-0.4.3-py3-none-any.whl"):
         raise ReproductionError("upstream training LeRobot wheel is outside the sealed output")
@@ -1990,9 +2052,21 @@ def verify_training_output(
         or upstream_tree != contract.lerobot_package_tree_sha256
     ):
         raise ReproductionError("upstream training LeRobot wheel package tree mismatch")
-    wheel = _regular_file(Path(runtime["compatibility_wheel_path"]), "compatible training LeRobot wheel")
+    expected_wheel = canonical_root / "evidence/compatibility/lerobot-0.4.3-py3-none-any.whl"
+    expected_compatibility_receipt = canonical_root / "evidence/compatibility/lerobot-compatibility-receipt.json"
+    if (
+        Path(runtime["compatibility_wheel_path"]) != expected_wheel
+        or Path(runtime["compatibility_wheel_receipt_path"])
+        != expected_compatibility_receipt
+        or Path(runtime["dependency_lock_path"]) != canonical_root / "evidence/uv.lock"
+    ):
+        raise ReproductionError("training runtime artifact paths are not canonical")
+    wheel = _regular_file(
+        root / "evidence/compatibility/lerobot-0.4.3-py3-none-any.whl",
+        "compatible training LeRobot wheel",
+    )
     compatibility_receipt = _regular_file(
-        Path(runtime["compatibility_wheel_receipt_path"]),
+        root / "evidence/compatibility/lerobot-compatibility-receipt.json",
         "compatible training LeRobot wheel receipt",
     )
     if (
@@ -2019,9 +2093,11 @@ def verify_training_output(
         raise ReproductionError("pinned training config is unreadable") from None
     if runtime["scheduler"] != scheduler:
         raise ReproductionError("training runtime scheduler differs from pinned public YAML")
+    expected_package_root = canonical_root / "runtime/site-packages/lerobot"
+    if Path(runtime["lerobot_package_root"]) != expected_package_root:
+        raise ReproductionError("installed LeRobot package path is not canonical")
     package_root = _regular_directory(
-        Path(runtime["lerobot_package_root"]),
-        "installed LeRobot package root",
+        root / "runtime/site-packages/lerobot", "installed LeRobot package root"
     )
     package_count, package_tree_sha256 = _installed_package_tree_identity(package_root)
     if (
@@ -2030,6 +2106,8 @@ def verify_training_output(
     ):
         raise ReproductionError("installed LeRobot package differs from the compatible wheel")
     resume_lineage = _verified_resume_lineage(root, artifacts, contract)
+    if resume_lineage:
+        _verify_resumed_checkpoint_advancement(artifacts, contract)
     log = artifacts.get("logs/train.log")
     if log is None or log.stat().st_size == 0:
         raise ReproductionError("training log is missing or empty")
@@ -2068,9 +2146,9 @@ def verify_training_output(
     identity = {
         "schema_version": 1,
         "kind": "lehome_public_n15_verified_training_output_v1",
-        "training_root": str(root),
+        "training_root": str(canonical_root),
         "step": int(contract.training["steps"]),
-        "checkpoint_root": str(checkpoint_root),
+        "checkpoint_root": str(canonical_root / checkpoint_relative),
         "checkpoint_files": {
             relative: _sha256_file(path)
             for relative, path in sorted(checkpoint_files.items())
@@ -2082,4 +2160,241 @@ def verify_training_output(
     }
     if resume_lineage:
         identity["resume_lineage"] = resume_lineage
+    return identity
+
+
+def finalize_training_output(
+    *,
+    verified: VerifiedInputs,
+    training_root: Path | str,
+    staging_root: Path | str,
+    upstream_output: Path | str,
+    contract: ReproductionContract = CONTRACT,
+    fault_after: str | None = None,
+) -> dict[str, object]:
+    """Recoverably assemble, verify, and atomically publish a completed run."""
+
+    allowed_faults = {
+        None, "manifest", "upstream", "evidence", "logs", "runtime",
+        "checksums", "identity", "before-rename", "after-rename",
+    }
+    if fault_after not in allowed_faults:
+        raise ReproductionError("finalization fault point is invalid")
+
+    def hit(point: str) -> None:
+        if fault_after == point:
+            raise ReproductionError(f"injected finalization fault after {point}")
+
+    requested_training = Path(training_root)
+    if not requested_training.is_absolute() or ".." in requested_training.parts:
+        raise ReproductionError("canonical training root is invalid")
+    parent = _regular_directory(requested_training.parent, "canonical training parent")
+    training = parent / requested_training.name
+    finalizing = parent / f"{training.name}.finalizing"
+    requested_staging = Path(staging_root)
+    requested_upstream = Path(upstream_output)
+    if requested_staging != Path(f"{training}.evidence-staging"):
+        raise ReproductionError("training finalization staging root is not canonical")
+    expected_upstream = (
+        verified.checkout / "outputs/train/groot_four_types_merged_batch64_lr2e-4"
+    )
+    if requested_upstream != expected_upstream:
+        raise ReproductionError("training finalization upstream root is not canonical")
+
+    if training.exists() or training.is_symlink():
+        if finalizing.exists() or finalizing.is_symlink():
+            raise ReproductionError(
+                "completed and finalizing training roots are ambiguous"
+            )
+        completed = _regular_directory(training, "training output root")
+        identity_path = _regular_file(
+            completed / "training-identity.json", "training identity receipt"
+        )
+        value = verify_training_output(
+            verified=verified, training_root=completed, contract=contract
+        )
+        if identity_path.read_bytes() != _canonical_bytes(value):
+            raise ReproductionError("completed training identity receipt mismatch")
+        return value
+
+    marker_in_staging = requested_staging / "training-finalization.json"
+    marker_in_final = finalizing / "evidence/training-finalization.json"
+    marker_path = marker_in_final if marker_in_final.exists() else marker_in_staging
+
+    source_locations: dict[str, Path] = {}
+    if not marker_path.exists() and not marker_path.is_symlink():
+        staging = _regular_directory(requested_staging, "training evidence staging root")
+        upstream = _regular_directory(requested_upstream, "upstream training output")
+        if finalizing.exists() or finalizing.is_symlink():
+            raise ReproductionError("unauthenticated training finalization root exists")
+        if len({parent.stat().st_dev, staging.stat().st_dev, upstream.stat().st_dev}) != 1:
+            raise ReproductionError("training finalization roots are not on one filesystem")
+        for base, prefix in (
+            (upstream, ""),
+            (_regular_directory(staging / "evidence", "staged training evidence"), "evidence"),
+            (_regular_directory(staging / "logs", "staged training logs"), "logs"),
+            (_regular_directory(staging / "runtime", "staged training runtime"), "runtime"),
+        ):
+            for path in sorted(base.rglob("*")):
+                relative = path.relative_to(base).as_posix()
+                final_relative = f"{prefix}/{relative}" if prefix else relative
+                metadata = path.lstat()
+                if path.is_symlink():
+                    if final_relative == "checkpoints/last" and os.readlink(path) == "012000":
+                        continue
+                    raise ReproductionError(
+                        f"training finalization contains unsafe symlink: {final_relative}"
+                    )
+                if stat.S_ISDIR(metadata.st_mode):
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ReproductionError(
+                        f"training finalization contains unsafe entry: {final_relative}"
+                    )
+                source_locations[final_relative] = path
+        if not source_locations:
+            raise ReproductionError("training finalization input is empty")
+        marker = {
+            "schema_version": 1,
+            "kind": "lehome_public_n15_training_finalization_v1",
+            "training_root": str(training),
+            "finalizing_root": str(finalizing),
+            "staging_root": str(staging),
+            "upstream_output": str(upstream),
+            "files": {
+                relative: _sha256_file(path)
+                for relative, path in sorted(source_locations.items())
+            },
+            "last_checkpoint": "012000",
+        }
+        write_receipt(
+            output=marker_in_staging,
+            value=marker,
+            label="training finalization receipt",
+        )
+        marker_path = marker_in_staging
+        hit("manifest")
+
+    marker_path, _, marker = _load_receipt(
+        marker_path, "training finalization receipt"
+    )
+    expected_keys = {
+        "schema_version", "kind", "training_root", "finalizing_root",
+        "staging_root", "upstream_output", "files", "last_checkpoint",
+    }
+    if (
+        set(marker) != expected_keys
+        or marker.get("schema_version") != 1
+        or marker.get("kind") != "lehome_public_n15_training_finalization_v1"
+        or marker.get("training_root") != str(training)
+        or marker.get("finalizing_root") != str(finalizing)
+        or marker.get("staging_root") != str(requested_staging)
+        or marker.get("upstream_output") != str(requested_upstream)
+        or marker.get("last_checkpoint") != "012000"
+        or not isinstance(marker.get("files"), dict)
+        or not marker["files"]
+    ):
+        raise ReproductionError("training finalization receipt identity mismatch")
+
+    def original_location(relative: str) -> Path:
+        pure = PurePosixPath(relative)
+        if pure.parts[0] in {"evidence", "logs", "runtime"}:
+            return requested_staging.joinpath(*pure.parts)
+        return requested_upstream.joinpath(*pure.parts)
+
+    for relative, digest in marker["files"].items():
+        pure = PurePosixPath(str(relative))
+        if (
+            not isinstance(relative, str)
+            or pure.is_absolute()
+            or any(part in {"", ".", ".."} for part in pure.parts)
+            or not isinstance(digest, str)
+            or _SHA256.fullmatch(digest) is None
+        ):
+            raise ReproductionError("training finalization file manifest is invalid")
+        original = original_location(relative)
+        assembled = finalizing.joinpath(*pure.parts)
+        candidates = [path for path in (original, assembled) if path.exists() or path.is_symlink()]
+        if len(candidates) != 1:
+            raise ReproductionError("training finalization file location is ambiguous")
+        path = _regular_file(candidates[0], "training finalization artifact")
+        if _sha256_file(path) != digest:
+            raise ReproductionError("training finalization artifact digest mismatch")
+
+    if not finalizing.exists():
+        _regular_directory(requested_upstream, "upstream training output").rename(finalizing)
+    elif requested_upstream.exists() or requested_upstream.is_symlink():
+        raise ReproductionError("training finalization upstream location is ambiguous")
+    _regular_directory(finalizing, "training finalization root")
+    hit("upstream")
+
+    for component in ("evidence", "logs", "runtime"):
+        source = requested_staging / component
+        destination = finalizing / component
+        if not destination.exists():
+            _regular_directory(source, f"staged training {component}").rename(destination)
+        elif source.exists() or source.is_symlink():
+            raise ReproductionError(
+                f"training finalization {component} location is ambiguous"
+            )
+        hit(component)
+
+    if marker_in_staging.exists():
+        marker_in_staging.rename(marker_in_final)
+    elif marker_path != marker_in_final:
+        raise ReproductionError("training finalization receipt location is invalid")
+    if requested_staging.exists() or requested_staging.is_symlink():
+        try:
+            requested_staging.rmdir()
+        except OSError:
+            raise ReproductionError("training finalization staging root is not empty") from None
+
+    for relative, digest in marker["files"].items():
+        assembled = _regular_file(
+            finalizing / relative, "assembled training finalization artifact"
+        )
+        if _sha256_file(assembled) != digest:
+            raise ReproductionError("assembled training finalization digest mismatch")
+    last = finalizing / "checkpoints/last"
+    if not last.is_symlink() or os.readlink(last) != "012000":
+        raise ReproductionError("assembled training last checkpoint is invalid")
+
+    checksum_path = finalizing / "checksums.sha256"
+    if not checksum_path.exists():
+        rows = []
+        for relative, path in sorted(_artifact_files(finalizing).items()):
+            if relative == "checksums.sha256":
+                continue
+            rows.append(f"{_sha256_file(path)}  {relative}\n")
+        checksum_path.write_text("".join(rows), encoding="ascii")
+        checksum_path.chmod(0o444)
+    hit("checksums")
+
+    identity = verify_training_output(
+        verified=verified,
+        training_root=finalizing,
+        canonical_training_root=training,
+        contract=contract,
+    )
+    identity_path = finalizing / "training-identity.json"
+    if not identity_path.exists():
+        write_receipt(
+            output=identity_path,
+            value=identity,
+            label="verified training output receipt",
+        )
+    elif _regular_file(identity_path, "training identity receipt").read_bytes() != _canonical_bytes(identity):
+        raise ReproductionError("training finalization identity receipt mismatch")
+    hit("identity")
+    second_identity = verify_training_output(
+        verified=verified,
+        training_root=finalizing,
+        canonical_training_root=training,
+        contract=contract,
+    )
+    if second_identity != identity or identity_path.read_bytes() != _canonical_bytes(identity):
+        raise ReproductionError("training finalization verification is not stable")
+    hit("before-rename")
+    finalizing.rename(training)
+    hit("after-rename")
     return identity

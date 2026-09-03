@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
+import stat
 import sys
+import time
 from typing import Mapping, Sequence
 
 
@@ -23,6 +26,7 @@ from lehome.n15_reproduction import (  # noqa: E402
     build_compatible_lerobot_wheel,
     cleanup_resume_scratch,
     compatibility_wheel_identity,
+    finalize_training_output,
     render_training,
     prepare_resume_scratch,
     verify_resume_checkpoint,
@@ -54,6 +58,19 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_inputs(output)
     output.add_argument("--training-root", type=Path, required=True)
+    finalization = commands.add_parser(
+        "finalize-training-output",
+        help="recoverably assemble and atomically publish a verified training output",
+    )
+    for name in (
+        "checkout", "source-receipt", "resolved-snapshots-receipt",
+        "vm-id", "disk-id", "training-root", "staging-root", "upstream-output",
+    ):
+        finalization.add_argument(
+            f"--{name}",
+            type=Path if name not in {"vm-id", "disk-id"} else str,
+            required=True,
+        )
     resume = commands.add_parser(
         "verify-resume-checkpoint",
         help="authenticate one explicit partial native LeRobot checkpoint",
@@ -95,6 +112,16 @@ def _parser() -> argparse.ArgumentParser:
         item.add_argument("--budget-usd", type=float, required=True)
         item.add_argument("--estimated-cost-usd", type=float, required=True)
         item.add_argument("--output", type=Path, required=True)
+    rate = commands.add_parser(
+        "provider-rate-admission",
+        help="validate immutable exact-VM rate evidence against the paid task window",
+    )
+    rate.add_argument("--rate-receipt", type=Path, required=True)
+    rate.add_argument("--lifecycle-plan", type=Path, required=True)
+    rate.add_argument("--paid-deadline", type=Path, required=True)
+    rate.add_argument("--budget-usd", type=float, required=True)
+    rate.add_argument("--hourly-ceiling-usd", type=float, required=True)
+    rate.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -189,6 +216,132 @@ def _verify_lifecycle_plan(args: argparse.Namespace, contract: ReproductionContr
     return actual
 
 
+def _immutable_canonical_json(path: Path, label: str) -> tuple[dict[str, object], bytes]:
+    try:
+        metadata = path.lstat()
+        payload = path.read_bytes()
+        value = json.loads(payload)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ReproductionError(f"{label} is unreadable") from error
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o444
+        or not isinstance(value, dict)
+    ):
+        raise ReproductionError(f"{label} is not an immutable regular file")
+    try:
+        canonical = (
+            json.dumps(
+                value, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=True, allow_nan=False,
+            ) + "\n"
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise ReproductionError(f"{label} is not canonical strict JSON") from error
+    if payload != canonical:
+        raise ReproductionError(f"{label} is not canonical strict JSON")
+    return value, payload
+
+
+def _provider_rate_admission(
+    args: argparse.Namespace, contract: ReproductionContract,
+) -> dict[str, object]:
+    """Validate staged exact-VM price evidence and the task-local paid window."""
+
+    rate, rate_bytes = _immutable_canonical_json(args.rate_receipt, "provider rate receipt")
+    plan, plan_bytes = _immutable_canonical_json(args.lifecycle_plan, "lifecycle plan")
+    deadline, deadline_bytes = _immutable_canonical_json(args.paid_deadline, "paid deadline")
+    expected_rate_keys = {
+        "schema_version", "kind", "vm_id", "currency", "hourly_rate_usd",
+        "source", "observed_unix_seconds", "valid_until_unix_seconds",
+    }
+    hourly_rate = rate.get("hourly_rate_usd")
+    observed = rate.get("observed_unix_seconds")
+    valid_until = rate.get("valid_until_unix_seconds")
+    if (
+        set(rate) != expected_rate_keys
+        or (
+            rate.get("schema_version"), rate.get("kind"), rate.get("vm_id"),
+            rate.get("currency"), rate.get("source"),
+        ) != (
+            1, "lehome_public_n15_exact_vm_rate_v1", contract.vm_id, "USD",
+            "operator-staged-nebius-exact-vm-price",
+        )
+        or isinstance(hourly_rate, bool)
+        or not isinstance(hourly_rate, (int, float))
+        or not (hourly_rate > 0.0)
+        or type(observed) is not int
+        or type(valid_until) is not int
+        or not (0 < valid_until - observed <= 86400)
+    ):
+        raise ReproductionError("provider rate receipt is not exact pinned VM price evidence")
+    now = int(time.time())
+    if observed > now or now > valid_until:
+        raise ReproductionError("provider rate receipt is expired or not yet valid")
+    if not (args.hourly_ceiling_usd > 0.0 and hourly_rate <= args.hourly_ceiling_usd):
+        raise ReproductionError("provider rate exceeds the code-owned hourly ceiling")
+    if not (args.budget_usd > 0.0 and args.budget_usd <= 100.0):
+        raise ReproductionError("task budget is invalid")
+    started = deadline.get("started_unix_seconds")
+    ends = deadline.get("deadline_unix_seconds")
+    if (
+        plan.get("vm_id") != contract.vm_id
+        or plan.get("budget_usd") != args.budget_usd
+        or deadline.get("kind") != "lehome_public_n15_paid_deadline_v1"
+        or deadline.get("run_id") != plan.get("run_id")
+        or deadline.get("lifecycle_plan_sha256") != hashlib.sha256(plan_bytes).hexdigest()
+        or type(started) is not int
+        or type(ends) is not int
+        or ends != started + 86400
+        or not (started <= now < ends)
+    ):
+        raise ReproductionError("paid task window is invalid for provider rate admission")
+    paid_window_seconds = ends - started
+    elapsed_paid_seconds = now - started
+    maximum_cost = hourly_rate * paid_window_seconds / 3600.0
+    elapsed_cost = hourly_rate * elapsed_paid_seconds / 3600.0
+    if maximum_cost > args.budget_usd or elapsed_cost > args.budget_usd:
+        raise ReproductionError("exact-VM task cost exceeds the approved budget")
+    base = {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_provider_rate_admission_v1",
+        "vm_id": contract.vm_id,
+        "rate_receipt_sha256": hashlib.sha256(rate_bytes).hexdigest(),
+        "lifecycle_plan_sha256": hashlib.sha256(plan_bytes).hexdigest(),
+        "paid_deadline_sha256": hashlib.sha256(deadline_bytes).hexdigest(),
+        "hourly_rate_usd": hourly_rate,
+        "hourly_ceiling_usd": args.hourly_ceiling_usd,
+        "budget_usd": args.budget_usd,
+        "paid_window_seconds": paid_window_seconds,
+        "maximum_paid_window_cost_usd": maximum_cost,
+    }
+    if args.output.exists() or args.output.is_symlink():
+        actual, _ = _immutable_canonical_json(args.output, "provider rate admission")
+        admitted_at = actual.get("admitted_at_unix_seconds")
+        first_elapsed = actual.get("elapsed_paid_seconds_at_first_admission")
+        if (
+            {key: actual.get(key) for key in base} != base
+            or set(actual) != {
+                *base, "admitted_at_unix_seconds",
+                "elapsed_paid_seconds_at_first_admission",
+            }
+            or type(admitted_at) is not int
+            or type(first_elapsed) is not int
+            or admitted_at - started != first_elapsed
+            or not (observed <= admitted_at <= now)
+        ):
+            raise ReproductionError(
+                "provider rate admission is not the exact immutable task admission"
+            )
+        return actual
+    return {
+        **base,
+        "admitted_at_unix_seconds": now,
+        "elapsed_paid_seconds_at_first_admission": elapsed_paid_seconds,
+    }
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -207,6 +360,17 @@ def main(
             result = {**value, **stored}
         elif args.command == "verify-lifecycle-plan":
             result = _verify_lifecycle_plan(args, contract)
+        elif args.command == "provider-rate-admission":
+            value = _provider_rate_admission(args, contract)
+            if args.output.exists():
+                result = value
+            else:
+                stored = write_receipt(
+                    output=args.output,
+                    value=value,
+                    label="provider rate admission",
+                )
+                result = {**value, **stored}
         elif args.command == "build-compatible-wheel":
             result = build_compatible_lerobot_wheel(
                 upstream_wheel=args.upstream_wheel,
@@ -259,6 +423,14 @@ def main(
                     label="verified training output receipt",
                 )
                 result = {**value, **stored}
+            elif args.command == "finalize-training-output":
+                result = finalize_training_output(
+                    verified=verified,
+                    training_root=args.training_root,
+                    staging_root=args.staging_root,
+                    upstream_output=args.upstream_output,
+                    contract=contract,
+                )
             elif args.command == "verify-resume-checkpoint":
                 value = verify_resume_checkpoint(
                     verified=verified,

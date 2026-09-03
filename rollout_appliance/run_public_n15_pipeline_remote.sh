@@ -22,6 +22,7 @@ readonly MAX_BUDGET_USD="${LEHOME_N15_MAX_BUDGET_USD:-100}"
 # Code-owned conservative ceiling: 3 USD/hour times (12h train + 4h gate +
 # 8h harvest) = 72 USD. The live provider preflight must not exceed 3 USD/h.
 readonly PROVIDER_HOURLY_CEILING_USD=3
+readonly PROVIDER_RATE_RECEIPT="${LEHOME_N15_PROVIDER_RATE_RECEIPT:-}"
 readonly TRAIN_TIMEOUT_SECONDS=43200
 readonly FOCUSED_TIMEOUT_SECONDS=14400
 readonly HARVEST_TIMEOUT_SECONDS=28800
@@ -57,6 +58,7 @@ readonly FOCUSED_HF_CACHE="${LEHOME_N15_FOCUSED_HF_CACHE_ROOT:-}"
 readonly ROLLOUT_IMAGE_RECEIPT="${LEHOME_N15_ROLLOUT_IMAGE_RECEIPT:-}"
 readonly PLAN_RECEIPT="$PIPELINE_ROOT/lifecycle-plan.json"
 readonly DEADLINE_RECEIPT="$PIPELINE_ROOT/paid-deadline.json"
+readonly PROVIDER_RATE_ADMISSION_RECEIPT="$PIPELINE_ROOT/provider-rate-admission.json"
 readonly TRAINING_IDENTITY_RECEIPT="$TRAINING_ROOT/training-identity.json"
 readonly TRAINING_PUBLICATION_RECEIPT="$TRAINING_ROOT/training-publication.json"
 readonly FOCUSED_OUTPUT_ROOT="$REMOTE_PIPELINE_ROOT/focused"
@@ -71,6 +73,9 @@ PIPELINE_COMPLETE=0
 PROVIDER_CLEANUP_REQUIRED=0
 CONTROLLER_LOCK_PID=""
 CONTROLLER_LOCK_READY=""
+CONTROLLER_LOCK_MONITOR_PID=""
+CONTROLLER_LOCK_RELEASE=""
+CONTROLLER_LOCK_PATH=""
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
 require_abs_dir() { [[ "$1" == /* && "$1" != *".."* && -d "$1" && ! -L "$1" ]] || fail "$2 is unavailable or unsafe"; }
@@ -129,7 +134,9 @@ acquire_controller_lock() {
   fi
   local lock_root="$runtime_base/lehome-public-n15-controller-$(id -u)"
   local lock_path="$lock_root/$EXACT_VM_ID.lock"
+  CONTROLLER_LOCK_PATH="$lock_path"
   CONTROLLER_LOCK_READY="$lock_root/.ready.$$.$RANDOM"
+  CONTROLLER_LOCK_RELEASE="$lock_root/.release.$$.$RANDOM"
   python3 - "$runtime_base" "$lock_root" "$lock_path" "$CONTROLLER_LOCK_READY" "$RUN_ID" "$SCRIPT_DIR/run_public_n15_pipeline_remote.sh" "$$" <<'PY' &
 import fcntl
 import json
@@ -230,7 +237,31 @@ PY
   CONTROLLER_LOCK_PID=$!
   local attempt
   for (( attempt = 1; attempt <= 100; attempt++ )); do
-    if [[ -f "$CONTROLLER_LOCK_READY" && ! -L "$CONTROLLER_LOCK_READY" ]]; then return 0; fi
+    if [[ -f "$CONTROLLER_LOCK_READY" && ! -L "$CONTROLLER_LOCK_READY" ]]; then
+      python3 - "$CONTROLLER_LOCK_PID" "$$" "$CONTROLLER_LOCK_RELEASE" <<'PY' &
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+holder_pid, controller_pid = map(int, sys.argv[1:3])
+release = Path(sys.argv[3])
+while True:
+    try:
+        os.kill(holder_pid, 0)
+    except ProcessLookupError:
+        break
+    time.sleep(0.05)
+if not release.exists():
+    try:
+        os.kill(controller_pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+PY
+      CONTROLLER_LOCK_MONITOR_PID=$!
+      return 0
+    fi
     if ! kill -0 "$CONTROLLER_LOCK_PID" 2>/dev/null; then
       wait "$CONTROLLER_LOCK_PID" || true
       CONTROLLER_LOCK_PID=""
@@ -245,11 +276,48 @@ PY
 }
 
 release_controller_lock() {
+  if [[ -n "$CONTROLLER_LOCK_RELEASE" ]]; then
+    ( umask 077; : > "$CONTROLLER_LOCK_RELEASE" ) 2>/dev/null || true
+  fi
   if [[ -n "$CONTROLLER_LOCK_PID" ]]; then
     kill -TERM "$CONTROLLER_LOCK_PID" 2>/dev/null || true
     wait "$CONTROLLER_LOCK_PID" 2>/dev/null || true
     CONTROLLER_LOCK_PID=""
   fi
+  if [[ -n "$CONTROLLER_LOCK_MONITOR_PID" ]]; then
+    kill -TERM "$CONTROLLER_LOCK_MONITOR_PID" 2>/dev/null || true
+    wait "$CONTROLLER_LOCK_MONITOR_PID" 2>/dev/null || true
+    CONTROLLER_LOCK_MONITOR_PID=""
+  fi
+  if [[ -n "$CONTROLLER_LOCK_PATH" && -f "$CONTROLLER_LOCK_PATH" && ! -L "$CONTROLLER_LOCK_PATH" ]]; then
+    python3 - "$CONTROLLER_LOCK_PATH" "$$" <<'PY' || true
+import fcntl
+import json
+import os
+from pathlib import Path
+import sys
+
+path, controller_pid = Path(sys.argv[1]), int(sys.argv[2])
+try:
+    descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+except OSError:
+    raise SystemExit(0)
+try:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(0)
+    with os.fdopen(os.dup(descriptor), encoding="ascii") as stream:
+        value = json.load(stream)
+    metadata = os.stat(path, follow_symlinks=False)
+    held = os.fstat(descriptor)
+    if value.get("controller_pid") == controller_pid and (metadata.st_dev, metadata.st_ino) == (held.st_dev, held.st_ino):
+        path.unlink()
+finally:
+    os.close(descriptor)
+PY
+  fi
+  rm -f -- "$CONTROLLER_LOCK_RELEASE" "$CONTROLLER_LOCK_READY" 2>/dev/null || true
 }
 
 controller_cleanup() {
@@ -376,7 +444,7 @@ PY
 }
 run_paid_stage() {
   local label="$1" limit_seconds="$2" stage_function="$3"
-  local aggregate_deadline now stage_deadline pid status
+  local aggregate_deadline now stage_deadline pid status launcher_root launcher_ready ready_pid attempt
   case "$stage_function" in train_stage|focused_stage|harvest_stage) ;; *) fail "unknown paid stage dispatcher" ;; esac
   aggregate_deadline="$(initialize_deadline)" || fail "aggregate paid deadline is invalid"
   stage_deadline="$(initialize_stage_deadline "$label" "$limit_seconds" "$aggregate_deadline")" || fail "$label deadline receipt is invalid"
@@ -387,10 +455,19 @@ run_paid_stage() {
   # launcher creates the session before execing an allowlisted Bash dispatcher.
   export -f remote train_stage focused_stage harvest_stage
   export REMOTE_ROOT SSH_TARGET HF_TOKEN_FILE RUNTIME_REVISION SOURCE_ROOT SOURCE_RECEIPT SNAPSHOTS_RECEIPT TRAINING_ROOT EXACT_VM_ID PROTECTED_DISK_ID TRAINING_HF_CACHE TRAINING_PYTHON TRAINING_UV LEROBOT_WHEEL RUNTIME_IMAGE_ID RESUME_PARTIAL RESUME_CHECKPOINT RESUME_STEP RESUME_ATTEMPT_ID ASSETS_ROOT METADATA_ROOT REFERENCE_CHECKPOINT REFERENCE_SANITIZED_CONFIG REFERENCE_COMPATIBILITY NATIVE_RUNTIME_EVIDENCE NATIVE_DEPENDENCIES FOCUSED_HF_CACHE FOCUSED_OUTPUT_ROOT PUBLIC_REPOSITORY ROLLOUT_IMAGE_RECEIPT REMOTE_PIPELINE_ROOT
-  python3 - "$stage_function" <<'PY' &
+  launcher_root="$(mktemp -d "$PIPELINE_ROOT/.stage-launcher-${label}.XXXXXX")"
+  launcher_ready="$launcher_root/ready"
+  python3 - "$stage_function" "$launcher_ready" <<'PY' &
 import os
+from pathlib import Path
 import sys
 os.setsid()
+ready = Path(sys.argv[2])
+descriptor = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+    stream.write(f"{os.getpid()}\n")
+    stream.flush()
+    os.fsync(stream.fileno())
 os.execvpe(
     "bash",
     ["bash", "-c", 'case "$1" in train_stage) train_stage ;; focused_stage) focused_stage ;; harvest_stage) harvest_stage ;; *) exit 64 ;; esac', "bash", sys.argv[1]],
@@ -398,6 +475,24 @@ os.execvpe(
 )
 PY
   pid=$!
+  ready_pid=""
+  for (( attempt = 1; attempt <= 200; attempt++ )); do
+    if [[ -f "$launcher_ready" && ! -L "$launcher_ready" ]]; then
+      IFS= read -r ready_pid < "$launcher_ready"
+      [[ "$ready_pid" == "$pid" ]] || { kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf -- "$launcher_root"; fail "$label launcher handshake identity mismatch"; }
+      break
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true; rm -rf -- "$launcher_root"; fail "$label launcher exited before setsid handshake"
+    fi
+    now="$(date +%s)"
+    if (( now >= stage_deadline )); then
+      kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf -- "$launcher_root"; fail "$label launcher handshake exceeded its paid timeout"
+    fi
+    sleep 0.02
+  done
+  [[ "$ready_pid" == "$pid" ]] || { kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf -- "$launcher_root"; fail "$label launcher setsid handshake failed"; }
+  rm -rf -- "$launcher_root"
   while kill -0 -- "-$pid" 2>/dev/null; do
     now="$(date +%s)"
     if (( now >= stage_deadline )); then
@@ -542,6 +637,14 @@ cleanup_resume_scratch() {
 }
 trap cleanup_resume_scratch EXIT
 trap 'exit 130' INT TERM
+if [[ -d "${training_root}.finalizing" || -f "$staging_root/training-finalization.json" || -f "${training_root}.finalizing/evidence/training-finalization.json" ]]; then
+  python3 "$root/scripts/run_public_n15_reproduction.py" finalize-training-output \
+    --checkout "$source_root" --source-receipt "$source_receipt" \
+    --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" \
+    --training-root "$training_root" --staging-root "$staging_root" \
+    --upstream-output "$upstream_output" >/dev/null
+  exit 0
+fi
 if [[ "$resume_partial" == 1 ]]; then
   [[ "$resume_step" =~ ^[0-9]+$ ]] || { echo "explicit resume step is invalid" >&2; exit 2; }
   [[ "$resume_attempt_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$ ]] || { echo "explicit resume attempt identity is invalid" >&2; exit 2; }
@@ -938,32 +1041,11 @@ if [[ "$resume_partial" == 1 ]]; then
     --staging-root "$staging_root" --attempt-id "$resume_attempt_id" >/dev/null
   resume_scratch_root=""
 fi
-mv -- "$upstream_output" "$training_root"
-mv -- "$staging_root/evidence" "$training_root/evidence"
-mv -- "$staging_root/logs" "$training_root/logs"
-rmdir -- "$staging_root"
-"$python_bin" - "$training_root" <<'PY'
-import hashlib
-from pathlib import Path
-import sys
-
-root = Path(sys.argv[1])
-checksum = root / "checksums.sha256"
-if checksum.exists() or checksum.is_symlink():
-    raise SystemExit("training checksum manifest already exists")
-rows = []
-for path in sorted(root.rglob("*")):
-    if path.is_file() and not path.is_symlink():
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-        digest = digest.hexdigest()
-        rows.append(f"{digest}  {path.relative_to(root).as_posix()}\n")
-checksum.write_text("".join(rows), encoding="ascii")
-checksum.chmod(0o444)
-PY
-python3 "$root/scripts/run_public_n15_reproduction.py" verify-training-output --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --training-root "$training_root" --output "$training_root/training-identity.json" >/dev/null
+python3 "$root/scripts/run_public_n15_reproduction.py" finalize-training-output \
+  --checkout "$source_root" --source-receipt "$source_receipt" \
+  --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" \
+  --training-root "$training_root" --staging-root "$staging_root" \
+  --upstream-output "$upstream_output" >/dev/null
 SH
 }
 
@@ -973,17 +1055,52 @@ publish_training_readback() {
 set -euo pipefail
 root="$1"; repository="$2"; prefix="$3"; token_file="$4"; test -f "$token_file" && test ! -L "$token_file"; export HF_TOKEN="$(cat "$token_file")"
 python3 - "$root" "$repository" "$prefix" <<'PY'
-import hashlib, json, os, sys
+import hashlib, json, os, re, sys
 from pathlib import Path
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.utils import EntryNotFoundError
 root, repository, prefix = sys.argv[1:]; directory = Path(root); receipt = directory / "training-publication.json"
 if receipt.exists(): raise SystemExit("training publication receipt already exists")
 entries = [{"path": str(path.relative_to(directory)), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()} for path in sorted(directory.rglob("*")) if path.is_file() and path != receipt]
-commit = HfApi(token=os.environ["HF_TOKEN"]).upload_folder(repo_id=repository, repo_type="model", folder_path=str(directory), path_in_repo=prefix, commit_message="public N1.5 training " + prefix)
-revision = str(commit.oid)
-for entry in entries:
-    fetched = hf_hub_download(repo_id=repository, repo_type="model", filename=prefix + "/" + entry["path"], revision=revision, token=False)
-    if hashlib.sha256(Path(fetched).read_bytes()).hexdigest() != entry["sha256"]: raise SystemExit("anonymous training byte readback mismatch")
+expected = {entry["path"]: entry["sha256"] for entry in entries}
+api = HfApi(token=os.environ["HF_TOKEN"])
+
+def verify_revision(revision):
+    try:
+        tree = api.list_repo_tree(repo_id=repository, repo_type="model", path_in_repo=prefix, revision=revision, recursive=True)
+    except EntryNotFoundError:
+        return None
+    remote_paths = {
+        item.rfilename[len(prefix) + 1:]
+        for item in tree
+        if getattr(item, "size", None) is not None and item.rfilename.startswith(prefix + "/")
+    }
+    if remote_paths != set(expected):
+        return False
+    for relative, digest in expected.items():
+        fetched = hf_hub_download(repo_id=repository, repo_type="model", filename=prefix + "/" + relative, revision=revision, token=False)
+        if hashlib.sha256(Path(fetched).read_bytes()).hexdigest() != digest:
+            return False
+    return True
+
+revision = None
+prefix_seen = False
+for prior in api.list_repo_commits(repo_id=repository, repo_type="model", token=os.environ["HF_TOKEN"]):
+    candidate = str(prior.commit_id)
+    if re.fullmatch(r"[0-9a-f]{40}", candidate) is None:
+        raise SystemExit("repository commit history contains an invalid immutable revision")
+    match = verify_revision(candidate)
+    prefix_seen = prefix_seen or match is not None
+    if match is True:
+        revision = candidate
+        break
+if revision is None:
+    if prefix_seen:
+        raise SystemExit("training publication prefix already exists with different bytes")
+    commit = api.upload_folder(repo_id=repository, repo_type="model", folder_path=str(directory), path_in_repo=prefix, commit_message="public N1.5 training " + prefix)
+    revision = str(commit.oid)
+    if re.fullmatch(r"[0-9a-f]{40}", revision) is None or verify_revision(revision) is not True:
+        raise SystemExit("uploaded training revision failed exact anonymous readback")
 value = {"schema_version": 1, "kind": "lehome_public_n15_training_publication_v1", "repository": repository, "remote_prefix": prefix, "immutable_revision": revision, "entries": entries, "anonymous_byte_readback_verified": True}
 with receipt.open("x", encoding="utf-8") as stream: json.dump(value, stream, sort_keys=True, separators=(",", ":")); stream.write("\n")
 os.chmod(receipt, 0o444)
@@ -1036,6 +1153,7 @@ main() {
 [[ "$RESUME_PARTIAL" == 0 || "$RESUME_PARTIAL" == 1 ]] || fail "resume-partial mode must be explicitly 0 or 1"
 if [[ "$RESUME_PARTIAL" == 1 ]]; then
   [[ "$RESUME_STEP" =~ ^[0-9]+$ && "$RESUME_CHECKPOINT" == "$SOURCE_ROOT/outputs/train/groot_four_types_merged_batch64_lr2e-4/checkpoints/$(printf '%06d' "$RESUME_STEP")" ]] || fail "resume requires the exact configured checkpoint path and step"
+  (( RESUME_STEP > 0 && RESUME_STEP < 12000 && RESUME_STEP % 1500 == 0 )) || fail "resume step is not a valid checkpoint boundary"
   [[ "$RESUME_ATTEMPT_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$ ]] || fail "resume requires a distinct attempt identity"
 else
   [[ -z "$RESUME_CHECKPOINT" && -z "$RESUME_STEP" && -z "$RESUME_ATTEMPT_ID" ]] || fail "resume checkpoint inputs require explicit resume-partial mode"
@@ -1052,8 +1170,6 @@ if [[ ! -e "$PLAN_RECEIPT" ]]; then python3 "$BUILDER" lifecycle-plan --run-id "
 python3 "$BUILDER" verify-lifecycle-plan --run-id "$RUN_ID" --repository "$PUBLIC_REPOSITORY" --remote-pipeline-root "$REMOTE_PIPELINE_ROOT" --budget-usd "$MAX_BUDGET_USD" --estimated-cost-usd "$ESTIMATED_COST_USD" --output "$PLAN_RECEIPT" >/dev/null
 aggregate_deadline="$(initialize_deadline)" || fail "aggregate paid deadline is invalid"
 (( $(date +%s) < aggregate_deadline )) || fail "aggregate paid deadline has expired"
-train_deadline="$(initialize_stage_deadline train "$TRAIN_TIMEOUT_SECONDS" "$aggregate_deadline")" || fail "train deadline receipt is invalid"
-(( $(date +%s) < train_deadline )) || fail "train deadline has expired"
 acquire_controller_lock || fail "another N1.5 controller already owns this run"
 trap controller_cleanup EXIT
 if [[ "$RESUME_PARTIAL" == 1 && -f "$HARVEST_TERMINAL_RECEIPT" ]]; then
@@ -1075,6 +1191,18 @@ if [[ -f "$HARVEST_TERMINAL_RECEIPT" ]]; then
   rm -rf -- "$terminal_temp_root"
   fail "existing terminal receipt chain is invalid"
 fi
+# The price is operator-staged because this local controller cannot safely
+# refresh provider billing data without external access.  It must be fresh,
+# immutable, exact-VM evidence and is bound to this task's elapsed paid window.
+[[ -n "$PROVIDER_RATE_RECEIPT" ]] || fail "exact VM provider rate receipt is required"
+python3 "$BUILDER" provider-rate-admission \
+  --rate-receipt "$PROVIDER_RATE_RECEIPT" \
+  --lifecycle-plan "$PLAN_RECEIPT" \
+  --paid-deadline "$DEADLINE_RECEIPT" \
+  --budget-usd "$MAX_BUDGET_USD" \
+  --hourly-ceiling-usd "$PROVIDER_HOURLY_CEILING_USD" \
+  --output "$PROVIDER_RATE_ADMISSION_RECEIPT" >/dev/null \
+  || fail "exact VM provider rate/cost admission failed"
 # A provider STOPPED observation is also the fail-closed proof that no trainer
 # or prior controller can already be live when this controller admits resume.
 # provider must be STOPPED before explicit partial resume.

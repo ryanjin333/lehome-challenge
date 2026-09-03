@@ -1062,6 +1062,9 @@ def _materialize_partial_training(
     last.symlink_to(f"{step:06d}", target_is_directory=True)
     state = checkpoint / "training_state/training_step.json"
     state.write_bytes(_canonical({"step": step}))
+    (checkpoint / "training_state/scheduler_state.json").write_bytes(
+        _canonical({"last_epoch": step})
+    )
     config = checkpoint / "pretrained_model/train_config.json"
     # Authentic LeRobot 0.4.3 TrainPipelineConfig serialization from the
     # public 12K recipe.  Only the source YAML's lora_rank and run-specific
@@ -1300,7 +1303,8 @@ def test_verify_resume_checkpoint_rejects_non_boundary_steps(
 
 
 def _complete_resumed_training(
-    *, training_root: Path, staging_root: Path, upstream_output: Path, receipt: dict[str, object]
+    *, training_root: Path, staging_root: Path, upstream_output: Path,
+    receipt: dict[str, object], advance: bool = True,
 ) -> Path:
     attempt_id = str(receipt["attempt_id"])
     lineage = staging_root / f"evidence/resume-attempts/{attempt_id}.json"
@@ -1312,6 +1316,18 @@ def _complete_resumed_training(
     (upstream_output / "checkpoints/012000/training_state/training_step.json").write_bytes(
         _canonical({"step": 12000})
     )
+    if advance:
+        final = upstream_output / "checkpoints/012000"
+        for relative in (
+            "pretrained_model/model.safetensors",
+            "training_state/optimizer_state.safetensors",
+            "training_state/rng_state.safetensors",
+        ):
+            path = final / relative
+            path.write_bytes(path.read_bytes() + b" resumed-through-step-12000")
+        (final / "training_state/scheduler_state.json").write_bytes(
+            _canonical({"last_epoch": 12000})
+        )
     (staging_root / "logs/train.log").write_text(
         "Checkpoint policy after step 1500\n", encoding="utf-8"
     )
@@ -1325,6 +1341,158 @@ def _complete_resumed_training(
     staging_root.rmdir()
     _write_training_checksums(training_root)
     return lineage
+
+
+def _materialize_native_resume_completion(
+    *, upstream_output: Path, staging_root: Path, receipt: dict[str, object]
+) -> None:
+    attempt_id = str(receipt["attempt_id"])
+    attempts = staging_root / "evidence/resume-attempts"
+    attempts.mkdir(parents=True, exist_ok=True)
+    (attempts / f"{attempt_id}.json").write_bytes(_canonical(receipt))
+    source = upstream_output / "checkpoints/001500"
+    final = upstream_output / "checkpoints/012000"
+    shutil.copytree(source, final)
+    last = upstream_output / "checkpoints/last"
+    last.unlink(); last.symlink_to("012000")
+    (final / "training_state/training_step.json").write_bytes(
+        _canonical({"step": 12000})
+    )
+    (final / "training_state/scheduler_state.json").write_bytes(
+        _canonical({"last_epoch": 12000})
+    )
+    for relative in (
+        "pretrained_model/model.safetensors",
+        "training_state/optimizer_state.safetensors",
+        "training_state/rng_state.safetensors",
+    ):
+        path = final / relative
+        path.write_bytes(path.read_bytes() + b" resumed-through-step-12000")
+    (staging_root / "logs/train.log").write_text(
+        "Checkpoint policy after step 1500\n", encoding="utf-8"
+    )
+    (staging_root / f"logs/train-resume-{attempt_id}.log").write_text(
+        "Checkpoint policy after step 12000\nEnd of training\n", encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    "fault_after",
+    [
+        "manifest", "upstream", "evidence", "logs", "runtime",
+        "checksums", "identity", "before-rename", "after-rename",
+    ],
+)
+def test_training_finalization_recovers_every_boundary_with_one_atomic_publish(
+    tmp_path: Path, fault_after: str,
+) -> None:
+    from lehome import n15_reproduction as reproduction
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout, source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id, disk_id=contract.disk_id, contract=contract,
+    )
+    training_root, staging_root, upstream_output = _materialize_partial_training(
+        tmp_path, verified=verified, contract=contract
+    )
+    lineage = reproduction.verify_resume_checkpoint(
+        verified=verified, training_root=training_root, staging_root=staging_root,
+        upstream_output=upstream_output, requested_step=1500,
+        attempt_id=f"attempt-finalize-{fault_after}", contract=contract,
+    )
+    _materialize_native_resume_completion(
+        upstream_output=upstream_output, staging_root=staging_root, receipt=lineage
+    )
+
+    with pytest.raises(reproduction.ReproductionError, match="injected finalization fault"):
+        reproduction.finalize_training_output(
+            verified=verified, training_root=training_root, staging_root=staging_root,
+            upstream_output=upstream_output, contract=contract,
+            fault_after=fault_after,
+        )
+    result = reproduction.finalize_training_output(
+        verified=verified, training_root=training_root, staging_root=staging_root,
+        upstream_output=upstream_output, contract=contract,
+    )
+
+    assert result["training_root"] == str(training_root.resolve())
+    assert training_root.is_dir()
+    assert not Path(f"{training_root}.finalizing").exists()
+    assert not staging_root.exists() and not upstream_output.exists()
+    identity_path = training_root / "training-identity.json"
+    assert identity_path.is_file() and not identity_path.is_symlink()
+    assert json.loads(identity_path.read_text(encoding="ascii")) == result
+
+
+def test_training_finalization_rejects_noncanonical_upstream_before_moving_state(
+    tmp_path: Path,
+) -> None:
+    from lehome import n15_reproduction as reproduction
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout, source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id, disk_id=contract.disk_id, contract=contract,
+    )
+    training_root, staging_root, upstream_output = _materialize_partial_training(
+        tmp_path, verified=verified, contract=contract
+    )
+    wrong_upstream = tmp_path / "wrong-upstream"
+    shutil.copytree(upstream_output, wrong_upstream, symlinks=True)
+
+    with pytest.raises(reproduction.ReproductionError, match="canonical"):
+        reproduction.finalize_training_output(
+            verified=verified, training_root=training_root, staging_root=staging_root,
+            upstream_output=wrong_upstream, contract=contract,
+        )
+
+    assert wrong_upstream.is_dir() and staging_root.is_dir()
+    assert not Path(f"{training_root}.finalizing").exists()
+
+
+def test_training_finalization_rejects_ambiguous_completed_and_finalizing_roots(
+    tmp_path: Path,
+) -> None:
+    from lehome import n15_reproduction as reproduction
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout, source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id, disk_id=contract.disk_id, contract=contract,
+    )
+    training_root, staging_root, upstream_output = _materialize_partial_training(
+        tmp_path, verified=verified, contract=contract
+    )
+    lineage = reproduction.verify_resume_checkpoint(
+        verified=verified, training_root=training_root, staging_root=staging_root,
+        upstream_output=upstream_output, requested_step=1500,
+        attempt_id="attempt-ambiguous", contract=contract,
+    )
+    _materialize_native_resume_completion(
+        upstream_output=upstream_output, staging_root=staging_root, receipt=lineage
+    )
+    reproduction.finalize_training_output(
+        verified=verified, training_root=training_root, staging_root=staging_root,
+        upstream_output=upstream_output, contract=contract,
+    )
+    finalizing = Path(f"{training_root}.finalizing")
+    finalizing.mkdir()
+
+    with pytest.raises(reproduction.ReproductionError, match="ambiguous"):
+        reproduction.finalize_training_output(
+            verified=verified, training_root=training_root, staging_root=staging_root,
+            upstream_output=upstream_output, contract=contract,
+        )
 
 
 def test_resumed_final_identity_authenticates_resume_lineage(tmp_path: Path) -> None:
@@ -1452,6 +1620,38 @@ def test_same_checkpoint_boundary_supports_distinct_authenticated_attempts(
     ]
     assert identity["resume_lineage"][0]["log_sha256"] is None
     assert all(item["log_sha256"] for item in identity["resume_lineage"][1:])
+
+
+def test_resumed_output_rejects_relabelled_checkpoint_without_state_advancement(
+    tmp_path: Path,
+) -> None:
+    from lehome import n15_reproduction as reproduction
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout, source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id, disk_id=contract.disk_id, contract=contract,
+    )
+    training_root, staging_root, upstream_output = _materialize_partial_training(
+        tmp_path, verified=verified, contract=contract
+    )
+    lineage = reproduction.verify_resume_checkpoint(
+        verified=verified, training_root=training_root, staging_root=staging_root,
+        upstream_output=upstream_output, requested_step=1500,
+        attempt_id="attempt-no-advancement", contract=contract,
+    )
+    _complete_resumed_training(
+        training_root=training_root, staging_root=staging_root,
+        upstream_output=upstream_output, receipt=lineage, advance=False,
+    )
+
+    with pytest.raises(reproduction.ReproductionError, match="did not advance"):
+        reproduction.verify_training_output(
+            verified=verified, training_root=training_root, contract=contract
+        )
 
 
 @pytest.mark.parametrize(
