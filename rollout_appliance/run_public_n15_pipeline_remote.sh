@@ -59,6 +59,8 @@ readonly ROLLOUT_IMAGE_RECEIPT="${LEHOME_N15_ROLLOUT_IMAGE_RECEIPT:-}"
 readonly PLAN_RECEIPT="$PIPELINE_ROOT/lifecycle-plan.json"
 readonly DEADLINE_RECEIPT="$PIPELINE_ROOT/paid-deadline.json"
 readonly PROVIDER_RATE_ADMISSION_RECEIPT="$PIPELINE_ROOT/provider-rate-admission.json"
+readonly HOST_TRAINING_STAGE_RECEIPT="$PIPELINE_ROOT/host-stage-training-complete.json"
+readonly HOST_FOCUSED_STAGE_RECEIPT="$PIPELINE_ROOT/host-stage-focused-complete.json"
 readonly TRAINING_IDENTITY_RECEIPT="$TRAINING_ROOT/training-identity.json"
 readonly TRAINING_PUBLICATION_RECEIPT="$TRAINING_ROOT/training-publication.json"
 readonly FOCUSED_OUTPUT_ROOT="$REMOTE_PIPELINE_ROOT/focused"
@@ -76,6 +78,7 @@ CONTROLLER_LOCK_READY=""
 CONTROLLER_LOCK_MONITOR_PID=""
 CONTROLLER_LOCK_RELEASE=""
 CONTROLLER_LOCK_PATH=""
+PRESTART_ADMITTED_STAGE=""
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
 require_abs_dir() { [[ "$1" == /* && "$1" != *".."* && -d "$1" && ! -L "$1" ]] || fail "$2 is unavailable or unsafe"; }
@@ -446,6 +449,9 @@ run_paid_stage() {
   local label="$1" limit_seconds="$2" stage_function="$3"
   local aggregate_deadline now stage_deadline pid status launcher_root launcher_ready ready_pid attempt
   case "$stage_function" in train_stage|focused_stage|harvest_stage) ;; *) fail "unknown paid stage dispatcher" ;; esac
+  if [[ -n "$PRESTART_ADMITTED_STAGE" && "$label" != "$PRESTART_ADMITTED_STAGE" ]]; then
+    fail "$label is not the host-sealed next unfinished stage"
+  fi
   aggregate_deadline="$(initialize_deadline)" || fail "aggregate paid deadline is invalid"
   stage_deadline="$(initialize_stage_deadline "$label" "$limit_seconds" "$aggregate_deadline")" || fail "$label deadline receipt is invalid"
   (( stage_deadline <= aggregate_deadline )) || fail "$label deadline exceeds aggregate deadline"
@@ -507,6 +513,9 @@ PY
   done
   wait "$pid"; status=$?
   (( status == 0 )) || fail "$label failed"
+  if [[ "$label" == "$PRESTART_ADMITTED_STAGE" ]]; then
+    PRESTART_ADMITTED_STAGE=""
+  fi
 }
 remote_file_exists() { remote bash -s -- "$1" <<'SH'
 set -euo pipefail
@@ -569,6 +578,132 @@ test -f "$1" && test ! -L "$1"
 cat -- "$1"
 SH
   chmod 0444 "$local_path"
+}
+
+host_next_unfinished_stage() {
+  python3 - "$HOST_TRAINING_STAGE_RECEIPT" "$HOST_FOCUSED_STAGE_RECEIPT" "$RUN_ID" \
+    "$TRAINING_IDENTITY_RECEIPT" "$TRAINING_PUBLICATION_RECEIPT" \
+    "$FOCUSED_OUTPUT_ROOT/comparison-receipt.json" "$FOCUSED_OUTPUT_ROOT/publication.json" "$FOCUSED_PROMOTION_RECEIPT" <<'PY'
+import json, re, stat, sys
+from pathlib import Path
+
+training, focused = map(Path, sys.argv[1:3])
+run_id = sys.argv[3]
+expected = {
+    "training": sys.argv[4:6],
+    "focused": sys.argv[6:9],
+}
+
+def validate(path, stage):
+    if not path.exists() and not path.is_symlink():
+        return False
+    metadata = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o444:
+        raise SystemExit(f"host {stage} completion seal is unsafe")
+    raw = path.read_bytes()
+    value = json.loads(raw)
+    canonical = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+    receipts = value.get("remote_receipts") if isinstance(value, dict) else None
+    if (
+        raw != canonical
+        or set(value) != {"schema_version", "kind", "run_id", "stage", "remote_receipts"}
+        or (value.get("schema_version"), value.get("kind"), value.get("run_id"), value.get("stage"))
+        != (1, "lehome_public_n15_host_stage_completion_v1", run_id, stage)
+        or not isinstance(receipts, list)
+        or [item.get("path") for item in receipts if isinstance(item, dict)] != expected[stage]
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"path", "sha256"}
+            or re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256"))) is None
+            for item in receipts
+        )
+    ):
+        raise SystemExit(f"host {stage} completion seal is invalid")
+    return True
+
+training_complete = validate(training, "training")
+focused_complete = validate(focused, "focused")
+if focused_complete and not training_complete:
+    raise SystemExit("host focused completion seal lacks training ancestry")
+print("harvest" if focused_complete else "focused_gate" if training_complete else "train")
+PY
+}
+
+record_host_stage_completion() {
+  local stage="$1" output="$2" temporary_root index remote_path
+  shift 2
+  temporary_root="$(mktemp -d "$PIPELINE_ROOT/.host-stage-${stage}.XXXXXX")"
+  trap 'rm -rf -- "$temporary_root"' RETURN
+  index=0
+  for remote_path in "$@"; do
+    fetch_remote_immutable "$remote_path" "$temporary_root/$index.receipt"
+    index=$((index + 1))
+  done
+  python3 - "$output" "$RUN_ID" "$stage" "$temporary_root" "$@" <<'PY'
+import hashlib, json, os, stat, sys, tempfile
+from pathlib import Path
+
+output, run_id, stage, temporary_root = Path(sys.argv[1]), sys.argv[2], sys.argv[3], Path(sys.argv[4])
+remote_paths = sys.argv[5:]
+receipts = []
+for index, remote_path in enumerate(remote_paths):
+    path = temporary_root / f"{index}.receipt"
+    metadata = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_size == 0:
+        raise SystemExit("host stage source receipt is unsafe")
+    receipts.append({"path": remote_path, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+value = {
+    "schema_version": 1,
+    "kind": "lehome_public_n15_host_stage_completion_v1",
+    "run_id": run_id,
+    "stage": stage,
+    "remote_receipts": receipts,
+}
+payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+if output.exists() or output.is_symlink():
+    metadata = output.lstat()
+    if output.is_symlink() or not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o444 or output.read_bytes() != payload:
+        raise SystemExit("existing host stage completion seal mismatch")
+    raise SystemExit(0)
+descriptor, temporary_name = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent)
+temporary = Path(temporary_name)
+try:
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(payload); stream.flush(); os.fsync(stream.fileno()); os.fchmod(stream.fileno(), 0o444)
+    os.link(temporary, output)
+finally:
+    temporary.unlink(missing_ok=True)
+PY
+  rm -rf -- "$temporary_root"
+  trap - RETURN
+}
+
+validate_remote_admitted_stage() {
+  case "$PRESTART_ADMITTED_STAGE" in
+    train)
+      ! remote_file_exists "$TRAINING_IDENTITY_RECEIPT" \
+        && ! remote_file_exists "$TRAINING_PUBLICATION_RECEIPT" \
+        || fail "remote training state is ahead of its host completion seal"
+      ;;
+    focused_gate)
+      remote_file_exists "$TRAINING_IDENTITY_RECEIPT" \
+        && remote_file_exists "$TRAINING_PUBLICATION_RECEIPT" \
+        && verify_remote_training_chain \
+        && verify_remote_training_publication \
+        && ! remote_file_exists "$FOCUSED_PROMOTION_RECEIPT" \
+        || fail "remote focused state disagrees with host completion seals"
+      ;;
+    harvest)
+      remote_file_exists "$TRAINING_IDENTITY_RECEIPT" \
+        && remote_file_exists "$TRAINING_PUBLICATION_RECEIPT" \
+        && remote_file_exists "$FOCUSED_PROMOTION_RECEIPT" \
+        && verify_remote_training_chain \
+        && verify_remote_training_publication \
+        && verify_remote_focused_chain \
+        || fail "remote harvest state disagrees with host completion seals"
+      ;;
+    *) fail "host-sealed paid-stage admission is invalid" ;;
+  esac
 }
 
 finalize_host_harvest_terminal() {
@@ -1131,8 +1266,13 @@ run_pipeline_after_runtime() {
   verify_remote_training_chain || fail "training receipt chain failed"
   if ! remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; then publish_training_readback || fail "training publication/readback failed"; fi
   verify_remote_training_publication || fail "training publication chain failed"
+  record_host_stage_completion training "$HOST_TRAINING_STAGE_RECEIPT" \
+    "$TRAINING_IDENTITY_RECEIPT" "$TRAINING_PUBLICATION_RECEIPT"
   if ! remote_file_exists "$FOCUSED_PROMOTION_RECEIPT"; then run_paid_stage focused_gate "$FOCUSED_TIMEOUT_SECONDS" focused_stage; fi
   verify_remote_focused_chain || fail "focused receipt chain failed"
+  record_host_stage_completion focused "$HOST_FOCUSED_STAGE_RECEIPT" \
+    "$FOCUSED_OUTPUT_ROOT/comparison-receipt.json" \
+    "$FOCUSED_OUTPUT_ROOT/publication.json" "$FOCUSED_PROMOTION_RECEIPT"
   if [[ ! -e "$HARVEST_TERMINAL_RECEIPT" ]]; then
     run_paid_stage harvest "$HARVEST_TIMEOUT_SECONDS" harvest_stage
     verify_remote_harvest_chain || fail "harvest pre-stop receipt chain failed"
@@ -1168,8 +1308,6 @@ require_abs_file "$PROVIDER_VERIFIER" "checked-in exact Nebius provider parser";
 # Immutable pre-start cost admission: run_public_n15_reproduction.py lifecycle-plan.
 if [[ ! -e "$PLAN_RECEIPT" ]]; then python3 "$BUILDER" lifecycle-plan --run-id "$RUN_ID" --repository "$PUBLIC_REPOSITORY" --remote-pipeline-root "$REMOTE_PIPELINE_ROOT" --budget-usd "$MAX_BUDGET_USD" --estimated-cost-usd "$ESTIMATED_COST_USD" --output "$PLAN_RECEIPT" >/dev/null; fi
 python3 "$BUILDER" verify-lifecycle-plan --run-id "$RUN_ID" --repository "$PUBLIC_REPOSITORY" --remote-pipeline-root "$REMOTE_PIPELINE_ROOT" --budget-usd "$MAX_BUDGET_USD" --estimated-cost-usd "$ESTIMATED_COST_USD" --output "$PLAN_RECEIPT" >/dev/null
-aggregate_deadline="$(initialize_deadline)" || fail "aggregate paid deadline is invalid"
-(( $(date +%s) < aggregate_deadline )) || fail "aggregate paid deadline has expired"
 acquire_controller_lock || fail "another N1.5 controller already owns this run"
 trap controller_cleanup EXIT
 if [[ "$RESUME_PARTIAL" == 1 && -f "$HARVEST_TERMINAL_RECEIPT" ]]; then
@@ -1191,6 +1329,20 @@ if [[ -f "$HARVEST_TERMINAL_RECEIPT" ]]; then
   rm -rf -- "$terminal_temp_root"
   fail "existing terminal receipt chain is invalid"
 fi
+aggregate_deadline="$(initialize_deadline)" || fail "aggregate paid deadline is invalid"
+(( $(date +%s) < aggregate_deadline )) || fail "aggregate paid deadline has expired"
+PRESTART_ADMITTED_STAGE="$(host_next_unfinished_stage)" \
+  || fail "host-sealed next unfinished stage is invalid"
+case "$PRESTART_ADMITTED_STAGE" in
+  train) admitted_timeout="$TRAIN_TIMEOUT_SECONDS" ;;
+  focused_gate) admitted_timeout="$FOCUSED_TIMEOUT_SECONDS" ;;
+  harvest) admitted_timeout="$HARVEST_TIMEOUT_SECONDS" ;;
+  *) fail "host-sealed next unfinished stage is invalid" ;;
+esac
+admitted_deadline="$(initialize_stage_deadline "$PRESTART_ADMITTED_STAGE" "$admitted_timeout" "$aggregate_deadline")" \
+  || fail "$PRESTART_ADMITTED_STAGE deadline receipt is invalid"
+(( $(date +%s) < admitted_deadline )) \
+  || fail "$PRESTART_ADMITTED_STAGE deadline has expired"
 # The price is operator-staged because this local controller cannot safely
 # refresh provider billing data without external access.  It must be fresh,
 # immutable, exact-VM evidence and is bound to this task's elapsed paid window.
@@ -1218,6 +1370,7 @@ done
 rm -f -- "$response"
 wait_for_ssh_readiness || fail "exact VM did not become SSH-ready"
 wait_for_remote_runtime || fail "runtime/cloud-init/workspace/GPU/upstream gate failed"
+validate_remote_admitted_stage
 if [[ "$RESUME_PARTIAL" == 1 ]] && { remote_file_exists "$TRAINING_IDENTITY_RECEIPT" || remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; }; then
   fail "explicit partial resume is forbidden after canonical training receipts exist"
 fi

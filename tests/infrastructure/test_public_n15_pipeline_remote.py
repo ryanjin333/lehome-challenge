@@ -60,6 +60,31 @@ def _provider_rate_env(pipeline: Path) -> dict[str, str]:
     return {"LEHOME_N15_PROVIDER_RATE_RECEIPT": str(rate_receipt)}
 
 
+def _write_host_stage_seal(
+    pipeline: Path, *, run_id: str, stage: str, remote_paths: list[str],
+) -> Path:
+    path = pipeline / f"host-stage-{stage}-complete.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "lehome_public_n15_host_stage_completion_v1",
+                "run_id": run_id,
+                "stage": stage,
+                "remote_receipts": [
+                    {"path": remote_path, "sha256": hashlib.sha256(remote_path.encode()).hexdigest()}
+                    for remote_path in remote_paths
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n",
+        encoding="ascii",
+    )
+    path.chmod(0o444)
+    return path
+
+
 def _wrapper_env(tmp_path: Path, fake_bin: Path, run_id: str) -> dict[str, str]:
     pipeline = tmp_path / "pipeline"
     pipeline.mkdir(exist_ok=True)
@@ -846,6 +871,7 @@ remote_file_exists() {
   return 1
 }
 run_paid_stage() { printf '%s\n' "$1" >> "$FAKE_TRACE"; }
+record_host_stage_completion() { :; }
 verify_remote_training_chain() { return 0; }
 verify_remote_training_publication() { return 0; }
 verify_remote_focused_chain() { return 0; }
@@ -863,6 +889,150 @@ run_pipeline_after_runtime
     assert result.returncode == 0, result.stderr
     assert trace.read_text(encoding="ascii").splitlines() == ["focused_gate"]
     assert stale_train.read_text(encoding="ascii") == "expired-train-deadline\n"
+
+
+@pytest.mark.parametrize("deadline_kind", ["malformed", "expired"])
+def test_main_rejects_actual_next_stage_deadline_before_any_provider_call(
+    tmp_path: Path, deadline_kind: str,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    provider_log = tmp_path / "provider.log"
+    _write_executable(
+        fake_bin / "nebius",
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$FAKE_PROVIDER_LOG\"\nexit 97\n",
+    )
+    _write_executable(fake_bin / "ssh", "#!/usr/bin/env bash\nexit 97\n")
+    env = _wrapper_env(tmp_path, fake_bin, f"n15-focused-deadline-{deadline_kind}")
+    env["FAKE_PROVIDER_LOG"] = str(provider_log)
+    pipeline = Path(env["LEHOME_N15_PIPELINE_ROOT"])
+    module = _load_cli()
+    plan = pipeline / "lifecycle-plan.json"
+    assert module.main([
+        "lifecycle-plan", "--run-id", env["LEHOME_N15_RUN_ID"],
+        "--repository", env["LEHOME_N15_PUBLIC_HF_REPOSITORY"],
+        "--remote-pipeline-root", env["LEHOME_N15_REMOTE_PIPELINE_ROOT"],
+        "--budget-usd", "100", "--estimated-cost-usd", "72",
+        "--output", str(plan),
+    ]) == 0
+    plan_sha = hashlib.sha256(plan.read_bytes()).hexdigest()
+    started = int(time.time())
+    paid = {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_paid_deadline_v1",
+        "run_id": env["LEHOME_N15_RUN_ID"],
+        "lifecycle_plan_sha256": plan_sha,
+        "started_unix_seconds": started,
+        "deadline_unix_seconds": started + 86400,
+    }
+    paid_path = pipeline / "paid-deadline.json"
+    paid_path.write_text(
+        json.dumps(paid, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="ascii",
+    )
+    paid_path.chmod(0o444)
+    _write_host_stage_seal(
+        pipeline,
+        run_id=env["LEHOME_N15_RUN_ID"],
+        stage="training",
+        remote_paths=[
+            f'{env["LEHOME_N15_TRAINING_ROOT"]}/training-identity.json',
+            f'{env["LEHOME_N15_TRAINING_ROOT"]}/training-publication.json',
+        ],
+    )
+    stage_path = pipeline / "stage-focused_gate-deadline.json"
+    if deadline_kind == "malformed":
+        stage = {}
+    else:
+        stage_started = started - 20000
+        stage = {
+            "schema_version": 1,
+            "kind": "lehome_public_n15_stage_deadline_v1",
+            "run_id": env["LEHOME_N15_RUN_ID"],
+            "stage": "focused_gate",
+            "lifecycle_plan_sha256": plan_sha,
+            "started_unix_seconds": stage_started,
+            "deadline_unix_seconds": stage_started + 14400,
+        }
+    stage_path.write_text(
+        json.dumps(stage, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="ascii",
+    )
+    stage_path.chmod(0o444)
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER)], cwd=ROOT, env=env,
+        text=True, capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert "focused" in result.stderr.lower() and "deadline" in result.stderr.lower()
+    assert not provider_log.exists()
+
+
+@pytest.mark.parametrize("provider_state", ["STOPPED", "RUNNING"])
+def test_main_processes_verified_terminal_before_expired_aggregate_deadline(
+    tmp_path: Path, provider_state: str,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, f"n15-terminal-expired-{provider_state.lower()}")
+    pipeline = Path(env["LEHOME_N15_PIPELINE_ROOT"])
+    trace = tmp_path / "terminal-order.log"
+    module = _load_cli()
+    plan = pipeline / "lifecycle-plan.json"
+    assert module.main([
+        "lifecycle-plan", "--run-id", env["LEHOME_N15_RUN_ID"],
+        "--repository", env["LEHOME_N15_PUBLIC_HF_REPOSITORY"],
+        "--remote-pipeline-root", env["LEHOME_N15_REMOTE_PIPELINE_ROOT"],
+        "--budget-usd", "100", "--estimated-cost-usd", "72",
+        "--output", str(plan),
+    ]) == 0
+    plan_sha = hashlib.sha256(plan.read_bytes()).hexdigest()
+    paid = {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_paid_deadline_v1",
+        "run_id": env["LEHOME_N15_RUN_ID"],
+        "lifecycle_plan_sha256": plan_sha,
+        "started_unix_seconds": 1,
+        "deadline_unix_seconds": 86401,
+    }
+    paid_path = pipeline / "paid-deadline.json"
+    paid_path.write_text(
+        json.dumps(paid, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="ascii",
+    )
+    paid_path.chmod(0o444)
+    (pipeline / "harvest-terminal.json").write_text("{}\n", encoding="ascii")
+    harness = r'''
+source "$WRAPPER_PATH"
+acquire_controller_lock() { return 0; }
+release_controller_lock() { :; }
+python3() {
+  if [[ "$*" == *"verify-terminal"* ]]; then return 0; fi
+  command python3 "$@"
+}
+capture_exact_provider_state() {
+  printf 'readback:%s\n' "$1" >> "$FAKE_TRACE"
+  [[ "$FAKE_PROVIDER_STATE" == "$1" ]]
+}
+stop_exact_vm() { printf 'stop\n' >> "$FAKE_TRACE"; return 0; }
+nebius() { printf 'paid-provider-command:%s\n' "$*" >> "$FAKE_TRACE"; return 97; }
+main
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env,
+            "WRAPPER_PATH": str(WRAPPER),
+            "FAKE_TRACE": str(trace),
+            "FAKE_PROVIDER_STATE": provider_state,
+        },
+        text=True, capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    expected = ["readback:STOPPED"] if provider_state == "STOPPED" else ["readback:STOPPED", "stop"]
+    assert trace.read_text(encoding="ascii").splitlines() == expected
 
 
 def test_completed_terminal_chain_is_processed_before_stale_stage_deadlines(
@@ -1414,7 +1584,7 @@ def test_running_observation_waits_for_cloud_init_after_ssh_is_ready(tmp_path: P
     }
     result = subprocess.run(["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True)
     assert result.returncode != 0
-    assert trace.read_text(encoding="utf-8").splitlines() == ["start", *("readiness" for _ in range(7)), "runtime", "runtime", "runtime", "identity-check", "train", "stop"]
+    assert trace.read_text(encoding="utf-8").splitlines() == ["start", *("readiness" for _ in range(7)), "runtime", "runtime", "runtime", "identity-check", "train", "train", "train", "stop"]
     assert state.read_text(encoding="utf-8") == "STOPPED"
 
 
