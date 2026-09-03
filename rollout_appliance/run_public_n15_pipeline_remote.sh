@@ -1396,6 +1396,167 @@ cleanup_resume_scratch() {
 }
 trap cleanup_resume_scratch EXIT
 trap 'exit 130' INT TERM
+repair_completed_output_ownership() {
+  # The native container can leave its final checkpoint and evidence staging
+  # root-owned.  Repair only the two exact, already-completed roots, after a
+  # descriptor/no-follow audit proves they are the canonical 12K boundary and
+  # no trainer or other remote controller can still be mutating them.
+  [[ "$upstream_output" == "$source_root/outputs/train/groot_four_types_merged_batch64_lr2e-4" ]]
+  [[ "$staging_root" == "${training_root}.evidence-staging" ]]
+  test ! -e "$training_root" && test ! -L "$training_root"
+  test -d "$source_root" && test ! -L "$source_root"
+  test -d "$upstream_output" && test ! -L "$upstream_output"
+  test -d "$staging_root" && test ! -L "$staging_root"
+  protected_device="$(findmnt -T "$(dirname -- "$training_root")" --noheadings --output MAJ:MIN)"
+  [[ "$(findmnt -T "$upstream_output" --noheadings --output MAJ:MIN)" == "$protected_device" ]]
+  [[ "$(findmnt -T "$staging_root" --noheadings --output MAJ:MIN)" == "$protected_device" ]]
+  ! pgrep -f '/opt/lehome-challenge/.venv/bin/lerobot-train([[:space:]]|$)' >/dev/null
+  ! pgrep -f "$root/rollout_appliance/run_public_n15_pipeline_remote.sh" >/dev/null
+  python3 - "$source_root" "$training_root" "$staging_root" "$upstream_output" "$(id -u)" preflight <<'PY'
+import os, stat, sys
+from pathlib import Path
+
+source, training, staging, upstream = map(Path, sys.argv[1:5])
+uid, mode = int(sys.argv[5]), sys.argv[6]
+expected_upstream = source / "outputs/train/groot_four_types_merged_batch64_lr2e-4"
+if (
+    not all(path.is_absolute() for path in (source, training, staging, upstream))
+    or source != source.resolve(strict=True)
+    or upstream != expected_upstream
+    or staging != Path(str(training) + ".evidence-staging")
+    or training.exists() or training.is_symlink()
+):
+    raise SystemExit("completed-output ownership repair paths are not canonical")
+
+def directory(path):
+    metadata = path.lstat()
+    if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode) or path.resolve(strict=True) != path:
+        raise SystemExit("completed-output ownership repair root is unsafe")
+    return metadata
+
+source_metadata = directory(source)
+upstream_metadata = directory(upstream)
+staging_metadata = directory(staging)
+parent_metadata = directory(training.parent)
+if len({source_metadata.st_dev, upstream_metadata.st_dev, staging_metadata.st_dev, parent_metadata.st_dev}) != 1:
+    raise SystemExit("completed-output ownership repair crosses filesystems")
+if not (upstream / "checkpoints/last").is_symlink() or os.readlink(upstream / "checkpoints/last") != "012000":
+    raise SystemExit("completed-output ownership repair lacks the exact 12K boundary")
+
+def walk(root, *, allow_last):
+    descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
+    root_device = os.fstat(descriptor).st_dev
+    def visit(parent, parts):
+        for entry in os.scandir(parent):
+            if entry.name in {"", ".", ".."} or "/" in entry.name:
+                raise SystemExit("completed-output ownership repair entry is unsafe")
+            relative = "/".join((*parts, entry.name))
+            metadata = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
+                if allow_last and relative == "checkpoints/last" and os.readlink(entry.name, dir_fd=parent) == "012000":
+                    if mode == "post" and metadata.st_uid != uid:
+                        raise SystemExit("completed-output ownership repair did not take ownership")
+                    continue
+                raise SystemExit("completed-output ownership repair symlink is unsafe")
+            if metadata.st_dev != root_device:
+                raise SystemExit("completed-output ownership repair crosses filesystems")
+            if mode == "post" and metadata.st_uid != uid:
+                raise SystemExit("completed-output ownership repair did not take ownership")
+            if stat.S_ISDIR(metadata.st_mode):
+                child = os.open(entry.name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW, dir_fd=parent)
+                try:
+                    visit(child, (*parts, entry.name))
+                finally:
+                    os.close(child)
+            elif not stat.S_ISREG(metadata.st_mode):
+                raise SystemExit("completed-output ownership repair entry is unsafe")
+    try:
+        if mode == "post" and os.fstat(descriptor).st_uid != uid:
+            raise SystemExit("completed-output ownership repair did not take ownership")
+        visit(descriptor, ())
+    finally:
+        os.close(descriptor)
+
+walk(upstream, allow_last=True)
+walk(staging, allow_last=False)
+PY
+  sudo -n chown -R --no-dereference "$(id -u):$(id -g)" -- "$upstream_output" "$staging_root"
+  python3 - "$source_root" "$training_root" "$staging_root" "$upstream_output" "$(id -u)" post <<'PY'
+import os, stat, sys
+from pathlib import Path
+
+source, training, staging, upstream = map(Path, sys.argv[1:5])
+uid, mode = int(sys.argv[5]), sys.argv[6]
+if (
+    upstream != source / "outputs/train/groot_four_types_merged_batch64_lr2e-4"
+    or staging != Path(str(training) + ".evidence-staging")
+    or training.exists() or training.is_symlink()
+):
+    raise SystemExit("completed-output ownership repair paths changed")
+
+def walk(root, *, allow_last):
+    descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
+    root_device = os.fstat(descriptor).st_dev
+    def visit(parent, parts):
+        for entry in os.scandir(parent):
+            relative = "/".join((*parts, entry.name))
+            metadata = entry.stat(follow_symlinks=False)
+            if metadata.st_uid != uid:
+                raise SystemExit("completed-output ownership repair did not take ownership")
+            if stat.S_ISLNK(metadata.st_mode):
+                if allow_last and relative == "checkpoints/last" and os.readlink(entry.name, dir_fd=parent) == "012000":
+                    continue
+                raise SystemExit("completed-output ownership repair symlink is unsafe")
+            if metadata.st_dev != root_device:
+                raise SystemExit("completed-output ownership repair crosses filesystems")
+            if stat.S_ISDIR(metadata.st_mode):
+                child = os.open(entry.name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW, dir_fd=parent)
+                try:
+                    visit(child, (*parts, entry.name))
+                finally:
+                    os.close(child)
+            elif not stat.S_ISREG(metadata.st_mode):
+                raise SystemExit("completed-output ownership repair entry is unsafe")
+    try:
+        if os.fstat(descriptor).st_uid != uid:
+            raise SystemExit("completed-output ownership repair did not take ownership")
+        visit(descriptor, ())
+    finally:
+        os.close(descriptor)
+
+walk(upstream, allow_last=True)
+walk(staging, allow_last=False)
+PY
+}
+clear_transient_eagle_cache_after_completed_proof() {
+  # This cache is regenerated from the immutable HF snapshot and is excluded
+  # from the completed training proof; finalization deliberately requires it
+  # absent.  It is the only recovery cleanup, and cannot reach an artifact.
+  python3 - "$staging_root" "$(id -u)" <<'PY'
+import os, shutil, stat, sys
+from pathlib import Path
+
+staging, uid = Path(sys.argv[1]), int(sys.argv[2])
+cache_name = "eagle-home"
+parent = os.open(staging, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
+try:
+    try:
+        metadata = os.stat(cache_name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    staging_metadata = os.fstat(parent)
+    if (
+        not stat.S_ISDIR(metadata.st_mode) or metadata.st_dev != staging_metadata.st_dev
+        or metadata.st_uid != uid
+        or not shutil.rmtree.avoids_symlink_attacks
+    ):
+        raise SystemExit("completed-output transient cache is unsafe")
+    shutil.rmtree(cache_name, dir_fd=parent)
+    os.fsync(parent)
+finally:
+    os.close(parent)
+PY
+}
 if [[ -d "${training_root}.finalizing" || -f "$staging_root/training-finalization.json" || -f "${training_root}.finalizing/evidence/training-finalization.json" ]]; then
   python3 "$root/scripts/run_public_n15_reproduction.py" finalize-training-output \
     --checkout "$source_root" --source-receipt "$source_receipt" \
@@ -1404,20 +1565,16 @@ if [[ -d "${training_root}.finalizing" || -f "$staging_root/training-finalizatio
     --upstream-output "$upstream_output" >/dev/null
   exit 0
 fi
-if [[ -d "$upstream_output" && ! -L "$upstream_output" && -d "$staging_root" && ! -L "$staging_root" ]]; then
+if [[ -d "$upstream_output" && ! -L "$upstream_output" && -d "$staging_root" && ! -L "$staging_root" \
+  && -L "$upstream_output/checkpoints/last" && "$(readlink "$upstream_output/checkpoints/last")" == 012000 ]]; then
+  repair_completed_output_ownership
   completed_state="$(python3 "$root/scripts/run_public_n15_reproduction.py" verify-completed-upstream \
     --checkout "$source_root" --source-receipt "$source_receipt" \
     --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" \
     --training-root "$training_root" --staging-root "$staging_root" \
     --upstream-output "$upstream_output")"
   if [[ "$completed_state" == '{"complete":true}' ]]; then
-    recovery_eagle_home="$staging_root/eagle-home"
-    if [[ -e "$recovery_eagle_home" || -L "$recovery_eagle_home" ]]; then
-      test -d "$recovery_eagle_home" && test ! -L "$recovery_eagle_home"
-      find "$recovery_eagle_home" -depth -type f -delete
-      find "$recovery_eagle_home" -depth -type d -empty -delete
-      test ! -e "$recovery_eagle_home"
-    fi
+    clear_transient_eagle_cache_after_completed_proof
     python3 "$root/scripts/run_public_n15_reproduction.py" finalize-training-output \
       --checkout "$source_root" --source-receipt "$source_receipt" \
       --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" \
@@ -1940,7 +2097,7 @@ def mkdir_beneath(root, relative):
     finally:
         os.close(current)
 
-def scan_tree():
+def scan_tree(root):
     regular, directories, links = set(), set(), {}
     def visit(descriptor, parents):
         for item in sorted(os.scandir(descriptor), key=lambda entry: entry.name):
@@ -1967,11 +2124,11 @@ def scan_tree():
                 regular.add(relative)
             else:
                 raise SystemExit("training publication tree contains an unsafe entry")
-    visit(root_descriptor, ())
+    visit(root, ())
     return regular, directories, links
 
-def read_regular(relative, expected_digest=None, *, collect=False, max_bytes=None):
-    descriptor = open_beneath(root_descriptor, relative)
+def read_regular(root, relative, expected_digest=None, *, collect=False, max_bytes=None):
+    descriptor = open_beneath(root, relative)
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_dev != directory_metadata.st_dev:
@@ -2013,15 +2170,16 @@ for item in os.scandir(root_descriptor):
     os.unlink(item.name, dir_fd=root_descriptor)
 fsync_directory(directory)
 
-def training_identity():
-    regular, directories, links = scan_tree()
-    if links != {"checkpoints/last": "012000"}:
+def training_identity(root, *, allow_snapshot_without_last=False):
+    regular, directories, links = scan_tree(root)
+    expected_links = {} if allow_snapshot_without_last else {"checkpoints/last": "012000"}
+    if links != expected_links:
         raise SystemExit("training publication tree contains an unsafe symlink")
     identity_raw, identity_digest = read_regular(
-        "training-identity.json", collect=True, max_bytes=16 * 1024 * 1024
+        root, "training-identity.json", collect=True, max_bytes=16 * 1024 * 1024
     )
     checksums_raw, checksums_digest = read_regular(
-        "checksums.sha256", collect=True, max_bytes=64 * 1024 * 1024
+        root, "checksums.sha256", collect=True, max_bytes=64 * 1024 * 1024
     )
     try:
         identity = json.loads(identity_raw)
@@ -2076,7 +2234,7 @@ def training_identity():
         "training-identity.json": identity_digest,
     }
     for relative, digest in expected.items():
-        read_regular(relative, digest)
+        read_regular(root, relative, digest)
     return expected, expected_directories
 
 snapshot_name = f".{directory.name}.publication-snapshot"
@@ -2099,11 +2257,49 @@ def remove_snapshot():
     shutil.rmtree(snapshot_name, dir_fd=parent_descriptor)
     fsync_descriptor(parent_descriptor)
 
-remove_snapshot()
+def open_snapshot():
+    try:
+        metadata = os.stat(snapshot_name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if (
+        not stat.S_ISDIR(metadata.st_mode) or metadata.st_dev != directory_metadata.st_dev
+        or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise SystemExit("training publication snapshot is unsafe")
+    descriptor = os.open(
+        snapshot_name,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW,
+        dir_fd=parent_descriptor,
+    )
+    current = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(current.st_mode) or current.st_dev != directory_metadata.st_dev
+        or current.st_uid != os.getuid() or stat.S_IMODE(current.st_mode) != 0o700
+    ):
+        os.close(descriptor)
+        raise SystemExit("training publication snapshot is unsafe")
+    return descriptor
 
-expected, expected_directories = training_identity()
+def load_or_discard_snapshot():
+    descriptor = open_snapshot()
+    if descriptor is None:
+        return None
+    try:
+        return training_identity(descriptor, allow_snapshot_without_last=True)
+    except (SystemExit, OSError):
+        # A partial snapshot can only be from an interrupted local copy.  It
+        # was never eligible for upload, so remove just this owned scratch root.
+        os.close(descriptor)
+        remove_snapshot()
+        return None
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
 
-def build_snapshot():
+def build_snapshot(expected, expected_directories):
     try:
         os.mkdir(snapshot_name, 0o700, dir_fd=parent_descriptor)
     except FileExistsError:
@@ -2177,7 +2373,32 @@ def build_snapshot():
         fsync_descriptor(snapshot_descriptor)
     finally:
         os.close(snapshot_descriptor)
-    training_identity()
+    # Detect an attacker or a delayed writer that completed a different,
+    # internally consistent source tree while this snapshot was being sealed.
+    if training_identity(root_descriptor) != (expected, expected_directories):
+        remove_snapshot()
+        raise SystemExit("training publication source changed while sealing snapshot")
+    descriptor = open_snapshot()
+    if descriptor is None:
+        raise SystemExit("training publication snapshot disappeared while sealing")
+    try:
+        if training_identity(descriptor, allow_snapshot_without_last=True) != (expected, expected_directories):
+            remove_snapshot()
+            raise SystemExit("training publication snapshot does not bind the initial identity")
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+snapshot_identity = load_or_discard_snapshot()
+if snapshot_identity is None:
+    source_identity = training_identity(root_descriptor)
+    build_snapshot(*source_identity)
+    snapshot_identity = load_or_discard_snapshot()
+    if snapshot_identity is None:
+        raise SystemExit("training publication snapshot was not sealed")
+expected, expected_directories = snapshot_identity
 
 entries = [{"path": relative, "sha256": digest} for relative, digest in sorted(expected.items())]
 api = HfApi(token=os.environ["HF_TOKEN"])
@@ -2258,15 +2479,14 @@ try:
     if revision is None:
         if prefix_seen:
             raise SystemExit("training publication prefix already exists with different bytes")
-        build_snapshot()
-        try:
-            commit = api.upload_folder(repo_id=repository, repo_type="model", folder_path=str(snapshot), path_in_repo=prefix, commit_message="public N1.5 training " + prefix)
-        finally:
-            remove_snapshot()
+        # Keep the exact sealed snapshot across an upload response loss.  A
+        # later retry adopts the same immutable prefix from this snapshot even
+        # if the mutable training root has since transitioned to another
+        # self-consistent tree.
+        commit = api.upload_folder(repo_id=repository, repo_type="model", folder_path=str(snapshot), path_in_repo=prefix, commit_message="public N1.5 training " + prefix)
         revision = str(commit.oid)
         if re.fullmatch(r"[0-9a-f]{40}", revision) is None or verify_revision(revision) is not True:
             raise SystemExit("uploaded training revision failed exact anonymous readback")
-    training_identity()
     value = {"schema_version": 1, "kind": "lehome_public_n15_training_publication_v1", "repository": repository, "remote_prefix": prefix, "immutable_revision": revision, "entries": entries, "anonymous_byte_readback_verified": True}
     payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
     descriptor, temporary_name = tempfile.mkstemp(prefix=".training-publication.json.", dir=directory)
@@ -2281,10 +2501,10 @@ try:
             os._exit(86)
         os.link(temporary, receipt)
         fsync_directory(directory)
+        remove_snapshot()
     finally:
         temporary.unlink(missing_ok=True)
 finally:
-    remove_snapshot()
     os.close(root_descriptor)
     os.close(parent_descriptor)
 PY

@@ -225,7 +225,34 @@ exec /usr/bin/readlink "$@"
         """#!/usr/bin/env bash
 set -euo pipefail
 [[ "${1:-}" == -n ]] && shift
-if [[ "${1:-}" == chown ]]; then exit 0; fi
+if [[ "${1:-}" == chown ]]; then
+  # A process running this test cannot create a genuinely root-owned fixture.
+  # Model the exact effect of the reviewed sudo chown handoff only when the
+  # recovery test opts in: an otherwise unreadable completed tree becomes
+  # readable by the controller.  Normal fixture calls remain no-ops.
+  if [[ -n "${FAKE_SUDO_CHOWN_REPAIR_ROOT:-}" ]]; then
+    command python3 - "$FAKE_SUDO_CHOWN_REPAIR_ROOT" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+for directory, names, filenames in os.walk(root, followlinks=False):
+    path = Path(directory)
+    if not path.is_symlink():
+        path.chmod(stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) | 0o700)
+    for name in names + filenames:
+        candidate = path / name
+        if not candidate.is_symlink():
+            candidate.chmod(
+                stat.S_IMODE(candidate.stat(follow_symlinks=False).st_mode)
+                | (0o700 if candidate.is_dir() else 0o600)
+            )
+PY
+  fi
+  exit 0
+fi
 exec "$@"
         """,
     )
@@ -460,6 +487,34 @@ def test_completed_12k_upstream_is_authenticated_and_finalized_without_retrainin
     recovered = _run_actual_remote_train_stage(
         env, attempt_id="attempt-after-trainer-recovery", complete=False,
     )
+    assert recovered.returncode == 0, recovered.stderr
+    assert training.is_dir() and not upstream.exists() and not staging.exists()
+    trace = Path(env["FAKE_TRACE"]).read_text(encoding="utf-8")
+    assert trace.count("native:/opt/lehome-challenge/.venv/bin/lerobot-train") == 1
+
+
+def test_completed_12k_recovery_repairs_unreadable_completed_tree_before_verification(
+    tmp_path: Path,
+) -> None:
+    """Recovery must repair the exact completed tree before reading its proof."""
+    env, _contract, training, staging, upstream = _remote_train_fixture(tmp_path)
+
+    interrupted = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-root-owned-completion", interrupt_point="after-trainer",
+        complete=True,
+    )
+    assert interrupted.returncode == 130, interrupted.stderr
+    protected_log = staging / "logs/train-resume-attempt-root-owned-completion.log"
+    assert protected_log.is_file()
+    protected_log.chmod(0)
+    # The fixture's sudo shim restores this only if recovery invokes its
+    # carefully bounded ownership repair.  The current production branch does
+    # not, so this is a true red test for the ordering bug.
+    recovered = _run_actual_remote_train_stage(
+        {**env, "FAKE_SUDO_CHOWN_REPAIR_ROOT": str(tmp_path)},
+        attempt_id="attempt-root-owned-recovery", complete=False,
+    )
+
     assert recovered.returncode == 0, recovered.stderr
     assert training.is_dir() and not upstream.exists() and not staging.exists()
     trace = Path(env["FAKE_TRACE"]).read_text(encoding="utf-8")
@@ -2151,7 +2206,8 @@ def hf_hub_download(*, filename, revision, cache_dir, token, **kwargs):
     assert token is False
     assert cache == expected
     assert cache.is_dir() and not cache.is_symlink()
-    assert not Path(os.environ["FAKE_HF_SNAPSHOT"]).exists()
+    sealed = Path(os.environ["FAKE_HF_SNAPSHOT"])
+    assert not sealed.is_symlink()
     with Path(os.environ["FAKE_HF_DOWNLOAD_LOG"]).open("a") as stream:
         stream.write(f"{filename}\t{cache}\n")
     source = Path(os.environ["FAKE_HF_STORE"]) / revision / filename
@@ -2240,8 +2296,10 @@ def hf_hub_download(*, filename, revision, cache_dir, token, **kwargs):
     assert uploaded_mutable_artifact.exists(), first.stderr
     assert uploaded_mutable_artifact.read_bytes() == original_mutable_artifact
     assert mutable_artifact.read_bytes() == b"concurrent mutation"
-    mutable_artifact.write_bytes(original_mutable_artifact)
-    assert not publication_snapshot.exists()
+    # The immutable remote prefix now contains the sealed pre-mutation tree.
+    # A retry must adopt that exact tree from the durable local snapshot; it
+    # must not require restoring the mutable source or attempt a second upload.
+    assert publication_snapshot.exists()
     interrupted = subprocess.run(
         ["bash", "-c", harness], cwd=ROOT,
         env={
@@ -2269,6 +2327,18 @@ def hf_hub_download(*, filename, revision, cache_dir, token, **kwargs):
     receipt = json.loads((training / "training-publication.json").read_text())
     assert receipt["immutable_revision"] == "a" * 40
     assert receipt["anonymous_byte_readback_verified"] is True
+    assert mutable_artifact.read_bytes() == b"concurrent mutation"
+    assert not publication_snapshot.exists()
+    verifier = subprocess.run(
+        ["bash", "-c", 'source "$WRAPPER_PATH"; remote() { command "$@"; }; verify_remote_training_publication'],
+        cwd=ROOT, env={**env, "WRAPPER_PATH": str(WRAPPER)},
+        text=True, capture_output=True,
+    )
+    # The receipt remains bound to the sealed/uploaded tree; a later mutation
+    # of the canonical training root therefore fails closed rather than
+    # silently treating the prefix as a publication of the new tree.
+    assert verifier.returncode != 0
+    mutable_artifact.write_bytes(original_mutable_artifact)
     verifier = subprocess.run(
         ["bash", "-c", 'source "$WRAPPER_PATH"; remote() { command "$@"; }; verify_remote_training_publication'],
         cwd=ROOT, env={**env, "WRAPPER_PATH": str(WRAPPER)},
@@ -2527,6 +2597,25 @@ def test_aggregate_watchdog_reaps_hung_post_start_lifecycle_before_stop_and_unlo
     deadline_path = pipeline / "paid-deadline.json"
     deadline_path.write_bytes(_canonical_json_bytes(paid_deadline)); deadline_path.chmod(0o444)
     deadline_before = deadline_path.read_bytes()
+    # Keep the production deadline/termination code intact while making this
+    # harness deterministic: once the isolated hung descendant is observable,
+    # its test-only `date` shim advances the controller to its already sealed
+    # aggregate deadline.  Scheduler delay can no longer consume the tiny
+    # three-second real-time window before the watchdog is exercised.
+    _write_executable(
+        fake_bin / "date",
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == +%s && -f "$FAKE_WATCHDOG_DESCENDANT_PID" ]]; then
+  command python3 - "$FAKE_WATCHDOG_DEADLINE" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="ascii"))["deadline_unix_seconds"])
+PY
+  exit 0
+fi
+exec /bin/date "$@"
+""",
+    )
     harness = r'''
 source "$WRAPPER_PATH"
 acquire_controller_lock() { printf 'lock\n' >> "$TRACE"; }
@@ -2602,6 +2691,8 @@ main
             "STARTED_MARKER": str(started_marker),
             "STOPPED_MARKER": str(stopped_marker),
             "DESCENDANT_PID": str(descendant_pid),
+            "FAKE_WATCHDOG_DESCENDANT_PID": str(descendant_pid),
+            "FAKE_WATCHDOG_DEADLINE": str(deadline_path),
             "HANG_POINT": hang_point,
         },
         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
