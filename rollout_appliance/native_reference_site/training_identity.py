@@ -87,6 +87,20 @@ _TRAINING_CONTAINER_PYTHON = "/opt/lehome-challenge/.venv/bin/python"
 _TRAINING_CONTAINER_PYTHONPATH = (
     "/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl"
 )
+_TRAIN_CONFIG_ORIGIN = {
+    "schema_version": 1,
+    "kind": "lehome_public_n15_train_config_golden_v1",
+    "source_repository": "theo-zhou/lehome-groot-submission-4",
+    "source_revision": "d384fe00508acd96ab1c3c5dc265e08261f94b3b",
+    "source_path": "pretrained_model/train_config.json",
+    "source_artifact_sha256": "8fed45ce6356ca2ab3a44ee16f58efcba65274666074d253fa252ef6e826052f",
+    "fixture_path": "n15_public_12k_train_config.golden.json",
+    "fixture_sha256": "a3130a1b796ecc0da6bb1c51b82b6ee04e2ecc761e4c2ae530f07281613f18ee",
+    "resolved_recipe_sha256": "14db86649a124aedcfd8b88e2f2c668dfe7b628f6e3191d2a5150084a9c58fd6",
+    "allowed_resolutions": [
+        "dataset.root", "output_dir", "wandb.run_id", "wandb.mode=offline",
+    ],
+}
 _TRAINING_CONTAINER_LEROBOT_ROOT = "/flash/site-packages/lerobot"
 
 
@@ -406,7 +420,7 @@ def validate_training_identity_receipt(
             expected_lineage_keys = {
                 "schema_version", "kind", "attempt_id", "requested_step", "checkpoint",
                 "checkpoint_files", "evidence_files", "original_upstream_output_dir",
-                "config_path", "pythonpath", "resume_argv",
+                "config_path", "pythonpath", "resume_argv", "train_config_origin",
             }
             upstream = lineage_receipt.get("original_upstream_output_dir")
             config_path = lineage_receipt.get("config_path")
@@ -420,6 +434,7 @@ def validate_training_identity_receipt(
                 or lineage_receipt.get("checkpoint") != checkpoint_relative
                 or not isinstance(upstream, str) or not Path(upstream).is_absolute()
                 or config_path != f"{upstream}/{checkpoint_relative}/pretrained_model/train_config.json"
+                or lineage_receipt.get("train_config_origin") != _TRAIN_CONFIG_ORIGIN
                 or lineage_receipt.get("pythonpath") != _TRAINING_CONTAINER_PYTHONPATH
                 or lineage_receipt.get("resume_argv") != [
                     "/opt/lehome-challenge/.venv/bin/lerobot-train",

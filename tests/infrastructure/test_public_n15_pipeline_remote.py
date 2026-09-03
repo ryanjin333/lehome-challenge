@@ -17,6 +17,12 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 CLI = ROOT / "scripts/run_public_n15_reproduction.py"
 WRAPPER = ROOT / "rollout_appliance/run_public_n15_pipeline_remote.sh"
+_FIXTURE_SPEC = importlib.util.spec_from_file_location(
+    "_public_n15_pipeline_fixtures", ROOT / "tests/test_n15_reproduction.py"
+)
+assert _FIXTURE_SPEC is not None and _FIXTURE_SPEC.loader is not None
+_FIXTURES = importlib.util.module_from_spec(_FIXTURE_SPEC)
+_FIXTURE_SPEC.loader.exec_module(_FIXTURES)
 
 
 def _load_cli():
@@ -30,10 +36,16 @@ def _load_cli():
 def _wrapper_env(tmp_path: Path, fake_bin: Path, run_id: str) -> dict[str, str]:
     pipeline = tmp_path / "pipeline"
     pipeline.mkdir(exist_ok=True)
+    controller_runtime = tmp_path / "controller-runtime"
+    controller_runtime.mkdir(mode=0o700, exist_ok=True)
+    controller_lock_test_root = tmp_path / "controller-lock-test-root"
+    controller_lock_test_root.mkdir(mode=0o700, exist_ok=True)
     remote_pipeline = f"/mnt/lehome/runs/{run_id}"
     return {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "TMPDIR": str(controller_runtime),
+        "LEHOME_N15_CONTROLLER_LOCK_TEST_ROOT": str(controller_lock_test_root),
         "LEHOME_N15_RUN_ID": run_id,
         "LEHOME_N15_PIPELINE_ROOT": str(pipeline),
         "LEHOME_N15_SSH_TARGET": "operator@example",
@@ -55,6 +67,14 @@ def _wrapper_env(tmp_path: Path, fake_bin: Path, run_id: str) -> dict[str, str]:
         "LEHOME_N15_LEROBOT_WHEEL": "/mnt/lerobot.whl",
         "LEHOME_N15_TRAINING_ROOT": f"{remote_pipeline}/training",
     }
+
+
+def _controller_lock_path(env: dict[str, str]) -> Path:
+    return (
+        Path(env["LEHOME_N15_CONTROLLER_LOCK_TEST_ROOT"])
+        / f"lehome-public-n15-controller-{os.getuid()}"
+        / "computeinstance-u00t6xfqhadrcmssa2.lock"
+    )
 
 
 def test_lifecycle_plan_is_immutable_and_has_exact_paid_stage_order(tmp_path: Path) -> None:
@@ -307,7 +327,7 @@ def test_over_budget_plan_never_starts_the_mocked_exact_vm(tmp_path: Path) -> No
     assert not log.exists()
 
 
-@pytest.mark.parametrize("deadline_kind", ["invalid", "expired"])
+@pytest.mark.parametrize("deadline_kind", ["invalid", "expired", "mutable"])
 def test_invalid_immutable_deadline_fails_before_any_provider_action(
     tmp_path: Path, deadline_kind: str,
 ) -> None:
@@ -334,17 +354,20 @@ def test_invalid_immutable_deadline_fails_before_any_provider_action(
         deadline = {}
     else:
         plan_sha = hashlib.sha256((pipeline / "lifecycle-plan.json").read_bytes()).hexdigest()
+        started = int(time.time()) if deadline_kind == "mutable" else 1
         deadline = {
             "schema_version": 1,
             "kind": "lehome_public_n15_paid_deadline_v1",
             "run_id": env["LEHOME_N15_RUN_ID"],
             "lifecycle_plan_sha256": plan_sha,
-            "started_unix_seconds": 1,
-            "deadline_unix_seconds": 86401,
+            "started_unix_seconds": started,
+            "deadline_unix_seconds": started + 86400,
         }
     (pipeline / "paid-deadline.json").write_text(
         json.dumps(deadline, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii"
     )
+    if deadline_kind != "mutable":
+        (pipeline / "paid-deadline.json").chmod(0o444)
 
     result = subprocess.run(
         ["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True
@@ -352,6 +375,70 @@ def test_invalid_immutable_deadline_fails_before_any_provider_action(
 
     assert result.returncode != 0
     assert "deadline" in result.stderr.lower()
+    assert not provider_log.exists()
+
+
+@pytest.mark.parametrize("stage_deadline_kind", ["mismatch", "expired"])
+def test_invalid_train_stage_deadline_fails_before_provider_start(
+    tmp_path: Path, stage_deadline_kind: str,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    provider_log = tmp_path / "provider.log"
+    (fake_bin / "nebius").write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$FAKE_PROVIDER_LOG\"\nexit 97\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "ssh").write_text("#!/usr/bin/env bash\nexit 97\n", encoding="utf-8")
+    for command in (fake_bin / "nebius", fake_bin / "ssh"): command.chmod(0o755)
+    env = _wrapper_env(tmp_path, fake_bin, f"n15-stage-{stage_deadline_kind}")
+    env["FAKE_PROVIDER_LOG"] = str(provider_log)
+    module = _load_cli()
+    pipeline = Path(env["LEHOME_N15_PIPELINE_ROOT"])
+    plan_path = pipeline / "lifecycle-plan.json"
+    assert module.main([
+        "lifecycle-plan", "--run-id", env["LEHOME_N15_RUN_ID"],
+        "--repository", env["LEHOME_N15_PUBLIC_HF_REPOSITORY"],
+        "--remote-pipeline-root", env["LEHOME_N15_REMOTE_PIPELINE_ROOT"],
+        "--budget-usd", "100", "--estimated-cost-usd", "72",
+        "--output", str(plan_path),
+    ]) == 0
+    plan_sha = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+    paid_started = int(time.time())
+    paid_deadline = paid_started + 86400
+    paid = {
+        "schema_version": 1, "kind": "lehome_public_n15_paid_deadline_v1",
+        "run_id": env["LEHOME_N15_RUN_ID"], "lifecycle_plan_sha256": plan_sha,
+        "started_unix_seconds": paid_started,
+        "deadline_unix_seconds": paid_deadline,
+    }
+    (pipeline / "paid-deadline.json").write_text(
+        json.dumps(paid, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii"
+    )
+    stage_started = 1 if stage_deadline_kind == "expired" else paid_started
+    stage = {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_stage_deadline_v1",
+        "run_id": (
+            env["LEHOME_N15_RUN_ID"] if stage_deadline_kind == "expired" else "wrong-run"
+        ),
+        "stage": "train",
+        "lifecycle_plan_sha256": plan_sha,
+        "started_unix_seconds": stage_started,
+        "deadline_unix_seconds": min(stage_started + 28800, paid_deadline),
+    }
+    stage_path = pipeline / "stage-train-deadline.json"
+    stage_path.write_text(
+        json.dumps(stage, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii"
+    )
+    for path in (pipeline / "paid-deadline.json", stage_path):
+        path.chmod(0o444)
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True
+    )
+
+    assert result.returncode != 0
+    assert "train" in result.stderr.lower() and "deadline" in result.stderr.lower()
     assert not provider_log.exists()
 
 
@@ -389,7 +476,7 @@ def test_atomic_controller_singleton_rejects_second_live_controller_without_stop
         while (not trace.exists() or "start" not in trace.read_text()) and time.monotonic() < deadline:
             time.sleep(0.02)
         assert trace.exists() and trace.read_text().splitlines() == ["start"]
-        lock_path = Path(env["LEHOME_N15_PIPELINE_ROOT"]) / "controller.lock"
+        lock_path = _controller_lock_path(env)
         owner = json.loads(lock_path.read_text(encoding="ascii"))
         assert owner == {
             "schema_version": 1,
@@ -414,6 +501,86 @@ def test_atomic_controller_singleton_rejects_second_live_controller_without_stop
             os.killpg(first.pid, signal.SIGTERM)
         first.communicate(timeout=5)
     assert trace.read_text().splitlines() == ["start", "stop"]
+
+
+def test_controller_singleton_contends_across_run_ids_and_pipeline_roots(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    first_root = tmp_path / "first"; first_root.mkdir()
+    second_root = tmp_path / "second"; second_root.mkdir()
+    first_env = _wrapper_env(first_root, fake_bin, "n15-lock-first")
+    second_env = _wrapper_env(second_root, fake_bin, "n15-lock-second")
+    second_env["LEHOME_N15_CONTROLLER_LOCK_TEST_ROOT"] = first_env[
+        "LEHOME_N15_CONTROLLER_LOCK_TEST_ROOT"
+    ]
+    holder_script = 'source "$WRAPPER_PATH"; acquire_controller_lock; while :; do /bin/sleep 1; done'
+    first = subprocess.Popen(
+        ["bash", "-c", holder_script], cwd=ROOT,
+        env={**first_env, "WRAPPER_PATH": str(WRAPPER)},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+    )
+    lock_path = _controller_lock_path(first_env)
+    try:
+        deadline = time.monotonic() + 5
+        while not lock_path.is_file() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert lock_path.is_file()
+        second = subprocess.run(
+            ["bash", "-c", 'source "$WRAPPER_PATH"; acquire_controller_lock'],
+            cwd=ROOT, env={**second_env, "WRAPPER_PATH": str(WRAPPER)},
+            capture_output=True, timeout=5,
+        )
+        assert second.returncode != 0
+        assert json.loads(lock_path.read_text(encoding="ascii"))["run_id"] == "n15-lock-first"
+    finally:
+        if first.poll() is None:
+            os.kill(first.pid, signal.SIGTERM)
+        try:
+            first.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(first.pid, signal.SIGKILL)
+            first.communicate(timeout=5)
+
+
+def test_orphan_lock_holder_detects_abrupt_controller_death(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, "n15-orphan-lock")
+    process = subprocess.Popen(
+        ["bash", "-c", 'source "$WRAPPER_PATH"; acquire_controller_lock; while :; do /bin/sleep 1; done'],
+        cwd=ROOT, env={**env, "WRAPPER_PATH": str(WRAPPER)},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+    )
+    lock_path = _controller_lock_path(env)
+    holder_pid: int | None = None
+    try:
+        deadline = time.monotonic() + 5
+        while not lock_path.is_file() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert lock_path.is_file()
+        holder_pid = json.loads(lock_path.read_text(encoding="ascii"))["holder_pid"]
+
+        os.kill(process.pid, signal.SIGKILL)
+        process.communicate(timeout=5)
+        deadline = time.monotonic() + 5
+        while lock_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not lock_path.exists()
+        with pytest.raises(ProcessLookupError):
+            os.kill(holder_pid, 0)
+    finally:
+        if process.poll() is None:
+            os.kill(process.pid, signal.SIGKILL)
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=5)
+        if holder_pid is not None:
+            try:
+                os.kill(holder_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
 
 
 def test_stale_controller_lock_is_reclaimed_without_killing_a_process(tmp_path: Path) -> None:
@@ -441,9 +608,12 @@ def test_stale_controller_lock_is_reclaimed_without_killing_a_process(tmp_path: 
         "run_id": env["LEHOME_N15_RUN_ID"], "controller_pid": 99999998,
         "holder_pid": 99999999, "script_path": str(WRAPPER.resolve()),
     }
-    (pipeline / "controller.lock").write_text(
+    lock_path = _controller_lock_path(env)
+    lock_path.parent.mkdir(mode=0o700)
+    lock_path.write_text(
         json.dumps(stale, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii"
     )
+    lock_path.chmod(0o600)
 
     result = subprocess.run(
         ["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True
@@ -451,7 +621,7 @@ def test_stale_controller_lock_is_reclaimed_without_killing_a_process(tmp_path: 
 
     assert result.returncode != 0
     assert "compute instance start" in trace.read_text()
-    assert not (pipeline / "controller.lock").exists()
+    assert not lock_path.exists()
 
 
 def test_wrapper_dispatches_preemption_resume_completion_and_downstream_exactly_once(
@@ -526,6 +696,161 @@ run_pipeline_after_runtime
     assert lines.count("paid:harvest") == 1
     assert lines.count("verify:harvest-1000") == 1
     assert (state / "training-012000").read_text(encoding="ascii") == "012000\n"
+
+
+def test_wrapper_main_wires_verified_resume_train_stage_and_final_move(
+    tmp_path: Path,
+) -> None:
+    """Run main and the real train-stage dispatcher with only the SSH boundary doubled."""
+    from lehome import n15_reproduction as reproduction
+
+    checkout, source_receipt = _FIXTURES._materialize_source(tmp_path)
+    _, _, snapshots_receipt = _FIXTURES._materialize_snapshots(tmp_path, checkout)
+    contract = _FIXTURES._fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout, source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id, disk_id=contract.disk_id, contract=contract,
+    )
+    old_training, old_staging, upstream = _FIXTURES._materialize_partial_training(
+        tmp_path, verified=verified, contract=contract
+    )
+    run_id = "n15-main-resume-integration"
+    remote_runs = tmp_path / "remote-runs"; remote_runs.mkdir()
+    remote_pipeline = remote_runs / run_id; remote_pipeline.mkdir()
+    training = remote_pipeline / "training"
+    staging = Path(f"{training}.evidence-staging")
+    old_staging.rename(staging)
+    assert not old_training.exists()
+
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    trace = tmp_path / "main-trace.log"
+    (fake_bin / "nebius").write_text(
+        "#!/usr/bin/env bash\nprintf 'provider:%s\\n' \"$*\" >> \"$FAKE_TRACE\"\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "ssh").write_text("#!/usr/bin/env bash\nexit 97\n", encoding="utf-8")
+    for command in (fake_bin / "nebius", fake_bin / "ssh"): command.chmod(0o755)
+    host_root = tmp_path / "host"; host_root.mkdir()
+    env = _wrapper_env(host_root, fake_bin, run_id)
+    env.update({
+        "FAKE_TRACE": str(trace),
+        "LEHOME_N15_REMOTE_RUNS_BASE": str(remote_runs),
+        "LEHOME_N15_REMOTE_PIPELINE_ROOT": str(remote_pipeline),
+        "LEHOME_N15_TRAINING_ROOT": str(training),
+        "LEHOME_N15_PUBLIC_SOURCE_ROOT": str(checkout),
+        "LEHOME_N15_SOURCE_RECEIPT": str(source_receipt),
+        "LEHOME_N15_RESOLVED_SNAPSHOTS_RECEIPT": str(snapshots_receipt),
+        "LEHOME_N15_RESUME_PARTIAL": "1",
+        "LEHOME_N15_RESUME_STEP": "1500",
+        "LEHOME_N15_RESUME_CHECKPOINT": str(upstream / "checkpoints/001500"),
+    })
+    harness = r'''
+source "$WRAPPER_PATH"
+capture_exact_provider_state() { printf 'provider-state:%s\n' "$1" >> "$FAKE_TRACE"; printf '{}\n' > "$2"; }
+wait_for_ssh_readiness() { printf 'ssh-ready\n' >> "$FAKE_TRACE"; }
+wait_for_remote_runtime() { printf 'runtime-ready\n' >> "$FAKE_TRACE"; }
+remote_file_exists() { test -f "$1" && test ! -L "$1"; }
+verify_remote_training_chain() { printf 'verify:training\n' >> "$FAKE_TRACE"; test -f "$TRAINING_ROOT/training-identity.json"; }
+publish_training_readback() { printf 'publish:training\n' >> "$FAKE_TRACE"; printf '{}\n' > "$TRAINING_PUBLICATION_RECEIPT"; }
+verify_remote_training_publication() { printf 'verify:training-publication\n' >> "$FAKE_TRACE"; test -f "$TRAINING_PUBLICATION_RECEIPT"; }
+verify_remote_focused_chain() { printf 'verify:focused\n' >> "$FAKE_TRACE"; test -f "$FOCUSED_PROMOTION_RECEIPT"; }
+verify_remote_harvest_chain() { printf 'verify:harvest-1000\n' >> "$FAKE_TRACE"; test -f "$REMOTE_PIPELINE_ROOT/harvest-1000"; }
+fetch_remote_immutable() { printf 'fetch\n' >> "$FAKE_TRACE"; printf '{}\n' > "$2"; }
+finalize_host_harvest_terminal() { printf 'finalize\n' >> "$FAKE_TRACE"; printf '{}\n' > "$HARVEST_TERMINAL_RECEIPT"; }
+stop_exact_vm() { printf 'stop\n' >> "$FAKE_TRACE"; }
+remote() {
+  payload="$(</dev/stdin)"
+    if [[ "$payload" == *'resume_scratch_root='* ]]; then
+      attempt_id="${!#}"
+    resume_step="${18}"
+    test "$resume_step" = 1500
+    test "$attempt_id" = "$RESUME_ATTEMPT_ID"
+    grep -F 'verify-resume-checkpoint' <<<"$payload" >/dev/null
+    grep -F -- '--attempt-id "$resume_attempt_id"' <<<"$payload" >/dev/null
+    grep -F 'PYTHONPATH="/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl" /opt/lehome-challenge/.venv/bin/lerobot-train --config_path="$resume_checkpoint/pretrained_model/train_config.json" --resume=true --wandb.mode=offline' <<<"$payload" >/dev/null
+    mkdir -p "$TRAINING_ROOT.evidence-staging/evidence/resume-attempts"
+    cp "$FAKE_VERIFIED_RESUME_RECEIPT" "$TRAINING_ROOT.evidence-staging/evidence/resume-attempts/$attempt_id.json"
+    printf 'resume attempt %s admitted at checkpoint 001500\n' "$attempt_id" > "$TRAINING_ROOT.evidence-staging/logs/train-resume-$attempt_id.log"
+    printf 'train-stage:%s\n' "$attempt_id" >> "$FAKE_TRACE"
+    if [[ "$FAKE_COMPLETE" != 1 ]]; then
+      printf 'preempted\n' >> "$TRAINING_ROOT.evidence-staging/logs/train-resume-$attempt_id.log"
+      return 17
+    fi
+    cp -R "$RESUME_CHECKPOINT" "$SOURCE_ROOT/outputs/train/groot_four_types_merged_batch64_lr2e-4/checkpoints/012000"
+    printf '{"step":12000}\n' > "$SOURCE_ROOT/outputs/train/groot_four_types_merged_batch64_lr2e-4/checkpoints/012000/training_state/training_step.json"
+    rm "$SOURCE_ROOT/outputs/train/groot_four_types_merged_batch64_lr2e-4/checkpoints/last"
+    ln -s 012000 "$SOURCE_ROOT/outputs/train/groot_four_types_merged_batch64_lr2e-4/checkpoints/last"
+    printf 'Checkpoint policy after step 12000\nEnd of training\n' >> "$TRAINING_ROOT.evidence-staging/logs/train-resume-$attempt_id.log"
+    mv "$SOURCE_ROOT/outputs/train/groot_four_types_merged_batch64_lr2e-4" "$TRAINING_ROOT"
+    mv "$TRAINING_ROOT.evidence-staging/evidence" "$TRAINING_ROOT/evidence"
+    mv "$TRAINING_ROOT.evidence-staging/logs" "$TRAINING_ROOT/logs"
+    mv "$TRAINING_ROOT.evidence-staging/runtime" "$TRAINING_ROOT/runtime"
+    rmdir "$TRAINING_ROOT.evidence-staging"
+    printf '{}\n' > "$TRAINING_ROOT/training-identity.json"
+    return 0
+  fi
+  if [[ "$payload" == *'run_public_n15_focused_gate.sh'* ]]; then
+    printf 'focused-stage\n' >> "$FAKE_TRACE"
+    focused_receipt="$REMOTE_PIPELINE_ROOT/focused/promotion.json"
+    mkdir -p "$(dirname "$focused_receipt")"
+    printf '{}\n' > "$focused_receipt"
+    return 0
+  fi
+  if [[ "$payload" == *'run_public_n15_harvest.sh'* ]]; then
+    printf 'harvest-stage:1000\n' >> "$FAKE_TRACE"
+    printf '{}\n' > "$REMOTE_PIPELINE_ROOT/harvest-1000"
+    return 0
+  fi
+  return 97
+}
+main
+'''
+
+    def receipt_for(attempt_id: str, destination: Path) -> None:
+        value = reproduction.verify_resume_checkpoint(
+            verified=verified, training_root=training, staging_root=staging,
+            upstream_output=upstream, requested_step=1500,
+            attempt_id=attempt_id, contract=contract,
+        )
+        destination.write_bytes(_FIXTURES._canonical(value))
+
+    first_receipt = tmp_path / "attempt-first.json"
+    receipt_for("attempt-first", first_receipt)
+    first = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={**env, "WRAPPER_PATH": str(WRAPPER),
+             "LEHOME_N15_RESUME_ATTEMPT_ID": "attempt-first",
+             "FAKE_VERIFIED_RESUME_RECEIPT": str(first_receipt), "FAKE_COMPLETE": "0"},
+        text=True, capture_output=True,
+    )
+    assert first.returncode != 0
+    assert upstream.is_dir() and not training.exists()
+    assert not (remote_pipeline / "focused/promotion.json").exists()
+
+    second_receipt = tmp_path / "attempt-second.json"
+    receipt_for("attempt-second", second_receipt)
+    second = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={**env, "WRAPPER_PATH": str(WRAPPER),
+             "LEHOME_N15_RESUME_ATTEMPT_ID": "attempt-second",
+             "FAKE_VERIFIED_RESUME_RECEIPT": str(second_receipt), "FAKE_COMPLETE": "1"},
+        text=True, capture_output=True,
+    )
+    assert second.returncode == 0, second.stderr
+    assert not upstream.exists()
+    assert (training / "checkpoints/012000/training_state/training_step.json").is_file()
+    assert (training / "evidence/resume-attempts/attempt-first.json").is_file()
+    assert (training / "evidence/resume-attempts/attempt-second.json").is_file()
+    assert (training / "logs/train-resume-attempt-first.log").is_file()
+    assert (training / "logs/train-resume-attempt-second.log").is_file()
+    lines = trace.read_text(encoding="utf-8").splitlines()
+    assert lines.count("train-stage:attempt-first") == 1
+    assert lines.count("train-stage:attempt-second") == 1
+    assert lines.count("publish:training") == 1
+    assert lines.count("focused-stage") == 1
+    assert lines.count("harvest-stage:1000") == 1
+    assert lines.count("verify:harvest-1000") == 1
 
 
 def test_running_observation_waits_for_cloud_init_after_ssh_is_ready(tmp_path: Path) -> None:

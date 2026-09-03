@@ -36,10 +36,13 @@ _TRAINING_CONTAINER_PYTHONPATH = (
     "/deps/peft-0.18.1-py3-none-any.whl"
 )
 _TRAINING_CONTAINER_LEROBOT_ROOT = "/flash/site-packages/lerobot"
-# Complete LeRobot 0.4.3 serialization structure is based on the public
-# pretrained_model/train_config.json (source sha256 8fed45ce...6052f), then
-# resolved against the byte-pinned submission-4 YAML (lora_rank=0) and this
-# controller's required offline W&B override before path/id normalization.
+_PUBLIC_12K_GOLDEN_TRAIN_CONFIG_NAME = "n15_public_12k_train_config.golden.json"
+_PUBLIC_12K_GOLDEN_TRAIN_CONFIG_SHA256 = (
+    "a3130a1b796ecc0da6bb1c51b82b6ee04e2ecc761e4c2ae530f07281613f18ee"
+)
+_PUBLIC_12K_SOURCE_TRAIN_CONFIG_SHA256 = (
+    "8fed45ce6356ca2ab3a44ee16f58efcba65274666074d253fa252ef6e826052f"
+)
 _PUBLIC_12K_NORMALIZED_TRAIN_CONFIG_SHA256 = (
     "14db86649a124aedcfd8b88e2f2c668dfe7b628f6e3191d2a5150084a9c58fd6"
 )
@@ -155,6 +158,62 @@ class VerifiedInputs:
     source_tree: str
     base_model_metadata_sha256: str
     dataset_metadata_sha256: str
+
+
+def _public_12k_golden_train_config() -> dict[str, object]:
+    path = Path(__file__).with_name(_PUBLIC_12K_GOLDEN_TRAIN_CONFIG_NAME)
+    try:
+        metadata = path.lstat()
+        payload = path.read_bytes()
+    except OSError:
+        raise ReproductionError("golden public training recipe fixture is unavailable") from None
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size == 0
+        or _sha256_bytes(payload) != _PUBLIC_12K_GOLDEN_TRAIN_CONFIG_SHA256
+    ):
+        raise ReproductionError("golden public training recipe fixture identity mismatch")
+    try:
+        value = json.loads(payload)
+    except (UnicodeError, json.JSONDecodeError):
+        raise ReproductionError("golden public training recipe fixture is invalid") from None
+    if not isinstance(value, dict):
+        raise ReproductionError("golden public training recipe fixture is invalid")
+    return value
+
+
+def public_12k_train_config_identity() -> dict[str, object]:
+    """Return the independently pinned origin of the complete saved config."""
+
+    golden = _public_12k_golden_train_config()
+    resolved = json.loads(json.dumps(golden, allow_nan=False))
+    try:
+        resolved["dataset"]["root"] = "<DATASET_ROOT>"
+        resolved["output_dir"] = "<OUTPUT_DIR>"
+        resolved["wandb"]["run_id"] = "<WANDB_RUN_ID>"
+        resolved["wandb"]["mode"] = "offline"
+    except (KeyError, TypeError):
+        raise ReproductionError("golden public training recipe fixture is invalid") from None
+    if _sha256_bytes(_canonical_bytes(resolved)) != _PUBLIC_12K_NORMALIZED_TRAIN_CONFIG_SHA256:
+        raise ReproductionError("golden public training recipe fixture resolution mismatch")
+    return {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_train_config_golden_v1",
+        "source_repository": CONTRACT.source_repository,
+        "source_revision": CONTRACT.source_revision,
+        "source_path": "pretrained_model/train_config.json",
+        "source_artifact_sha256": _PUBLIC_12K_SOURCE_TRAIN_CONFIG_SHA256,
+        "fixture_path": _PUBLIC_12K_GOLDEN_TRAIN_CONFIG_NAME,
+        "fixture_sha256": _PUBLIC_12K_GOLDEN_TRAIN_CONFIG_SHA256,
+        "resolved_recipe_sha256": _PUBLIC_12K_NORMALIZED_TRAIN_CONFIG_SHA256,
+        "allowed_resolutions": [
+            "dataset.root",
+            "output_dir",
+            "wandb.run_id",
+            "wandb.mode=offline",
+        ],
+    }
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -1215,13 +1274,12 @@ def _required_nonempty_checkpoint_files(checkpoint_root: Path) -> dict[str, Path
 
 def _verify_exact_saved_train_config(
     value: object, *, verified: VerifiedInputs, upstream: Path
-) -> None:
+) -> dict[str, object]:
     """Verify the complete LeRobot 0.4.3 serialization of the pinned recipe.
 
-    The digest is derived from an authentic public TrainPipelineConfig emitted
-    by the pinned LeRobot version.  Only the two resolved filesystem paths and
-    W&B's generated run id are normalized; every key, nested value, and unknown
-    field remains covered by the digest.
+    The complete public TrainPipelineConfig is checked in as an independently
+    digested golden fixture.  Only the two resolved filesystem paths, W&B's
+    generated run id, and the required offline W&B mode may differ.
     """
 
     if not isinstance(value, dict):
@@ -1256,8 +1314,113 @@ def _verify_exact_saved_train_config(
     normalized["dataset"]["root"] = "<DATASET_ROOT>"
     normalized["output_dir"] = "<OUTPUT_DIR>"
     normalized["wandb"]["run_id"] = "<WANDB_RUN_ID>"
-    if _sha256_bytes(_canonical_bytes(normalized)) != _PUBLIC_12K_NORMALIZED_TRAIN_CONFIG_SHA256:
+    golden = _public_12k_golden_train_config()
+    golden["dataset"]["root"] = "<DATASET_ROOT>"
+    golden["output_dir"] = "<OUTPUT_DIR>"
+    golden["wandb"]["run_id"] = "<WANDB_RUN_ID>"
+    golden["wandb"]["mode"] = "offline"
+    if (
+        normalized != golden
+        or _sha256_bytes(_canonical_bytes(normalized))
+        != _PUBLIC_12K_NORMALIZED_TRAIN_CONFIG_SHA256
+    ):
         raise ReproductionError("saved training recipe differs from the pinned recipe")
+    return public_12k_train_config_identity()
+
+
+def _resume_scratch_path(staging_root: Path | str, attempt_id: str) -> tuple[Path, Path]:
+    if not isinstance(attempt_id, str) or _RESUME_ATTEMPT_ID.fullmatch(attempt_id) is None:
+        raise ReproductionError("resume scratch attempt identity is invalid")
+    staging = _regular_directory(Path(staging_root), "training evidence staging root")
+    return staging, staging / f".resume-scratch-{attempt_id}"
+
+
+def _remove_resume_scratch(staging: Path, scratch: Path) -> None:
+    if not scratch.exists() and not scratch.is_symlink():
+        return
+    metadata = scratch.lstat()
+    if (
+        scratch.parent != staging
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or scratch.is_symlink()
+    ):
+        raise ReproductionError("resume scratch root is unsafe")
+    expected_attempt = scratch.name.removeprefix(".resume-scratch-")
+    if _RESUME_ATTEMPT_ID.fullmatch(expected_attempt) is None:
+        raise ReproductionError("resume scratch path is invalid")
+    owner = scratch / "owner.json"
+    if owner.exists() or owner.is_symlink():
+        try:
+            owner_metadata = owner.lstat()
+            owner_raw = owner.read_bytes()
+            owner_value = json.loads(owner_raw)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raise ReproductionError("resume scratch owner evidence is invalid") from None
+        if (
+            not stat.S_ISREG(owner_metadata.st_mode)
+            or stat.S_IMODE(owner_metadata.st_mode) != 0o444
+            or owner.is_symlink()
+            or owner_raw != _canonical_bytes(owner_value)
+            or owner_value != {
+                "schema_version": 1,
+                "kind": "lehome_public_n15_resume_scratch_v1",
+                "attempt_id": expected_attempt,
+            }
+        ):
+            raise ReproductionError("resume scratch owner evidence is invalid")
+    staging_device = staging.stat().st_dev
+    entries = sorted(scratch.rglob("*"), key=lambda path: len(path.parts), reverse=True)
+    for path in entries:
+        item = path.lstat()
+        if (
+            path.is_symlink()
+            or item.st_uid != os.getuid()
+            or item.st_dev != staging_device
+            or not (stat.S_ISREG(item.st_mode) or stat.S_ISDIR(item.st_mode))
+        ):
+            raise ReproductionError("resume scratch contains an unsafe entry")
+    for path in entries:
+        if stat.S_ISDIR(path.lstat().st_mode):
+            path.rmdir()
+        else:
+            path.unlink()
+    scratch.rmdir()
+
+
+def cleanup_resume_scratch(*, staging_root: Path | str, attempt_id: str) -> None:
+    """Remove only one authenticated, controller-owned resume scratch tree."""
+
+    staging, scratch = _resume_scratch_path(staging_root, attempt_id)
+    _remove_resume_scratch(staging, scratch)
+
+
+def prepare_resume_scratch(*, staging_root: Path | str, attempt_id: str) -> Path:
+    """Clear safe stale attempt scratch and create this attempt's owned tree."""
+
+    staging, scratch = _resume_scratch_path(staging_root, attempt_id)
+    for candidate in sorted(staging.iterdir()):
+        if not candidate.name.startswith(".resume-scratch-"):
+            continue
+        suffix = candidate.name.removeprefix(".resume-scratch-")
+        if _RESUME_ATTEMPT_ID.fullmatch(suffix) is None:
+            raise ReproductionError("resume scratch path is invalid")
+        _remove_resume_scratch(staging, candidate)
+    scratch.mkdir(mode=0o700)
+    owner = {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_resume_scratch_v1",
+        "attempt_id": attempt_id,
+    }
+    try:
+        with (scratch / "owner.json").open("x", encoding="ascii") as stream:
+            stream.write(_canonical_bytes(owner).decode("ascii"))
+        os.chmod(scratch / "owner.json", 0o444)
+    except OSError:
+        _remove_resume_scratch(staging, scratch)
+        raise
+    return scratch
 
 
 def verify_resume_checkpoint(
@@ -1332,7 +1495,9 @@ def verify_resume_checkpoint(
         train_config = json.loads(config_raw)
     except (OSError, UnicodeError, json.JSONDecodeError):
         raise ReproductionError("saved training recipe is invalid") from None
-    _verify_exact_saved_train_config(train_config, verified=verified, upstream=upstream)
+    train_config_origin = _verify_exact_saved_train_config(
+        train_config, verified=verified, upstream=upstream
+    )
 
     evidence_root = _regular_directory(staging / "evidence", "staged training evidence")
     required_evidence = {
@@ -1412,6 +1577,7 @@ def verify_resume_checkpoint(
             relative: _sha256_file(path)
             for relative, path in sorted(evidence_files.items())
         },
+        "train_config_origin": train_config_origin,
         "original_upstream_output_dir": str(upstream),
         "config_path": str(config_path),
         "pythonpath": _TRAINING_CONTAINER_PYTHONPATH,
@@ -1454,7 +1620,7 @@ def _verified_resume_lineage(
         expected_keys = {
             "schema_version", "kind", "attempt_id", "requested_step", "checkpoint",
             "checkpoint_files", "evidence_files", "original_upstream_output_dir",
-            "config_path", "pythonpath", "resume_argv",
+            "config_path", "pythonpath", "resume_argv", "train_config_origin",
         }
         save_freq = contract.training.get("save_freq")
         total_steps = contract.training.get("steps")
@@ -1484,6 +1650,7 @@ def _verified_resume_lineage(
             or not isinstance(upstream, str)
             or not Path(upstream).is_absolute()
             or config_path != f"{upstream}/{checkpoint_relative}/pretrained_model/train_config.json"
+            or receipt.get("train_config_origin") != public_12k_train_config_identity()
             or receipt.get("pythonpath") != _TRAINING_CONTAINER_PYTHONPATH
             or receipt.get("resume_argv") != [
                 _TRAINING_CONTAINER_PYTHON.removesuffix("/python") + "/lerobot-train",

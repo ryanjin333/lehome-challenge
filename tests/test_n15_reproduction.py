@@ -1078,6 +1078,30 @@ def _materialize_partial_training(
 _AUTHENTIC_PUBLIC_12K_TRAIN_CONFIG = r'''{"dataset":{"repo_id":"repo_groot","root":"Datasets/example/four_types_merged","episodes":null,"image_transforms":{"enable":false,"max_num_transforms":3,"random_order":false,"tfs":{"brightness":{"weight":1.0,"type":"ColorJitter","kwargs":{"brightness":[0.8,1.2]}},"contrast":{"weight":1.0,"type":"ColorJitter","kwargs":{"contrast":[0.8,1.2]}},"saturation":{"weight":1.0,"type":"ColorJitter","kwargs":{"saturation":[0.5,1.5]}},"hue":{"weight":1.0,"type":"ColorJitter","kwargs":{"hue":[-0.05,0.05]}},"sharpness":{"weight":1.0,"type":"SharpnessJitter","kwargs":{"sharpness":[0.5,1.5]}},"affine":{"weight":1.0,"type":"RandomAffine","kwargs":{"degrees":[-5.0,5.0],"translate":[0.05,0.05]}}}},"revision":null,"use_imagenet_stats":true,"video_backend":"torchcodec","streaming":false},"env":null,"policy":{"type":"groot","n_obs_steps":1,"input_features":{"observation.state":{"type":"STATE","shape":[12]},"observation.images.top_rgb":{"type":"VISUAL","shape":[3,480,640]},"observation.images.left_rgb":{"type":"VISUAL","shape":[3,480,640]},"observation.images.right_rgb":{"type":"VISUAL","shape":[3,480,640]},"observation.images.top_depth":{"type":"STATE","shape":[1,480,640]}},"output_features":{"action":{"type":"ACTION","shape":[12]}},"device":"cuda","use_amp":false,"use_peft":false,"push_to_hub":false,"repo_id":null,"private":null,"tags":null,"license":null,"pretrained_path":null,"chunk_size":50,"n_action_steps":50,"max_state_dim":64,"max_action_dim":32,"normalization_mapping":{"VISUAL":"IDENTITY","STATE":"MEAN_STD","ACTION":"MEAN_STD"},"image_size":[224,224],"base_model_path":"nvidia/GR00T-N1.5-3B","tokenizer_assets_repo":"lerobot/eagle2hg-processor-groot-n1p5","embodiment_tag":"new_embodiment","tune_llm":false,"tune_visual":false,"tune_projector":true,"tune_diffusion_model":true,"lora_rank":0,"lora_alpha":16,"lora_dropout":0.05,"lora_full_model":false,"optimizer_lr":0.0002,"optimizer_betas":[0.95,0.999],"optimizer_eps":1e-08,"optimizer_weight_decay":1e-05,"warmup_ratio":0.05,"num_decay_steps":12000,"decay_lr_ratio":0.1,"use_bf16":true,"video_backend":"decord","balance_dataset_weights":true,"balance_trajectory_weights":true,"dataset_paths":null,"output_dir":"./tmp/gr00t","save_steps":1000,"max_steps":10000,"batch_size":32,"dataloader_num_workers":8,"report_to":"wandb","resume":false},"output_dir":"outputs/train/groot_four_types_merged_batch64_lr2e-4","job_name":"groot","resume":false,"seed":1000,"num_workers":4,"batch_size":64,"steps":12000,"eval_freq":20000,"log_freq":500,"tolerance_s":0.0001,"save_checkpoint":true,"save_freq":1500,"use_policy_training_preset":true,"optimizer":{"type":"adamw","lr":0.0002,"weight_decay":1e-05,"grad_clip_norm":10.0,"betas":[0.95,0.999],"eps":1e-08},"scheduler":{"type":"cosine_decay_with_warmup","num_warmup_steps":600,"num_decay_steps":12000,"peak_lr":0.0002,"decay_lr":2e-05},"eval":{"n_episodes":50,"batch_size":50,"use_async_envs":false},"wandb":{"enable":true,"disable_artifact":true,"project":"lehome-challenge","entity":null,"notes":null,"run_id":"iqfjc8st","mode":null},"peft":null,"use_rabc":false,"rabc_progress_path":null,"rabc_kappa":0.01,"rabc_epsilon":1e-06,"rabc_head_mode":"sparse","rename_map":{},"checkpoint_path":null}'''
 
 
+def test_public_12k_golden_config_has_independent_origin_and_fixture_digest() -> None:
+    from lehome import n15_reproduction as reproduction
+
+    identity = reproduction.public_12k_train_config_identity()
+
+    assert identity == {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_train_config_golden_v1",
+        "source_repository": "theo-zhou/lehome-groot-submission-4",
+        "source_revision": "d384fe00508acd96ab1c3c5dc265e08261f94b3b",
+        "source_path": "pretrained_model/train_config.json",
+        "source_artifact_sha256": "8fed45ce6356ca2ab3a44ee16f58efcba65274666074d253fa252ef6e826052f",
+        "fixture_path": "n15_public_12k_train_config.golden.json",
+        "fixture_sha256": "a3130a1b796ecc0da6bb1c51b82b6ee04e2ecc761e4c2ae530f07281613f18ee",
+        "resolved_recipe_sha256": "14db86649a124aedcfd8b88e2f2c668dfe7b628f6e3191d2a5150084a9c58fd6",
+        "allowed_resolutions": [
+            "dataset.root",
+            "output_dir",
+            "wandb.run_id",
+            "wandb.mode=offline",
+        ],
+    }
+
+
 def test_verify_resume_checkpoint_accepts_complete_001500_and_renders_exact_command(
     tmp_path: Path,
 ) -> None:
@@ -1123,6 +1147,7 @@ def test_verify_resume_checkpoint_accepts_complete_001500_and_renders_exact_comm
     )
     assert receipt["checkpoint_files"]
     assert receipt["evidence_files"]
+    assert receipt["train_config_origin"] == reproduction.public_12k_train_config_identity()
 
 
 @pytest.mark.parametrize(
@@ -1283,6 +1308,7 @@ def _complete_resumed_training(
 def test_resumed_final_identity_authenticates_resume_lineage(tmp_path: Path) -> None:
     from lehome import n15_reproduction as reproduction
     from rollout_appliance.native_reference_site.training_identity import (
+        TrainingIdentityError,
         validate_training_identity_receipt,
     )
 
@@ -1331,6 +1357,19 @@ def test_resumed_final_identity_authenticates_resume_lineage(tmp_path: Path) -> 
         expected_pretrained_root=training_root / "checkpoints/012000/pretrained_model",
     )
     assert admitted["resume_lineage"] == identity["resume_lineage"]
+
+    lineage_path = training_root / "evidence/resume-attempts/attempt-a.json"
+    altered_lineage = json.loads(lineage_path.read_text(encoding="ascii"))
+    altered_lineage["train_config_origin"]["source_artifact_sha256"] = "0" * 64
+    lineage_path.write_bytes(_canonical(altered_lineage))
+    identity_path.unlink()
+    identity["resume_lineage"][0]["receipt_sha256"] = _sha(lineage_path.read_bytes())
+    _rewrite_task1_identity(training_root, identity, identity_path)
+    with pytest.raises(TrainingIdentityError, match="resume lineage receipt"):
+        validate_training_identity_receipt(
+            identity_path, expected_contract=contract,
+            expected_pretrained_root=training_root / "checkpoints/012000/pretrained_model",
+        )
 
 
 def test_same_checkpoint_boundary_supports_distinct_authenticated_attempts(
@@ -1391,6 +1430,54 @@ def test_same_checkpoint_boundary_supports_distinct_authenticated_attempts(
     ]
     assert identity["resume_lineage"][0]["log_sha256"] is None
     assert all(item["log_sha256"] for item in identity["resume_lineage"][1:])
+
+
+@pytest.mark.parametrize(
+    "setup_point",
+    ["compatibility", "runtime-image", "overlays", "runtime-receipt", "execution-manifest"],
+)
+def test_resume_retry_cleans_authenticated_scratch_after_each_setup_preemption(
+    tmp_path: Path, setup_point: str,
+) -> None:
+    from lehome.n15_reproduction import cleanup_resume_scratch, prepare_resume_scratch
+
+    staging = tmp_path / "training.evidence-staging"
+    staging.mkdir(mode=0o700)
+    first = prepare_resume_scratch(staging_root=staging, attempt_id="attempt-first")
+    interrupted = first / setup_point
+    if "." in setup_point:
+        interrupted.write_bytes(b"partial\n")
+    else:
+        interrupted.mkdir()
+        (interrupted / "partial.bin").write_bytes(b"partial\n")
+
+    second = prepare_resume_scratch(staging_root=staging, attempt_id="attempt-second")
+
+    assert not first.exists()
+    assert second.is_dir() and not second.is_symlink()
+    owner = json.loads((second / "owner.json").read_text(encoding="ascii"))
+    assert owner == {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_resume_scratch_v1",
+        "attempt_id": "attempt-second",
+    }
+    cleanup_resume_scratch(staging_root=staging, attempt_id="attempt-second")
+    assert not second.exists()
+
+
+def test_resume_scratch_cleanup_fails_closed_on_an_unsafe_stale_entry(
+    tmp_path: Path,
+) -> None:
+    from lehome.n15_reproduction import ReproductionError, prepare_resume_scratch
+
+    staging = tmp_path / "training.evidence-staging"
+    staging.mkdir(mode=0o700)
+    outside = tmp_path / "outside"; outside.mkdir()
+    (staging / ".resume-scratch-attempt-stale").symlink_to(outside)
+
+    with pytest.raises(ReproductionError, match="scratch"):
+        prepare_resume_scratch(staging_root=staging, attempt_id="attempt-next")
+    assert outside.is_dir()
 
 
 @pytest.mark.parametrize(

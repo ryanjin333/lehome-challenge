@@ -21,8 +21,10 @@ from lehome.n15_reproduction import (  # noqa: E402
     ReproductionContract,
     ReproductionError,
     build_compatible_lerobot_wheel,
+    cleanup_resume_scratch,
     compatibility_wheel_identity,
     render_training,
+    prepare_resume_scratch,
     verify_resume_checkpoint,
     verify_inputs,
     verify_training_output,
@@ -62,6 +64,13 @@ def _parser() -> argparse.ArgumentParser:
     resume.add_argument("--upstream-output", type=Path, required=True)
     resume.add_argument("--resume-step", type=int, required=True)
     resume.add_argument("--attempt-id", required=True)
+    for scratch_command, help_text in (
+        ("prepare-resume-scratch", "replace safe stale scratch with one owned attempt tree"),
+        ("cleanup-resume-scratch", "remove one owned resume attempt scratch tree"),
+    ):
+        scratch = commands.add_parser(scratch_command, help=help_text)
+        scratch.add_argument("--staging-root", type=Path, required=True)
+        scratch.add_argument("--attempt-id", required=True)
     compatibility = commands.add_parser(
         "build-compatible-wheel",
         help="build the sealed two-field LeRobot 0.4.3 compatibility wheel",
@@ -212,6 +221,16 @@ def main(
                 upstream_wheel=args.upstream_wheel,
                 expected_upstream_sha256=contract.lerobot_wheel_sha256,
             )
+        elif args.command == "prepare-resume-scratch":
+            path = prepare_resume_scratch(
+                staging_root=args.staging_root, attempt_id=args.attempt_id
+            )
+            result = {"scratch_root": str(path)}
+        elif args.command == "cleanup-resume-scratch":
+            cleanup_resume_scratch(
+                staging_root=args.staging_root, attempt_id=args.attempt_id
+            )
+            result = {"removed": True}
         else:
             verified = _verified(args, contract)
             if args.command == "verify-inputs":

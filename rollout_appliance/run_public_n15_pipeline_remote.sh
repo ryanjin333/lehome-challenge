@@ -117,24 +117,67 @@ stop_exact_vm() {
 trap 'exit 130' INT TERM
 
 acquire_controller_lock() {
-  local lock_path="$PIPELINE_ROOT/controller.lock"
-  CONTROLLER_LOCK_READY="$PIPELINE_ROOT/.controller-lock-ready.$$.$RANDOM"
-  python3 - "$lock_path" "$CONTROLLER_LOCK_READY" "$RUN_ID" "$SCRIPT_DIR/run_public_n15_pipeline_remote.sh" "$$" <<'PY' &
+  local runtime_base
+  if [[ -n "${LEHOME_N15_CONTROLLER_LOCK_TEST_ROOT:-}" ]]; then
+    case "${PYTEST_CURRENT_TEST:-}" in
+      tests/infrastructure/test_public_n15_pipeline_remote.py::*) ;;
+      *) return 1 ;;
+    esac
+    runtime_base="$(cd "$LEHOME_N15_CONTROLLER_LOCK_TEST_ROOT" && pwd -P)" || return 1
+  else
+    runtime_base="$(cd /var/tmp && pwd -P)" || return 1
+  fi
+  local lock_root="$runtime_base/lehome-public-n15-controller-$(id -u)"
+  local lock_path="$lock_root/$EXACT_VM_ID.lock"
+  CONTROLLER_LOCK_READY="$lock_root/.ready.$$.$RANDOM"
+  python3 - "$runtime_base" "$lock_root" "$lock_path" "$CONTROLLER_LOCK_READY" "$RUN_ID" "$SCRIPT_DIR/run_public_n15_pipeline_remote.sh" "$$" <<'PY' &
 import fcntl
 import json
 import os
 from pathlib import Path
 import signal
+import stat
 import sys
+import time
 
-lock_path, ready_path = map(Path, sys.argv[1:3])
-run_id, script_path, controller_pid = sys.argv[3], sys.argv[4], int(sys.argv[5])
+runtime_base, lock_root, lock_path, ready_path = map(Path, sys.argv[1:5])
+run_id, script_path, controller_pid = sys.argv[5], sys.argv[6], int(sys.argv[7])
+if (
+    not runtime_base.is_absolute()
+    or runtime_base.is_symlink()
+    or not runtime_base.is_dir()
+    or runtime_base.resolve(strict=True) != runtime_base
+    or lock_root.parent != runtime_base
+    or lock_path.parent != lock_root
+    or lock_path.name != "computeinstance-u00t6xfqhadrcmssa2.lock"
+    or ready_path.parent != lock_root
+):
+    raise SystemExit(73)
+try:
+    lock_root.mkdir(mode=0o700)
+except FileExistsError:
+    pass
+root_metadata = lock_root.lstat()
+if (
+    not stat.S_ISDIR(root_metadata.st_mode)
+    or root_metadata.st_uid != os.getuid()
+    or stat.S_IMODE(root_metadata.st_mode) != 0o700
+):
+    raise SystemExit(73)
 try:
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
 except OSError:
     raise SystemExit(73)
 acquired = False
 try:
+    lock_metadata = os.fstat(fd)
+    if (
+        not stat.S_ISREG(lock_metadata.st_mode)
+        or lock_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(lock_metadata.st_mode) != 0o600
+        or lock_metadata.st_nlink != 1
+    ):
+        raise SystemExit(73)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -162,7 +205,13 @@ try:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     while not nonlocal_stopped[0]:
-        signal.pause()
+        if os.getppid() != controller_pid:
+            break
+        try:
+            os.kill(controller_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
 finally:
     if acquired:
         try:
@@ -275,12 +324,16 @@ wait_for_ssh_readiness() {
 }
 initialize_deadline() {
   python3 - "$PLAN_RECEIPT" "$DEADLINE_RECEIPT" "$RUN_ID" <<'PY'
-import hashlib, json, os, sys, time
+import hashlib, json, os, stat, sys, time
 from pathlib import Path
 plan, output, run_id = map(Path if False else str, sys.argv[1:])
 plan_bytes = Path(plan).read_bytes(); digest = hashlib.sha256(plan_bytes).hexdigest()
-if Path(output).exists():
-    value = json.loads(Path(output).read_bytes())
+output_path = Path(output)
+if output_path.exists() or output_path.is_symlink():
+    metadata = output_path.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o444:
+        raise SystemExit("paid deadline receipt is not immutable")
+    value = json.loads(output_path.read_bytes())
     if value != {"schema_version": 1, "kind": "lehome_public_n15_paid_deadline_v1", "run_id": run_id, "lifecycle_plan_sha256": digest, "started_unix_seconds": value.get("started_unix_seconds"), "deadline_unix_seconds": value.get("deadline_unix_seconds")} or type(value["started_unix_seconds"]) is not int or value["deadline_unix_seconds"] != value["started_unix_seconds"] + 86400:
         raise SystemExit("paid deadline receipt is invalid")
     print(value["deadline_unix_seconds"]); raise SystemExit(0)
@@ -289,28 +342,44 @@ with Path(output).open("x", encoding="ascii") as stream: stream.write(json.dumps
 os.chmod(output, 0o444); print(value["deadline_unix_seconds"])
 PY
 }
-run_paid_stage() {
-  local label="$1" limit_seconds="$2" stage_function="$3"
-  local aggregate_deadline now stage_deadline pid status stage_receipt
-  case "$stage_function" in train_stage|focused_stage|harvest_stage) ;; *) fail "unknown paid stage dispatcher" ;; esac
-  aggregate_deadline="$(initialize_deadline)" || fail "aggregate paid deadline is invalid"
-  stage_receipt="$PIPELINE_ROOT/stage-$label-deadline.json"
-  stage_deadline="$(python3 - "$PLAN_RECEIPT" "$stage_receipt" "$RUN_ID" "$label" "$limit_seconds" "$aggregate_deadline" <<'PY'
-import hashlib, json, os, sys, time
-plan, output, run_id, stage, limit, aggregate = sys.argv[1:]
-digest = hashlib.sha256(open(plan, "rb").read()).hexdigest(); limit, aggregate = int(limit), int(aggregate)
-if os.path.exists(output):
-    value = json.load(open(output))
-    expected_keys = {"schema_version", "kind", "run_id", "stage", "lifecycle_plan_sha256", "started_unix_seconds", "deadline_unix_seconds"}
+initialize_stage_deadline() {
+  local label="$1" limit_seconds="$2" aggregate_deadline="$3"
+  local stage_receipt="$PIPELINE_ROOT/stage-$label-deadline.json"
+  python3 - "$PLAN_RECEIPT" "$stage_receipt" "$RUN_ID" "$label" "$limit_seconds" "$aggregate_deadline" <<'PY'
+import hashlib, json, os, stat, sys, time
+from pathlib import Path
+
+plan, output = map(Path, sys.argv[1:3])
+run_id, stage, limit, aggregate = sys.argv[3], sys.argv[4], int(sys.argv[5]), int(sys.argv[6])
+plan_metadata = plan.lstat()
+if not stat.S_ISREG(plan_metadata.st_mode) or stat.S_IMODE(plan_metadata.st_mode) != 0o444:
+    raise SystemExit("lifecycle plan is not immutable")
+digest = hashlib.sha256(plan.read_bytes()).hexdigest()
+expected_keys = {"schema_version", "kind", "run_id", "stage", "lifecycle_plan_sha256", "started_unix_seconds", "deadline_unix_seconds"}
+if output.exists() or output.is_symlink():
+    metadata = output.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o444:
+        raise SystemExit("stage deadline is not immutable")
+    value = json.loads(output.read_bytes())
     started, deadline = value.get("started_unix_seconds"), value.get("deadline_unix_seconds")
-    if set(value) != expected_keys or (value.get("schema_version"), value.get("kind"), value.get("run_id"), value.get("stage"), value.get("lifecycle_plan_sha256")) != (1, "lehome_public_n15_stage_deadline_v1", run_id, stage, digest) or type(started) is not int or type(deadline) is not int or deadline != min(started + limit, aggregate): raise SystemExit("stage deadline is invalid")
-    print(value["deadline_unix_seconds"]); raise SystemExit
+    if set(value) != expected_keys or (value.get("schema_version"), value.get("kind"), value.get("run_id"), value.get("stage"), value.get("lifecycle_plan_sha256")) != (1, "lehome_public_n15_stage_deadline_v1", run_id, stage, digest) or type(started) is not int or type(deadline) is not int or deadline != min(started + limit, aggregate):
+        raise SystemExit("stage deadline is invalid")
+    print(deadline)
+    raise SystemExit(0)
 started = int(time.time()); deadline = min(started + limit, aggregate)
 value = {"schema_version": 1, "kind": "lehome_public_n15_stage_deadline_v1", "run_id": run_id, "stage": stage, "lifecycle_plan_sha256": digest, "started_unix_seconds": started, "deadline_unix_seconds": deadline}
-with open(output, "x", encoding="ascii") as stream: stream.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
-os.chmod(output, 0o444); print(deadline)
+with output.open("x", encoding="ascii") as stream:
+    stream.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+os.chmod(output, 0o444)
+print(deadline)
 PY
-)" || fail "$label deadline receipt is invalid"
+}
+run_paid_stage() {
+  local label="$1" limit_seconds="$2" stage_function="$3"
+  local aggregate_deadline now stage_deadline pid status
+  case "$stage_function" in train_stage|focused_stage|harvest_stage) ;; *) fail "unknown paid stage dispatcher" ;; esac
+  aggregate_deadline="$(initialize_deadline)" || fail "aggregate paid deadline is invalid"
+  stage_deadline="$(initialize_stage_deadline "$label" "$limit_seconds" "$aggregate_deadline")" || fail "$label deadline receipt is invalid"
   (( stage_deadline <= aggregate_deadline )) || fail "$label deadline exceeds aggregate deadline"
   now="$(date +%s)"
   (( now < stage_deadline )) || fail "$label has no remaining paid time"
@@ -462,6 +531,17 @@ upstream_output="$source_root/outputs/train/groot_four_types_merged_batch64_lr2e
 staging_root="${training_root}.evidence-staging"
 resume_name=""
 resume_log="$staging_root/logs/train.log"
+resume_scratch_root=""
+cleanup_resume_scratch() {
+  local status=$?
+  if [[ -n "$resume_scratch_root" && -d "$staging_root" && ! -L "$staging_root" ]]; then
+    python3 "$root/scripts/run_public_n15_reproduction.py" cleanup-resume-scratch \
+      --staging-root "$staging_root" --attempt-id "$resume_attempt_id" >/dev/null || true
+  fi
+  return "$status"
+}
+trap cleanup_resume_scratch EXIT
+trap 'exit 130' INT TERM
 if [[ "$resume_partial" == 1 ]]; then
   [[ "$resume_step" =~ ^[0-9]+$ ]] || { echo "explicit resume step is invalid" >&2; exit 2; }
   [[ "$resume_attempt_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$ ]] || { echo "explicit resume attempt identity is invalid" >&2; exit 2; }
@@ -485,6 +565,9 @@ if [[ "$resume_partial" == 1 ]]; then
     --attempt-id "$resume_attempt_id" \
     --output "$staging_root/evidence/resume-attempts/${resume_attempt_id}.json" >/dev/null
   printf 'resume attempt %s admitted at checkpoint %s\n' "$resume_attempt_id" "$resume_name" >"$resume_log"
+  python3 "$root/scripts/run_public_n15_reproduction.py" prepare-resume-scratch \
+    --staging-root "$staging_root" --attempt-id "$resume_attempt_id" >/dev/null
+  resume_scratch_root="$staging_root/.resume-scratch-${resume_attempt_id}"
 else
   test ! -e "$training_root" && test ! -L "$training_root"
   test ! -e "$upstream_output" && test ! -L "$upstream_output"
@@ -508,7 +591,8 @@ export UV_LINK_MODE=copy
 mkdir -m 0700 -p "$UV_CACHE_DIR" "$TMPDIR"
 if [[ "$resume_partial" == 1 ]]; then
   cmp -s "$wheel" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl"
-  comparison_root="$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-resume-compatibility.XXXXXX")"
+  comparison_root="$resume_scratch_root/compatibility"
+  mkdir -m 0700 -- "$comparison_root"
   python3 "$root/scripts/run_public_n15_reproduction.py" build-compatible-wheel \
     --upstream-wheel "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" \
     --wheel-output "$comparison_root/lerobot-0.4.3-py3-none-any.whl" \
@@ -517,7 +601,6 @@ if [[ "$resume_partial" == 1 ]]; then
   temporary_receipt="$comparison_root/lerobot-compatibility-receipt.json"
   immutable_receipt="$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json"
   cmp -s "$temporary_receipt" "$immutable_receipt"
-  rm -rf -- "$comparison_root"
 else
   install -m 0444 "$wheel" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl"
   python3 "$root/scripts/run_public_n15_reproduction.py" build-compatible-wheel \
@@ -537,7 +620,8 @@ runtime_comparison_root=""
 runtime_inspect="$staging_root/evidence/runtime-image-inspect.json"
 runtime_receipt="$staging_root/evidence/runtime-image-receipt.json"
 if [[ "$resume_partial" == 1 ]]; then
-  runtime_comparison_root="$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-resume-runtime.XXXXXX")"
+  runtime_comparison_root="$resume_scratch_root/runtime-image"
+  mkdir -m 0700 -- "$runtime_comparison_root"
   runtime_inspect="$runtime_comparison_root/runtime-image-inspect.json"
   runtime_receipt="$runtime_comparison_root/runtime-image-receipt.json"
 fi
@@ -570,7 +654,8 @@ flash_overlay_receipt="$staging_root/evidence/flash-attention-overlay-receipt.js
 flash_runtime_receipt="$staging_root/evidence/flash-attention-runtime-receipt.json"
 container_runtime_receipt="$staging_root/evidence/training-container-runtime-receipt.json"
 if [[ "$resume_partial" == 1 ]]; then
-  overlay_comparison_root="$(mktemp -d "$staging_root/.resume-overlays.XXXXXX")"
+  overlay_comparison_root="$resume_scratch_root/overlays"
+  mkdir -m 0700 -- "$overlay_comparison_root"
   peft_receipt="$overlay_comparison_root/peft-overlay-receipt.json"
   flash_overlay_receipt="$overlay_comparison_root/flash-attention-overlay-receipt.json"
   flash_runtime_receipt="$overlay_comparison_root/flash-attention-runtime-receipt.json"
@@ -710,10 +795,9 @@ if [[ "$resume_partial" == 1 ]]; then
     immutable_receipt="$staging_root/evidence/$receipt_name"
     cmp -s "$temporary_receipt" "$immutable_receipt"
   done
-  rm -rf -- "$overlay_comparison_root" "$runtime_comparison_root"
 fi
 generated_runtime_receipt="$staging_root/evidence/runtime-receipt.json"
-if [[ "$resume_partial" == 1 ]]; then generated_runtime_receipt="$staging_root/.resume-runtime-receipt.$$.json"; fi
+if [[ "$resume_partial" == 1 ]]; then generated_runtime_receipt="$resume_scratch_root/runtime-receipt.json"; fi
 "$python_bin" - "$root" "$source_root/configs/train_groot.yaml" "$generated_runtime_receipt" "$staging_root/evidence/uv.lock" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json" "$training_root/evidence/uv.lock" "$training_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-compatibility-receipt.json" <<'PY'
 import hashlib, importlib.util, json, os, sys
 from pathlib import Path
@@ -729,16 +813,14 @@ if [[ "$resume_partial" == 1 ]]; then
   temporary_receipt="$generated_runtime_receipt"
   immutable_receipt="$staging_root/evidence/runtime-receipt.json"
   cmp -s "$temporary_receipt" "$immutable_receipt"
-  rm -f -- "$temporary_receipt"
 fi
 generated_execution_manifest="$staging_root/evidence/execution-manifest.json"
-if [[ "$resume_partial" == 1 ]]; then generated_execution_manifest="$staging_root/.resume-execution-manifest.$$.json"; fi
+if [[ "$resume_partial" == 1 ]]; then generated_execution_manifest="$resume_scratch_root/execution-manifest.json"; fi
 python3 "$root/scripts/run_public_n15_reproduction.py" render-training --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --output "$generated_execution_manifest" >/dev/null
 if [[ "$resume_partial" == 1 ]]; then
   temporary_receipt="$generated_execution_manifest"
   immutable_receipt="$staging_root/evidence/execution-manifest.json"
   cmp -s "$temporary_receipt" "$immutable_receipt"
-  rm -f -- "$temporary_receipt"
 fi
 dataset_blobs="$("$python_bin" - "$root/source/lehome" "$snapshots" "$source_root/Datasets/example/four_types_merged" <<'PY'
 import sys
@@ -851,6 +933,11 @@ test -z "$(find "$upstream_output" "$eagle_home" "$staging_root" ! -user "$(id -
 find "$eagle_home" -depth -type f -delete
 find "$eagle_home" -depth -type d -empty -delete
 test ! -e "$eagle_home"
+if [[ "$resume_partial" == 1 ]]; then
+  python3 "$root/scripts/run_public_n15_reproduction.py" cleanup-resume-scratch \
+    --staging-root "$staging_root" --attempt-id "$resume_attempt_id" >/dev/null
+  resume_scratch_root=""
+fi
 mv -- "$upstream_output" "$training_root"
 mv -- "$staging_root/evidence" "$training_root/evidence"
 mv -- "$staging_root/logs" "$training_root/logs"
@@ -965,6 +1052,8 @@ if [[ ! -e "$PLAN_RECEIPT" ]]; then python3 "$BUILDER" lifecycle-plan --run-id "
 python3 "$BUILDER" verify-lifecycle-plan --run-id "$RUN_ID" --repository "$PUBLIC_REPOSITORY" --remote-pipeline-root "$REMOTE_PIPELINE_ROOT" --budget-usd "$MAX_BUDGET_USD" --estimated-cost-usd "$ESTIMATED_COST_USD" --output "$PLAN_RECEIPT" >/dev/null
 aggregate_deadline="$(initialize_deadline)" || fail "aggregate paid deadline is invalid"
 (( $(date +%s) < aggregate_deadline )) || fail "aggregate paid deadline has expired"
+train_deadline="$(initialize_stage_deadline train "$TRAIN_TIMEOUT_SECONDS" "$aggregate_deadline")" || fail "train deadline receipt is invalid"
+(( $(date +%s) < train_deadline )) || fail "train deadline has expired"
 acquire_controller_lock || fail "another N1.5 controller already owns this run"
 trap controller_cleanup EXIT
 if [[ "$RESUME_PARTIAL" == 1 && -f "$HARVEST_TERMINAL_RECEIPT" ]]; then
