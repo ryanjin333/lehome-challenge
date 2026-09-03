@@ -42,6 +42,9 @@ readonly TRAINING_HF_CACHE="${LEHOME_N15_TRAINING_HF_CACHE_ROOT:-}"
 readonly TRAINING_PYTHON="${LEHOME_N15_TRAINING_PYTHON:-/opt/lehome-challenge/.venv/bin/python}"
 readonly TRAINING_UV="${LEHOME_N15_TRAINING_UV:-}"
 readonly LEROBOT_WHEEL="${LEHOME_N15_LEROBOT_WHEEL:-}"
+readonly RESUME_PARTIAL="${LEHOME_N15_RESUME_PARTIAL:-0}"
+readonly RESUME_CHECKPOINT="${LEHOME_N15_RESUME_CHECKPOINT:-}"
+readonly RESUME_STEP="${LEHOME_N15_RESUME_STEP:-}"
 readonly ASSETS_ROOT="${LEHOME_OFFICIAL_ASSETS_ROOT:-}"
 readonly METADATA_ROOT="${LEHOME_OFFICIAL_METADATA_ROOT:-}"
 readonly REFERENCE_CHECKPOINT="${LEHOME_N15_REFERENCE_CHECKPOINT:-}"
@@ -216,7 +219,7 @@ PY
   # macOS has no external ``setsid``. This tiny controller-owned Python
   # launcher creates the session before execing an allowlisted Bash dispatcher.
   export -f remote train_stage focused_stage harvest_stage
-  export REMOTE_ROOT SSH_TARGET HF_TOKEN_FILE RUNTIME_REVISION SOURCE_ROOT SOURCE_RECEIPT SNAPSHOTS_RECEIPT TRAINING_ROOT EXACT_VM_ID PROTECTED_DISK_ID TRAINING_HF_CACHE TRAINING_PYTHON TRAINING_UV LEROBOT_WHEEL RUNTIME_IMAGE_ID ASSETS_ROOT METADATA_ROOT REFERENCE_CHECKPOINT REFERENCE_SANITIZED_CONFIG REFERENCE_COMPATIBILITY NATIVE_RUNTIME_EVIDENCE NATIVE_DEPENDENCIES FOCUSED_HF_CACHE FOCUSED_OUTPUT_ROOT PUBLIC_REPOSITORY ROLLOUT_IMAGE_RECEIPT REMOTE_PIPELINE_ROOT
+  export REMOTE_ROOT SSH_TARGET HF_TOKEN_FILE RUNTIME_REVISION SOURCE_ROOT SOURCE_RECEIPT SNAPSHOTS_RECEIPT TRAINING_ROOT EXACT_VM_ID PROTECTED_DISK_ID TRAINING_HF_CACHE TRAINING_PYTHON TRAINING_UV LEROBOT_WHEEL RUNTIME_IMAGE_ID RESUME_PARTIAL RESUME_CHECKPOINT RESUME_STEP ASSETS_ROOT METADATA_ROOT REFERENCE_CHECKPOINT REFERENCE_SANITIZED_CONFIG REFERENCE_COMPATIBILITY NATIVE_RUNTIME_EVIDENCE NATIVE_DEPENDENCIES FOCUSED_HF_CACHE FOCUSED_OUTPUT_ROOT PUBLIC_REPOSITORY ROLLOUT_IMAGE_RECEIPT REMOTE_PIPELINE_ROOT
   python3 - "$stage_function" <<'PY' &
 import os
 import sys
@@ -354,19 +357,43 @@ wait_for_remote_runtime() {
 }
 
 train_stage() {
-  remote bash -s -- "$REMOTE_ROOT" "$SOURCE_ROOT" "$SOURCE_RECEIPT" "$SNAPSHOTS_RECEIPT" "$TRAINING_ROOT" "$EXACT_VM_ID" "$PROTECTED_DISK_ID" "$TRAINING_HF_CACHE" "$TRAINING_PYTHON" "$TRAINING_UV" "$LEROBOT_WHEEL" "$RUNTIME_IMAGE_ID" <<'SH'
+  remote bash -s -- "$REMOTE_ROOT" "$SOURCE_ROOT" "$SOURCE_RECEIPT" "$SNAPSHOTS_RECEIPT" "$TRAINING_ROOT" "$EXACT_VM_ID" "$PROTECTED_DISK_ID" "$TRAINING_HF_CACHE" "$TRAINING_PYTHON" "$TRAINING_UV" "$LEROBOT_WHEEL" "$RUNTIME_IMAGE_ID" "$RESUME_PARTIAL" "$RESUME_CHECKPOINT" "$RESUME_STEP" <<'SH'
 set -euo pipefail
-root="$1"; source_root="$2"; source_receipt="$3"; snapshots="$4"; training_root="$5"; vm_id="$6"; disk_id="$7"; hf_cache="$8"; python_bin="$9"; uv_bin="${10}"; wheel="${11}"; runtime_image_id="${12}"
+root="$1"; source_root="$2"; source_receipt="$3"; snapshots="$4"; training_root="$5"; vm_id="$6"; disk_id="$7"; hf_cache="$8"; python_bin="$9"; uv_bin="${10}"; wheel="${11}"; runtime_image_id="${12}"; resume_partial="${13}"; resume_checkpoint="${14}"; resume_step="${15}"
 upstream_output="$source_root/outputs/train/groot_four_types_merged_batch64_lr2e-4"
 staging_root="${training_root}.evidence-staging"
-test ! -e "$training_root" && test ! -L "$training_root"
-test ! -e "$upstream_output" && test ! -L "$upstream_output"
-test ! -e "$staging_root" && test ! -L "$staging_root"
-mkdir -m 0700 -p "$staging_root/evidence/upstream" "$staging_root/evidence/compatibility" "$staging_root/logs"
-mkdir -p "$(dirname -- "$upstream_output")"
-install -m 0444 "$source_receipt" "$staging_root/evidence/source-receipt.json"
-install -m 0444 "$snapshots" "$staging_root/evidence/resolved-snapshots-receipt.json"
-install -m 0444 "$source_root/uv.lock" "$staging_root/evidence/uv.lock"
+resume_name=""
+resume_log="$staging_root/logs/train.log"
+if [[ "$resume_partial" == 1 ]]; then
+  [[ "$resume_step" =~ ^[0-9]+$ ]] || { echo "explicit resume step is invalid" >&2; exit 2; }
+  printf -v resume_name '%06d' "$resume_step"
+  [[ "$resume_checkpoint" == "$upstream_output/checkpoints/$resume_name" ]] || { echo "explicit resume checkpoint path is not the configured boundary" >&2; exit 2; }
+  test ! -e "$training_root" && test ! -L "$training_root"
+  test -d "$upstream_output" && test ! -L "$upstream_output"
+  test -d "$staging_root" && test ! -L "$staging_root"
+  protected_device="$(findmnt -T "$(dirname -- "$training_root")" --noheadings --output MAJ:MIN)"
+  [[ "$(findmnt -T "$staging_root" --noheadings --output MAJ:MIN)" == "$protected_device" ]]
+  [[ "$(findmnt -T "$upstream_output" --noheadings --output MAJ:MIN)" == "$protected_device" ]]
+  ! pgrep -f '/opt/lehome-challenge/.venv/bin/lerobot-train([[:space:]]|$)' >/dev/null
+  resume_log="$staging_root/logs/train-resume-${resume_name}.log"
+  test ! -e "$resume_log" && test ! -L "$resume_log"
+  mkdir -m 0700 -p "$staging_root/evidence/resume-attempts"
+  python3 "$root/scripts/run_public_n15_reproduction.py" verify-resume-checkpoint \
+    --checkout "$source_root" --source-receipt "$source_receipt" \
+    --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" \
+    --training-root "$training_root" --staging-root "$staging_root" \
+    --upstream-output "$upstream_output" --resume-step "$resume_step" \
+    --output "$staging_root/evidence/resume-attempts/step-${resume_name}.json" >/dev/null
+else
+  test ! -e "$training_root" && test ! -L "$training_root"
+  test ! -e "$upstream_output" && test ! -L "$upstream_output"
+  test ! -e "$staging_root" && test ! -L "$staging_root"
+  mkdir -m 0700 -p "$staging_root/evidence/upstream" "$staging_root/evidence/compatibility" "$staging_root/logs"
+  mkdir -p "$(dirname -- "$upstream_output")"
+  install -m 0444 "$source_receipt" "$staging_root/evidence/source-receipt.json"
+  install -m 0444 "$snapshots" "$staging_root/evidence/resolved-snapshots-receipt.json"
+  install -m 0444 "$source_root/uv.lock" "$staging_root/evidence/uv.lock"
+fi
 test -f "$wheel" && test ! -L "$wheel" && test -d "$hf_cache" && test ! -L "$hf_cache"
 test -x "$uv_bin" && test ! -L "$uv_bin"
 test -x "$python_bin"
@@ -378,11 +405,25 @@ export UV_CACHE_DIR="$(dirname -- "$python_bin")/.uv-cache"
 export TMPDIR="$(dirname -- "$python_bin")/.uv-tmp"
 export UV_LINK_MODE=copy
 mkdir -m 0700 -p "$UV_CACHE_DIR" "$TMPDIR"
-install -m 0444 "$wheel" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl"
-python3 "$root/scripts/run_public_n15_reproduction.py" build-compatible-wheel \
-  --upstream-wheel "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" \
-  --wheel-output "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" \
-  --receipt-output "$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json" >/dev/null
+if [[ "$resume_partial" == 1 ]]; then
+  cmp -s "$wheel" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl"
+  comparison_root="$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-resume-compatibility.XXXXXX")"
+  python3 "$root/scripts/run_public_n15_reproduction.py" build-compatible-wheel \
+    --upstream-wheel "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" \
+    --wheel-output "$comparison_root/lerobot-0.4.3-py3-none-any.whl" \
+    --receipt-output "$comparison_root/lerobot-compatibility-receipt.json" >/dev/null
+  cmp -s "$comparison_root/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl"
+  temporary_receipt="$comparison_root/lerobot-compatibility-receipt.json"
+  immutable_receipt="$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json"
+  cmp -s "$temporary_receipt" "$immutable_receipt"
+  rm -rf -- "$comparison_root"
+else
+  install -m 0444 "$wheel" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl"
+  python3 "$root/scripts/run_public_n15_reproduction.py" build-compatible-wheel \
+    --upstream-wheel "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" \
+    --wheel-output "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" \
+    --receipt-output "$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json" >/dev/null
+fi
 python3 "$root/scripts/run_public_n15_reproduction.py" verify-compatible-wheel \
   --upstream-wheel "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" \
   --wheel "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" \
@@ -391,8 +432,16 @@ python3 "$root/scripts/run_public_n15_reproduction.py" verify-compatible-wheel \
   "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" >/dev/null
 test -x "$(dirname -- "$python_bin")/lerobot-train"
 "$python_bin" -I -c 'import lerobot; from pathlib import Path; assert Path(lerobot.__file__).is_file()'
-sudo -n docker image inspect -- "$runtime_image_id" >"$staging_root/evidence/runtime-image-inspect.json"
-"$python_bin" - "$staging_root/evidence/runtime-image-inspect.json" "$staging_root/evidence/runtime-image-receipt.json" "$runtime_image_id" <<'PY'
+runtime_comparison_root=""
+runtime_inspect="$staging_root/evidence/runtime-image-inspect.json"
+runtime_receipt="$staging_root/evidence/runtime-image-receipt.json"
+if [[ "$resume_partial" == 1 ]]; then
+  runtime_comparison_root="$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-resume-runtime.XXXXXX")"
+  runtime_inspect="$runtime_comparison_root/runtime-image-inspect.json"
+  runtime_receipt="$runtime_comparison_root/runtime-image-receipt.json"
+fi
+sudo -n docker image inspect -- "$runtime_image_id" >"$runtime_inspect"
+"$python_bin" - "$runtime_inspect" "$runtime_receipt" "$runtime_image_id" <<'PY'
 import json, os, sys
 from pathlib import Path
 
@@ -409,6 +458,23 @@ with os.fdopen(fd, "w", encoding="ascii") as stream:
     os.fsync(stream.fileno())
 source.unlink()
 PY
+if [[ "$resume_partial" == 1 ]]; then
+  temporary_receipt="$runtime_receipt"
+  immutable_receipt="$staging_root/evidence/runtime-image-receipt.json"
+  cmp -s "$temporary_receipt" "$immutable_receipt"
+fi
+overlay_comparison_root=""
+peft_receipt="$staging_root/evidence/peft-overlay-receipt.json"
+flash_overlay_receipt="$staging_root/evidence/flash-attention-overlay-receipt.json"
+flash_runtime_receipt="$staging_root/evidence/flash-attention-runtime-receipt.json"
+container_runtime_receipt="$staging_root/evidence/training-container-runtime-receipt.json"
+if [[ "$resume_partial" == 1 ]]; then
+  overlay_comparison_root="$(mktemp -d "$staging_root/.resume-overlays.XXXXXX")"
+  peft_receipt="$overlay_comparison_root/peft-overlay-receipt.json"
+  flash_overlay_receipt="$overlay_comparison_root/flash-attention-overlay-receipt.json"
+  flash_runtime_receipt="$overlay_comparison_root/flash-attention-runtime-receipt.json"
+  container_runtime_receipt="$overlay_comparison_root/training-container-runtime-receipt.json"
+fi
 sudo -n docker run --rm -i --pull never --gpus all --network none \
   --tmpfs "/flash:rw,exec,size=2g,mode=700,uid=$(id -u),gid=$(id -g)" \
   --mount "type=bind,src=$root,dst=$root,readonly" \
@@ -416,7 +482,7 @@ sudo -n docker run --rm -i --pull never --gpus all --network none \
   --mount "type=bind,src=$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl,dst=/runtime/lerobot-0.4.3-py3-none-any.whl,readonly" \
   --mount "type=bind,src=/mnt/lehome/reference-native/dependencies,dst=/deps,readonly" \
   --mount "type=bind,src=/mnt/lehome/reference-native/dependencies,dst=/mnt/lehome/reference-native/dependencies,readonly" \
-  --entrypoint bash "$runtime_image_id" -s -- "$root" "$staging_root/evidence/peft-overlay-receipt.json" "$staging_root/evidence/flash-attention-overlay-receipt.json" "$staging_root/evidence/flash-attention-runtime-receipt.json" "$staging_root/evidence/training-container-runtime-receipt.json" "$runtime_image_id" <<'CONTAINER'
+  --entrypoint bash "$runtime_image_id" -s -- "$root" "$peft_receipt" "$flash_overlay_receipt" "$flash_runtime_receipt" "$container_runtime_receipt" "$runtime_image_id" <<'CONTAINER'
 set -euo pipefail
 python_bin=/opt/lehome-challenge/.venv/bin/python
 pythonpath=/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl
@@ -537,7 +603,17 @@ with os.fdopen(fd, "w", encoding="ascii") as stream:
     os.fsync(stream.fileno())
 PY
 CONTAINER
-"$python_bin" - "$root" "$source_root/configs/train_groot.yaml" "$staging_root/evidence/runtime-receipt.json" "$staging_root/evidence/uv.lock" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json" "$training_root/evidence/uv.lock" "$training_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-compatibility-receipt.json" <<'PY'
+if [[ "$resume_partial" == 1 ]]; then
+  for receipt_name in peft-overlay-receipt.json flash-attention-overlay-receipt.json flash-attention-runtime-receipt.json training-container-runtime-receipt.json; do
+    temporary_receipt="$overlay_comparison_root/$receipt_name"
+    immutable_receipt="$staging_root/evidence/$receipt_name"
+    cmp -s "$temporary_receipt" "$immutable_receipt"
+  done
+  rm -rf -- "$overlay_comparison_root" "$runtime_comparison_root"
+fi
+generated_runtime_receipt="$staging_root/evidence/runtime-receipt.json"
+if [[ "$resume_partial" == 1 ]]; then generated_runtime_receipt="$staging_root/.resume-runtime-receipt.$$.json"; fi
+"$python_bin" - "$root" "$source_root/configs/train_groot.yaml" "$generated_runtime_receipt" "$staging_root/evidence/uv.lock" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json" "$training_root/evidence/uv.lock" "$training_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-compatibility-receipt.json" <<'PY'
 import hashlib, importlib.util, json, os, sys
 from pathlib import Path
 root, config, output, staged_lock, staged_upstream, staged_wheel, staged_compatibility, final_lock, final_upstream, final_wheel, final_compatibility = map(Path, sys.argv[1:])
@@ -548,7 +624,21 @@ value = {"schema_version": 1, "kind": "lehome_public_n15_training_runtime_v1", "
 with output.open("x", encoding="ascii") as stream: stream.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
 os.chmod(output, 0o444)
 PY
-python3 "$root/scripts/run_public_n15_reproduction.py" render-training --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --output "$staging_root/evidence/execution-manifest.json" >/dev/null
+if [[ "$resume_partial" == 1 ]]; then
+  temporary_receipt="$generated_runtime_receipt"
+  immutable_receipt="$staging_root/evidence/runtime-receipt.json"
+  cmp -s "$temporary_receipt" "$immutable_receipt"
+  rm -f -- "$temporary_receipt"
+fi
+generated_execution_manifest="$staging_root/evidence/execution-manifest.json"
+if [[ "$resume_partial" == 1 ]]; then generated_execution_manifest="$staging_root/.resume-execution-manifest.$$.json"; fi
+python3 "$root/scripts/run_public_n15_reproduction.py" render-training --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --output "$generated_execution_manifest" >/dev/null
+if [[ "$resume_partial" == 1 ]]; then
+  temporary_receipt="$generated_execution_manifest"
+  immutable_receipt="$staging_root/evidence/execution-manifest.json"
+  cmp -s "$temporary_receipt" "$immutable_receipt"
+  rm -f -- "$temporary_receipt"
+fi
 dataset_blobs="$("$python_bin" - "$root/source/lehome" "$snapshots" "$source_root/Datasets/example/four_types_merged" <<'PY'
 import sys
 from pathlib import Path
@@ -567,6 +657,12 @@ eagle_repository="$hf_cache/models--lerobot--eagle2hg-processor-groot-n1p5"
 eagle_snapshot="$eagle_repository/snapshots/baf604d8a5caf26fda5cc545f141bc1814156237"
 test -d "$eagle_snapshot" && test ! -L "$eagle_snapshot"
 eagle_home="$staging_root/eagle-home"
+if [[ "$resume_partial" == 1 && -e "$eagle_home" ]]; then
+  test -d "$eagle_home" && test ! -L "$eagle_home"
+  sudo -n chown -R --no-dereference "$(id -u):$(id -g)" "$eagle_home"
+  find "$eagle_home" -depth -type f -delete
+  find "$eagle_home" -depth -type d -empty -delete
+fi
 test ! -e "$eagle_home" && test ! -L "$eagle_home"
 eagle_cache="$eagle_home/lerobot/lerobot/eagle2hg-processor-groot-n1p5"
 mkdir -m 0700 -p "$eagle_cache"
@@ -595,9 +691,9 @@ sudo -n docker run --rm -i --pull never --gpus all --network none \
   --mount "type=bind,src=$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl,dst=/runtime/lerobot-0.4.3-py3-none-any.whl,readonly" \
   --mount "type=bind,src=/mnt/lehome/reference-native/dependencies,dst=/deps,readonly" \
   --mount "type=bind,src=/mnt/lehome/reference-native/dependencies,dst=/mnt/lehome/reference-native/dependencies,readonly" \
-  --entrypoint bash "$runtime_image_id" -s -- "$source_root" "$eagle_home" "$hf_cache" "$staging_root" <<'CONTAINER' 2>&1 | tee "$staging_root/logs/train.log"
+  --entrypoint bash "$runtime_image_id" -s -- "$source_root" "$eagle_home" "$hf_cache" "$staging_root" "$resume_partial" "$resume_checkpoint" <<'CONTAINER' 2>&1 | tee "$resume_log"
 set -euo pipefail
-source_root="$1"; eagle_home="$2"; hf_cache="$3"; staging_root="$4"
+source_root="$1"; eagle_home="$2"; hf_cache="$3"; staging_root="$4"; resume_partial="$5"; resume_checkpoint="$6"
 python_bin=/opt/lehome-challenge/.venv/bin/python
 mkdir -m 0700 /flash/site-packages
 dm_tree_wheel="/mnt/lehome/reference-native/dependencies/dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
@@ -640,7 +736,11 @@ if tree.map_structure(lambda left, right: left + right, {"joint": 1}, {"joint": 
 if groot_n1.tree is not tree:
     raise SystemExit("LeRobot GR00T did not import the verified dm-tree module")
 PY
-PYTHONPATH="/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl" /opt/lehome-challenge/.venv/bin/lerobot-train --config_path=configs/train_groot.yaml --wandb.mode=offline
+if [[ "$resume_partial" == 1 ]]; then
+  PYTHONPATH="/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl" /opt/lehome-challenge/.venv/bin/lerobot-train --config_path="$resume_checkpoint/pretrained_model/train_config.json" --resume=true --wandb.mode=offline
+else
+  PYTHONPATH="/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl" /opt/lehome-challenge/.venv/bin/lerobot-train --config_path=configs/train_groot.yaml --wandb.mode=offline
+fi
 CONTAINER
 test -d "$upstream_output" && test ! -L "$upstream_output"
 test -d "$eagle_home" && test ! -L "$eagle_home"
@@ -722,6 +822,12 @@ SH
 }
 
 [[ $# -eq 0 ]] || fail "this wrapper accepts no positional arguments"
+[[ "$RESUME_PARTIAL" == 0 || "$RESUME_PARTIAL" == 1 ]] || fail "resume-partial mode must be explicitly 0 or 1"
+if [[ "$RESUME_PARTIAL" == 1 ]]; then
+  [[ "$RESUME_STEP" =~ ^[0-9]+$ && "$RESUME_CHECKPOINT" == "$SOURCE_ROOT/outputs/train/groot_four_types_merged_batch64_lr2e-4/checkpoints/$(printf '%06d' "$RESUME_STEP")" ]] || fail "resume requires the exact configured checkpoint path and step"
+else
+  [[ -z "$RESUME_CHECKPOINT" && -z "$RESUME_STEP" ]] || fail "resume checkpoint inputs require explicit resume-partial mode"
+fi
 command -v nebius >/dev/null 2>&1 || fail "Nebius CLI is unavailable"
 command -v ssh >/dev/null 2>&1 || fail "SSH is unavailable"
 require_abs_dir "$PIPELINE_ROOT" "pipeline receipt root"; require_abs_file "$BUILDER" "checked-in lifecycle planner"
@@ -732,6 +838,9 @@ require_abs_file "$PROVIDER_VERIFIER" "checked-in exact Nebius provider parser";
 # Immutable pre-start cost admission: run_public_n15_reproduction.py lifecycle-plan.
 if [[ ! -e "$PLAN_RECEIPT" ]]; then python3 "$BUILDER" lifecycle-plan --run-id "$RUN_ID" --repository "$PUBLIC_REPOSITORY" --remote-pipeline-root "$REMOTE_PIPELINE_ROOT" --budget-usd "$MAX_BUDGET_USD" --estimated-cost-usd "$ESTIMATED_COST_USD" --output "$PLAN_RECEIPT" >/dev/null; fi
 python3 "$BUILDER" verify-lifecycle-plan --run-id "$RUN_ID" --repository "$PUBLIC_REPOSITORY" --remote-pipeline-root "$REMOTE_PIPELINE_ROOT" --budget-usd "$MAX_BUDGET_USD" --estimated-cost-usd "$ESTIMATED_COST_USD" --output "$PLAN_RECEIPT" >/dev/null
+if [[ "$RESUME_PARTIAL" == 1 && -f "$HARVEST_TERMINAL_RECEIPT" ]]; then
+  fail "explicit partial resume is forbidden for a completed canonical pipeline"
+fi
 # A complete immutable terminal chain is terminal even if a prior controller
 # crashed after it.  Observe current provider state before *any* start: never
 # rerun a paid stage from a completed run, and clean up a stale RUNNING VM.
@@ -748,6 +857,9 @@ if [[ -f "$HARVEST_TERMINAL_RECEIPT" ]]; then
   rm -rf -- "$terminal_temp_root"
   fail "existing terminal receipt chain is invalid"
 fi
+# A provider STOPPED observation is also the fail-closed proof that no trainer
+# or prior controller can already be live when this controller admits resume.
+# provider must be STOPPED before explicit partial resume.
 response="$PIPELINE_ROOT/.provider-start.$$.json"; capture_exact_provider_state STOPPED "$response" || fail "Nebius Compute API is unavailable or exact VM is not stopped"; rm -f -- "$response"
 nebius compute instance start --id "$EXACT_VM_ID" --format json --no-browser --no-progress --no-check-update --retries 1 --timeout 60s >/dev/null
 running_observed=0
@@ -759,6 +871,9 @@ done
 rm -f -- "$response"
 wait_for_ssh_readiness || fail "exact VM did not become SSH-ready"
 wait_for_remote_runtime || fail "runtime/cloud-init/workspace/GPU/upstream gate failed"
+if [[ "$RESUME_PARTIAL" == 1 ]] && { remote_file_exists "$TRAINING_IDENTITY_RECEIPT" || remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; }; then
+  fail "explicit partial resume is forbidden after canonical training receipts exist"
+fi
 if ! remote_file_exists "$TRAINING_IDENTITY_RECEIPT"; then run_paid_stage train "$TRAIN_TIMEOUT_SECONDS" train_stage; fi
 verify_remote_training_chain || fail "training receipt chain failed"
 if ! remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; then publish_training_readback || fail "training publication/readback failed"; fi

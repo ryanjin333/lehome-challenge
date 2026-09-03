@@ -79,9 +79,9 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'PROTECTED_DISK_ID="computedisk-u00pbe55crxy7jr56x"' in text
     assert 'EXACT_IMAGE_ID="computeimage-u00zf6w3yf72gakhcy"' in text
     assert 'RUNTIME_IMAGE_ID="sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"' in text
-    assert '"$LEROBOT_WHEEL" "$RUNTIME_IMAGE_ID" <<\'SH\'' in text
+    assert '"$LEROBOT_WHEEL" "$RUNTIME_IMAGE_ID" "$RESUME_PARTIAL" "$RESUME_CHECKPOINT" "$RESUME_STEP" <<\'SH\'' in text
     assert 'runtime_image_id="${12}"' in text
-    assert " LEROBOT_WHEEL RUNTIME_IMAGE_ID ASSETS_ROOT" in text
+    assert " LEROBOT_WHEEL RUNTIME_IMAGE_ID RESUME_PARTIAL RESUME_CHECKPOINT RESUME_STEP ASSETS_ROOT" in text
     assert "LEHOME_N15_EXPECTED_IMAGE_ID" not in text
     assert "nebius compute instance start --id" in text
     assert "nebius compute instance stop --id" in text
@@ -198,6 +198,43 @@ def test_remote_wrapper_never_runs_downstream_after_a_failed_gate() -> None:
     assert "run_paid_stage harvest" in text
     assert "paid-deadline.json" in text
     assert text.index("verify_remote_focused_chain || fail") < text.rindex("run_paid_stage harvest")
+
+
+def test_remote_wrapper_resume_is_explicit_exact_and_preserves_immutable_evidence() -> None:
+    text = WRAPPER.read_text(encoding="utf-8")
+    assert 'readonly RESUME_PARTIAL="${LEHOME_N15_RESUME_PARTIAL:-0}"' in text
+    assert 'readonly RESUME_CHECKPOINT="${LEHOME_N15_RESUME_CHECKPOINT:-}"' in text
+    assert 'readonly RESUME_STEP="${LEHOME_N15_RESUME_STEP:-}"' in text
+    assert '[[ "$RESUME_PARTIAL" == 0 || "$RESUME_PARTIAL" == 1 ]]' in text
+    assert '[[ "$resume_checkpoint" == "$upstream_output/checkpoints/$resume_name" ]]' in text
+    assert "verify-resume-checkpoint" in text
+    assert '--resume-step "$resume_step"' in text
+    assert '--config_path="$resume_checkpoint/pretrained_model/train_config.json"' in text
+    assert "--resume=true" in text
+    assert (
+        'PYTHONPATH="/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl" '
+        '/opt/lehome-challenge/.venv/bin/lerobot-train'
+    ) in text
+    assert 'logs/train-resume-${resume_name}.log' in text
+    assert 'evidence/resume-attempts/step-${resume_name}.json' in text
+    assert 'cmp -s "$temporary_receipt" "$immutable_receipt"' in text
+    assert 'mv -- "$temporary_receipt" "$immutable_receipt"' not in text
+    assert "provider must be STOPPED before explicit partial resume" in text
+    assert "pgrep -f" in text
+    assert 'findmnt -T "$staging_root" --noheadings --output MAJ:MIN' in text
+    assert 'findmnt -T "$upstream_output" --noheadings --output MAJ:MIN' in text
+    terminal_guard = '[[ "$RESUME_PARTIAL" == 1 && -f "$HARVEST_TERMINAL_RECEIPT" ]]'
+    assert terminal_guard in text
+    assert text.index(terminal_guard) < text.index('if [[ -f "$HARVEST_TERMINAL_RECEIPT" ]]')
+
+
+def test_remote_wrapper_fresh_mode_does_not_discover_or_resume_a_checkpoint() -> None:
+    text = WRAPPER.read_text(encoding="utf-8")
+    assert 'if [[ "$resume_partial" == 1 ]]; then' in text
+    fresh_branch = text[text.index('if [[ "$resume_partial" == 1 ]]; then'):]
+    assert 'else\n  test ! -e "$training_root"' in fresh_branch
+    assert "find \"$upstream_output/checkpoints\"" not in text
+    assert "readlink \"$upstream_output/checkpoints/last\"" not in text
 
 
 def test_runtime_gate_creates_the_fresh_run_directory_only_after_proving_the_workspace_mount() -> None:

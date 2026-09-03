@@ -38,6 +38,13 @@ _REQUIRED_PRETRAINED = {
     "policy_preprocessor_step_2_groot_pack_inputs_v3.safetensors",
     "policy_postprocessor_step_0_groot_action_unpack_unnormalize_v1.safetensors",
 }
+_REQUIRED_TRAINING_STATE = {
+    "optimizer_param_groups.json",
+    "optimizer_state.safetensors",
+    "rng_state.safetensors",
+    "scheduler_state.json",
+    "training_step.json",
+}
 _PEFT_OVERLAY_RECEIPT = {
     "schema_version": 1,
     "kind": "lehome_native_reference_peft_overlay_v1",
@@ -267,7 +274,12 @@ def validate_training_identity_receipt(
         receipt = json.loads(raw)
     except (UnicodeError, json.JSONDecodeError):
         raise TrainingIdentityError("candidate training identity receipt is invalid") from None
-    if not isinstance(receipt, dict) or set(receipt) != _RECEIPT_KEYS or raw != _canonical(receipt):
+    receipt_keys = set(receipt) if isinstance(receipt, dict) else set()
+    if (
+        not isinstance(receipt, dict)
+        or receipt_keys not in (_RECEIPT_KEYS, _RECEIPT_KEYS | {"resume_lineage"})
+        or raw != _canonical(receipt)
+    ):
         raise TrainingIdentityError("candidate training identity receipt schema is invalid")
     if (
         type(receipt.get("schema_version")) is not int
@@ -334,6 +346,115 @@ def validate_training_identity_receipt(
     for relative, digest in checksums.items():
         if _sha256_file(artifacts[relative]) != digest:
             raise TrainingIdentityError(f"training artifact checksum mismatch: {relative}")
+
+    resume_lineage = receipt.get("resume_lineage")
+    resume_logs = {
+        int(match.group(1)): path
+        for relative, path in artifacts.items()
+        if (match := re.fullmatch(r"logs/train-resume-([0-9]{6})\.log", relative))
+    }
+    if resume_lineage is None:
+        if resume_logs or any(relative.startswith("evidence/resume-attempts/") for relative in artifacts):
+            raise TrainingIdentityError("candidate resume lineage is missing")
+        validated_lineage: list[dict[str, object]] = []
+    else:
+        if not isinstance(resume_lineage, list) or not resume_lineage:
+            raise TrainingIdentityError("candidate resume lineage is invalid")
+        validated_lineage = []
+        seen_steps: set[int] = set()
+        for item in resume_lineage:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"requested_step", "receipt", "receipt_sha256"}
+                or type(item.get("requested_step")) is not int
+            ):
+                raise TrainingIdentityError("candidate resume lineage is invalid")
+            step = item["requested_step"]
+            expected_relative = f"evidence/resume-attempts/step-{step:06d}.json"
+            if (
+                step <= 0 or step >= 12000 or step % 1500 != 0 or step in seen_steps
+                or item.get("receipt") != expected_relative
+                or _SHA256.fullmatch(str(item.get("receipt_sha256"))) is None
+                or checksums.get(expected_relative) != item.get("receipt_sha256")
+                or step not in resume_logs
+            ):
+                raise TrainingIdentityError("candidate resume lineage identity is invalid")
+            seen_steps.add(step)
+            lineage_receipt = _json(
+                training_root / expected_relative, "candidate resume lineage receipt"
+            )
+            expected_lineage_keys = {
+                "schema_version", "kind", "requested_step", "checkpoint",
+                "checkpoint_files", "evidence_files", "original_upstream_output_dir",
+                "config_path", "pythonpath", "resume_argv",
+            }
+            upstream = lineage_receipt.get("original_upstream_output_dir")
+            config_path = lineage_receipt.get("config_path")
+            checkpoint_relative = f"checkpoints/{step:06d}"
+            if (
+                set(lineage_receipt) != expected_lineage_keys
+                or lineage_receipt.get("schema_version") != 1
+                or lineage_receipt.get("kind") != "lehome_public_n15_resume_lineage_v1"
+                or lineage_receipt.get("requested_step") != step
+                or lineage_receipt.get("checkpoint") != checkpoint_relative
+                or not isinstance(upstream, str) or not Path(upstream).is_absolute()
+                or config_path != f"{upstream}/{checkpoint_relative}/pretrained_model/train_config.json"
+                or lineage_receipt.get("pythonpath") != _TRAINING_CONTAINER_PYTHONPATH
+                or lineage_receipt.get("resume_argv") != [
+                    "/opt/lehome-challenge/.venv/bin/lerobot-train",
+                    f"--config_path={config_path}",
+                    "--resume=true",
+                    "--wandb.mode=offline",
+                ]
+            ):
+                raise TrainingIdentityError("candidate resume lineage receipt is invalid")
+            checkpoint_hashes = lineage_receipt.get("checkpoint_files")
+            evidence_hashes = lineage_receipt.get("evidence_files")
+            if not isinstance(checkpoint_hashes, dict) or not checkpoint_hashes:
+                raise TrainingIdentityError("candidate resume checkpoint hashes are invalid")
+            if not isinstance(evidence_hashes, dict) or not evidence_hashes:
+                raise TrainingIdentityError("candidate resume evidence hashes are invalid")
+            expected_resume_checkpoint_hashes = {
+                relative.removeprefix(checkpoint_relative + "/"): digest
+                for relative, digest in checksums.items()
+                if relative.startswith(checkpoint_relative + "/")
+            }
+            if checkpoint_hashes != expected_resume_checkpoint_hashes:
+                raise TrainingIdentityError("candidate resume checkpoint hashes mismatch")
+            for relative, digest in checkpoint_hashes.items():
+                artifact = checksums.get(f"{checkpoint_relative}/{relative}")
+                if artifact != digest or _SHA256.fullmatch(str(digest)) is None:
+                    raise TrainingIdentityError("candidate resume checkpoint hashes mismatch")
+            if not _REQUIRED_PRETRAINED.issubset(
+                relative.removeprefix("pretrained_model/")
+                for relative in checkpoint_hashes
+                if relative.startswith("pretrained_model/")
+            ):
+                raise TrainingIdentityError("candidate resume checkpoint hashes are incomplete")
+            if not _REQUIRED_TRAINING_STATE.issubset(
+                relative.removeprefix("training_state/")
+                for relative in checkpoint_hashes
+                if relative.startswith("training_state/")
+            ):
+                raise TrainingIdentityError("candidate resume checkpoint hashes are incomplete")
+            required_resume_evidence = {
+                "source-receipt.json",
+                "resolved-snapshots-receipt.json",
+                "uv.lock",
+                "execution-manifest.json",
+                "runtime-image-receipt.json",
+                "upstream/lerobot-0.4.3-py3-none-any.whl",
+                "compatibility/lerobot-0.4.3-py3-none-any.whl",
+                "compatibility/lerobot-compatibility-receipt.json",
+            }
+            if not required_resume_evidence.issubset(evidence_hashes):
+                raise TrainingIdentityError("candidate resume evidence hashes are incomplete")
+            for relative, digest in evidence_hashes.items():
+                if checksums.get(f"evidence/{relative}") != digest:
+                    raise TrainingIdentityError("candidate resume evidence hashes mismatch")
+            validated_lineage.append(dict(item))
+        if set(resume_logs) != seen_steps:
+            raise TrainingIdentityError("candidate resume log set mismatch")
 
     checkpoint_files = receipt.get("checkpoint_files")
     expected_checkpoint_files = {
@@ -688,8 +809,16 @@ def validate_training_identity_receipt(
     ):
         raise TrainingIdentityError("training Python interpreter version mismatch")
     log = _regular(training_root / "logs/train.log", "training log")
+    completion_log = (
+        _regular(
+            training_root / f"logs/train-resume-{validated_lineage[-1]['requested_step']:06d}.log",
+            "resume attempt log",
+        )
+        if validated_lineage
+        else log
+    )
     try:
-        log_text = log.read_text(encoding="utf-8")
+        log_text = completion_log.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         raise TrainingIdentityError("training log is unreadable") from None
     if (
@@ -699,7 +828,7 @@ def validate_training_identity_receipt(
     ):
         raise TrainingIdentityError("training log lacks step-12000 completion evidence")
     checkpoint_files_sha256 = hashlib.sha256(_canonical(checkpoint_files)).hexdigest()
-    return {
+    result = {
         "schema_version": 1,
         "kind": receipt["kind"],
         "training_root": str(training_root),
@@ -713,3 +842,6 @@ def validate_training_identity_receipt(
         "resolved_snapshots_receipt_sha256": receipt["resolved_snapshots_receipt_sha256"],
         "identity_receipt_sha256": hashlib.sha256(raw).hexdigest(),
     }
+    if validated_lineage:
+        result["resume_lineage"] = validated_lineage
+    return result

@@ -23,6 +23,7 @@ from lehome.n15_reproduction import (  # noqa: E402
     build_compatible_lerobot_wheel,
     compatibility_wheel_identity,
     render_training,
+    verify_resume_checkpoint,
     verify_inputs,
     verify_training_output,
     write_receipt,
@@ -51,6 +52,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_inputs(output)
     output.add_argument("--training-root", type=Path, required=True)
+    resume = commands.add_parser(
+        "verify-resume-checkpoint",
+        help="authenticate one explicit partial native LeRobot checkpoint",
+    )
+    _add_inputs(resume)
+    resume.add_argument("--training-root", type=Path, required=True)
+    resume.add_argument("--staging-root", type=Path, required=True)
+    resume.add_argument("--upstream-output", type=Path, required=True)
+    resume.add_argument("--resume-step", type=int, required=True)
     compatibility = commands.add_parser(
         "build-compatible-wheel",
         help="build the sealed two-field LeRobot 0.4.3 compatibility wheel",
@@ -227,6 +237,21 @@ def main(
                     output=args.output,
                     value=value,
                     label="verified training output receipt",
+                )
+                result = {**value, **stored}
+            elif args.command == "verify-resume-checkpoint":
+                value = verify_resume_checkpoint(
+                    verified=verified,
+                    training_root=args.training_root,
+                    staging_root=args.staging_root,
+                    upstream_output=args.upstream_output,
+                    requested_step=args.resume_step,
+                    contract=contract,
+                )
+                stored = write_receipt(
+                    output=args.output,
+                    value=value,
+                    label="public N1.5 resume lineage receipt",
                 )
                 result = {**value, **stored}
             else:  # pragma: no cover - argparse constrains this branch.

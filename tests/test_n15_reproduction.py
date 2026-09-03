@@ -267,7 +267,7 @@ def _materialize_source(tmp_path: Path) -> tuple[Path, Path]:
 
     checkout = tmp_path / "source"
     checkout.mkdir()
-    (checkout / ".gitignore").write_text("Datasets*\n", encoding="utf-8")
+    (checkout / ".gitignore").write_text("Datasets*\noutputs/\n", encoding="utf-8")
     wheel_sha256 = _sha(_fixture_wheel_bytes())
     (checkout / "uv.lock").write_text(
         f'hash = "sha256:{wheel_sha256}"\n',
@@ -1030,6 +1030,333 @@ def _write_training_checksums(root: Path) -> None:
             relative = path.relative_to(root).as_posix()
             lines.append(f"{_sha(path.read_bytes())}  {relative}\n")
     (root / "checksums.sha256").write_text("".join(lines), encoding="ascii")
+
+
+def _materialize_partial_training(
+    tmp_path: Path,
+    *,
+    verified,
+    contract,
+    step: int = 1500,
+) -> tuple[Path, Path, Path]:
+    """Turn the complete fixture into the two real pre-finalization roots."""
+    training_root = _materialize_training_output(
+        tmp_path, verified=verified, contract=contract
+    )
+    upstream_output = (
+        verified.checkout / "outputs/train/groot_four_types_merged_batch64_lr2e-4"
+    )
+    staging_root = Path(f"{training_root}.evidence-staging")
+    upstream_output.mkdir(parents=True)
+    staging_root.mkdir()
+    (training_root / "checkpoints").rename(upstream_output / "checkpoints")
+    (training_root / "evidence").rename(staging_root / "evidence")
+    (training_root / "logs").rename(staging_root / "logs")
+    (training_root / "runtime").rename(staging_root / "runtime")
+    (training_root / "checksums.sha256").unlink()
+    training_root.rmdir()
+    checkpoint = upstream_output / f"checkpoints/{step:06d}"
+    (upstream_output / "checkpoints/012000").rename(checkpoint)
+    last = upstream_output / "checkpoints/last"
+    last.unlink()
+    last.symlink_to(f"{step:06d}", target_is_directory=True)
+    state = checkpoint / "training_state/training_step.json"
+    state.write_bytes(_canonical({"step": step}))
+    config = checkpoint / "pretrained_model/train_config.json"
+    config.write_bytes(
+        _canonical({**dict(contract.training), "output_dir": str(upstream_output)})
+    )
+    return training_root, staging_root, upstream_output
+
+
+def test_verify_resume_checkpoint_accepts_complete_001500_and_renders_exact_command(
+    tmp_path: Path,
+) -> None:
+    from lehome import n15_reproduction as reproduction
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout,
+        source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id,
+        disk_id=contract.disk_id,
+        contract=contract,
+    )
+    training_root, staging_root, upstream_output = _materialize_partial_training(
+        tmp_path, verified=verified, contract=contract
+    )
+
+    receipt = reproduction.verify_resume_checkpoint(
+        verified=verified,
+        training_root=training_root,
+        staging_root=staging_root,
+        upstream_output=upstream_output,
+        requested_step=1500,
+        contract=contract,
+    )
+
+    config = upstream_output / "checkpoints/001500/pretrained_model/train_config.json"
+    assert receipt["requested_step"] == 1500
+    assert receipt["resume_argv"] == [
+        "/opt/lehome-challenge/.venv/bin/lerobot-train",
+        f"--config_path={config}",
+        "--resume=true",
+        "--wandb.mode=offline",
+    ]
+    assert receipt["pythonpath"] == (
+        "/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl"
+    )
+    assert receipt["checkpoint_files"]
+    assert receipt["evidence_files"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing_last", "last-checkpoint"),
+        ("wrong_last", "last-checkpoint"),
+        ("symlink_file", "unsafe"),
+        ("symlink_extra", "unsafe"),
+        ("missing_file", "incomplete"),
+        ("empty_file", "empty"),
+        ("empty_extra", "empty"),
+        ("wrong_step", "training-step"),
+        ("modified_recipe", "recipe"),
+        ("wrong_output", "output"),
+        ("completed_identity", "canonical training"),
+        ("completed_publication", "canonical training"),
+        ("source_evidence", "source receipt"),
+        ("runtime_image", "runtime image"),
+        ("compatibility", "compatibility wheel"),
+    ],
+)
+def test_verify_resume_checkpoint_fails_closed(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    from lehome import n15_reproduction as reproduction
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout,
+        source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id,
+        disk_id=contract.disk_id,
+        contract=contract,
+    )
+    training_root, staging_root, upstream_output = _materialize_partial_training(
+        tmp_path, verified=verified, contract=contract
+    )
+    checkpoint = upstream_output / "checkpoints/001500"
+    if mutation == "missing_last":
+        (upstream_output / "checkpoints/last").unlink()
+    elif mutation == "wrong_last":
+        (upstream_output / "checkpoints/last").unlink()
+        (upstream_output / "checkpoints/last").symlink_to("003000")
+    elif mutation in {"symlink_file", "symlink_extra"}:
+        target = checkpoint / "pretrained_model/model.safetensors"
+        payload = target.read_bytes(); target.unlink()
+        outside = tmp_path / "outside"; outside.write_bytes(payload)
+        if mutation == "symlink_file":
+            target.symlink_to(outside)
+        else:
+            target.write_bytes(payload)
+            (checkpoint / "extra.bin").symlink_to(outside)
+    elif mutation == "missing_file":
+        (checkpoint / "training_state/rng_state.safetensors").unlink()
+    elif mutation == "empty_file":
+        (checkpoint / "training_state/scheduler_state.json").write_bytes(b"")
+    elif mutation == "empty_extra":
+        (checkpoint / "extra.bin").write_bytes(b"")
+    elif mutation == "wrong_step":
+        (checkpoint / "training_state/training_step.json").write_bytes(
+            _canonical({"step": 1499})
+        )
+    elif mutation in {"modified_recipe", "wrong_output"}:
+        path = checkpoint / "pretrained_model/train_config.json"
+        value = json.loads(path.read_text())
+        value["batch_size" if mutation == "modified_recipe" else "output_dir"] = (
+            32 if mutation == "modified_recipe" else "/wrong/output"
+        )
+        path.write_bytes(_canonical(value))
+    elif mutation == "completed_identity":
+        training_root.mkdir(); (training_root / "training-identity.json").write_bytes(b"{}\n")
+    elif mutation == "completed_publication":
+        training_root.mkdir(); (training_root / "training-publication.json").write_bytes(b"{}\n")
+    elif mutation == "source_evidence":
+        (staging_root / "evidence/source-receipt.json").write_bytes(b"{}\n")
+    elif mutation == "runtime_image":
+        path = staging_root / "evidence/runtime-image-receipt.json"
+        value = json.loads(path.read_text()); value["image_id"] = "sha256:" + "0" * 64
+        path.write_bytes(_canonical(value))
+    else:
+        path = staging_root / "evidence/compatibility/lerobot-0.4.3-py3-none-any.whl"
+        path.chmod(0o644)
+        path.write_bytes(b"tampered")
+
+    with pytest.raises(reproduction.ReproductionError, match=message):
+        reproduction.verify_resume_checkpoint(
+            verified=verified,
+            training_root=training_root,
+            staging_root=staging_root,
+            upstream_output=upstream_output,
+            requested_step=1500,
+            contract=contract,
+        )
+
+
+@pytest.mark.parametrize("step", [0, 1499, 12000, 13500])
+def test_verify_resume_checkpoint_rejects_non_boundary_steps(
+    tmp_path: Path, step: int
+) -> None:
+    from lehome import n15_reproduction as reproduction
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout, source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id, disk_id=contract.disk_id, contract=contract,
+    )
+    training_root, staging_root, upstream_output = _materialize_partial_training(
+        tmp_path, verified=verified, contract=contract
+    )
+    with pytest.raises(reproduction.ReproductionError, match="resume step"):
+        reproduction.verify_resume_checkpoint(
+            verified=verified, training_root=training_root, staging_root=staging_root,
+            upstream_output=upstream_output, requested_step=step, contract=contract,
+        )
+
+
+def _complete_resumed_training(
+    *, training_root: Path, staging_root: Path, upstream_output: Path, receipt: dict[str, object]
+) -> Path:
+    lineage = staging_root / "evidence/resume-attempts/step-001500.json"
+    lineage.parent.mkdir()
+    lineage.write_bytes(_canonical(receipt))
+    checkpoint_1500 = upstream_output / "checkpoints/001500"
+    shutil.copytree(checkpoint_1500, upstream_output / "checkpoints/012000")
+    last = upstream_output / "checkpoints/last"; last.unlink(); last.symlink_to("012000")
+    (upstream_output / "checkpoints/012000/training_state/training_step.json").write_bytes(
+        _canonical({"step": 12000})
+    )
+    (staging_root / "logs/train.log").write_text(
+        "Checkpoint policy after step 1500\n", encoding="utf-8"
+    )
+    (staging_root / "logs/train-resume-001500.log").write_text(
+        "Checkpoint policy after step 12000\nEnd of training\n", encoding="utf-8"
+    )
+    upstream_output.rename(training_root)
+    (staging_root / "evidence").rename(training_root / "evidence")
+    (staging_root / "logs").rename(training_root / "logs")
+    (staging_root / "runtime").rename(training_root / "runtime")
+    staging_root.rmdir()
+    _write_training_checksums(training_root)
+    return lineage
+
+
+def test_resumed_final_identity_authenticates_resume_lineage(tmp_path: Path) -> None:
+    from lehome import n15_reproduction as reproduction
+    from rollout_appliance.native_reference_site.training_identity import (
+        validate_training_identity_receipt,
+    )
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout, source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id, disk_id=contract.disk_id, contract=contract,
+    )
+    training_root, staging_root, upstream_output = _materialize_partial_training(
+        tmp_path, verified=verified, contract=contract
+    )
+    lineage = reproduction.verify_resume_checkpoint(
+        verified=verified, training_root=training_root, staging_root=staging_root,
+        upstream_output=upstream_output, requested_step=1500, contract=contract,
+    )
+    _complete_resumed_training(
+        training_root=training_root, staging_root=staging_root,
+        upstream_output=upstream_output, receipt=lineage,
+    )
+
+    identity = reproduction.verify_training_output(
+        verified=verified, training_root=training_root, contract=contract
+    )
+    assert identity["resume_lineage"] == [
+        {
+            "requested_step": 1500,
+            "receipt": "evidence/resume-attempts/step-001500.json",
+            "receipt_sha256": _sha(
+                (training_root / "evidence/resume-attempts/step-001500.json").read_bytes()
+            ),
+        }
+    ]
+    identity_path = training_root / "training-identity.json"
+    identity_path.write_bytes(_canonical(identity))
+    admitted = validate_training_identity_receipt(
+        identity_path, expected_contract=contract,
+        expected_pretrained_root=training_root / "checkpoints/012000/pretrained_model",
+    )
+    assert admitted["resume_lineage"] == identity["resume_lineage"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing_receipt", "wrong_receipt", "missing_log", "missing_checkpoint_hash", "missing_evidence_hash"],
+)
+def test_resumed_final_verification_rejects_missing_or_wrong_resume_evidence(
+    tmp_path: Path, mutation: str
+) -> None:
+    from lehome import n15_reproduction as reproduction
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout, source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id, disk_id=contract.disk_id, contract=contract,
+    )
+    training_root, staging_root, upstream_output = _materialize_partial_training(
+        tmp_path, verified=verified, contract=contract
+    )
+    lineage = reproduction.verify_resume_checkpoint(
+        verified=verified, training_root=training_root, staging_root=staging_root,
+        upstream_output=upstream_output, requested_step=1500, contract=contract,
+    )
+    _complete_resumed_training(
+        training_root=training_root, staging_root=staging_root,
+        upstream_output=upstream_output, receipt=lineage,
+    )
+    if mutation == "missing_receipt":
+        (training_root / "evidence/resume-attempts/step-001500.json").unlink()
+    elif mutation == "wrong_receipt":
+        path = training_root / "evidence/resume-attempts/step-001500.json"
+        value = json.loads(path.read_text()); value["requested_step"] = 3000
+        path.write_bytes(_canonical(value))
+    elif mutation == "missing_log":
+        (training_root / "logs/train-resume-001500.log").unlink()
+    else:
+        path = training_root / "evidence/resume-attempts/step-001500.json"
+        value = json.loads(path.read_text())
+        mapping = value[
+            "checkpoint_files" if mutation == "missing_checkpoint_hash" else "evidence_files"
+        ]
+        mapping.pop(next(iter(mapping)))
+        path.write_bytes(_canonical(value))
+    _write_training_checksums(training_root)
+    with pytest.raises(reproduction.ReproductionError, match="resume"):
+        reproduction.verify_training_output(
+            verified=verified, training_root=training_root, contract=contract
+        )
 
 
 def test_verify_training_output_requires_step_12000_receipts_logs_and_checksums(

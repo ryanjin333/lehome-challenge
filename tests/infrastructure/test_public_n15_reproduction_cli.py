@@ -27,6 +27,7 @@ _fixture_contract = _FIXTURES._fixture_contract
 _materialize_snapshots = _FIXTURES._materialize_snapshots
 _materialize_source = _FIXTURES._materialize_source
 _materialize_training_output = _FIXTURES._materialize_training_output
+_materialize_partial_training = _FIXTURES._materialize_partial_training
 _CLI_SPEC = importlib.util.spec_from_file_location("_public_n15_cli", SCRIPT)
 assert _CLI_SPEC is not None and _CLI_SPEC.loader is not None
 _CLI = importlib.util.module_from_spec(_CLI_SPEC)
@@ -138,6 +139,40 @@ def test_cli_fails_closed_without_overwriting_an_existing_output(
     assert result == 2
     assert output.read_text(encoding="utf-8") == "sentinel\n"
     assert "already exists" in capsys.readouterr().err
+
+
+def test_cli_writes_an_immutable_explicit_resume_lineage_receipt(tmp_path: Path) -> None:
+    from lehome.n15_reproduction import verify_inputs
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    verified = verify_inputs(
+        checkout=checkout, source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id, disk_id=contract.disk_id, contract=contract,
+    )
+    training_root, staging_root, upstream_output = _materialize_partial_training(
+        tmp_path, verified=verified, contract=contract
+    )
+    output = staging_root / "evidence/resume-attempts/step-001500.json"
+    output.parent.mkdir()
+
+    arguments = [
+        "verify-resume-checkpoint",
+        *_common(checkout, source_receipt, snapshots_receipt, contract),
+        "--training-root", str(training_root),
+        "--staging-root", str(staging_root),
+        "--upstream-output", str(upstream_output),
+        "--resume-step", "1500",
+        "--output", str(output),
+    ]
+    assert _cli_main(arguments, contract=contract) == 0
+    receipt = json.loads(output.read_text(encoding="ascii"))
+    assert receipt["kind"] == "lehome_public_n15_resume_lineage_v1"
+    assert receipt["requested_step"] == 1500
+    assert output.stat().st_mode & 0o777 == 0o444
+    assert _cli_main(arguments, contract=contract) == 2
 
 
 def test_compatibility_wheel_cli_requires_the_pinned_upstream_wheel() -> None:

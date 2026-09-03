@@ -1148,6 +1148,360 @@ def _checksum_entries(path: Path) -> dict[str, str]:
     return entries
 
 
+_REQUIRED_CHECKPOINT_PRETRAINED = {
+    "config.json",
+    "model.safetensors",
+    "train_config.json",
+    "policy_preprocessor.json",
+    "policy_postprocessor.json",
+    "policy_preprocessor_step_2_groot_pack_inputs_v3.safetensors",
+    "policy_postprocessor_step_0_groot_action_unpack_unnormalize_v1.safetensors",
+}
+_REQUIRED_CHECKPOINT_STATE = {
+    "optimizer_param_groups.json",
+    "optimizer_state.safetensors",
+    "rng_state.safetensors",
+    "scheduler_state.json",
+    "training_step.json",
+}
+
+
+def _required_nonempty_checkpoint_files(checkpoint_root: Path) -> dict[str, Path]:
+    required = {
+        **{
+            f"pretrained_model/{name}": checkpoint_root / "pretrained_model" / name
+            for name in _REQUIRED_CHECKPOINT_PRETRAINED
+        },
+        **{
+            f"training_state/{name}": checkpoint_root / "training_state" / name
+            for name in _REQUIRED_CHECKPOINT_STATE
+        },
+    }
+    missing = [relative for relative, path in required.items() if not path.exists()]
+    if missing:
+        raise ReproductionError("resume checkpoint structure is incomplete")
+    for relative, path in required.items():
+        try:
+            metadata = path.lstat()
+        except OSError:
+            raise ReproductionError("resume checkpoint structure is incomplete") from None
+        if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+            raise ReproductionError(f"resume checkpoint file is unsafe: {relative}")
+        if metadata.st_size == 0:
+            raise ReproductionError(f"resume checkpoint file is empty: {relative}")
+    files: dict[str, Path] = {}
+    for path in sorted(checkpoint_root.rglob("*")):
+        relative = path.relative_to(checkpoint_root).as_posix()
+        metadata = path.lstat()
+        if path.is_symlink():
+            raise ReproductionError(f"resume checkpoint file is unsafe: {relative}")
+        if stat.S_ISDIR(metadata.st_mode):
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReproductionError(f"resume checkpoint file is unsafe: {relative}")
+        if metadata.st_size == 0:
+            raise ReproductionError(f"resume checkpoint file is empty: {relative}")
+        files[relative] = path.resolve(strict=True)
+    return files
+
+
+def _unique_nested_config_value(value: object, key: str) -> object:
+    found: list[object] = []
+
+    def visit(candidate: object) -> None:
+        if isinstance(candidate, dict):
+            for nested_key, nested_value in candidate.items():
+                if nested_key == key:
+                    found.append(nested_value)
+                visit(nested_value)
+        elif isinstance(candidate, list):
+            for nested_value in candidate:
+                visit(nested_value)
+
+    visit(value)
+    if len(found) != 1:
+        raise ReproductionError(f"saved training recipe field is missing or ambiguous: {key}")
+    return found[0]
+
+
+def verify_resume_checkpoint(
+    *,
+    verified: VerifiedInputs,
+    training_root: Path | str,
+    staging_root: Path | str,
+    upstream_output: Path | str,
+    requested_step: int,
+    contract: ReproductionContract = CONTRACT,
+) -> dict[str, object]:
+    """Authenticate one explicitly requested native LeRobot resume boundary."""
+
+    training = Path(training_root)
+    if not training.is_absolute() or ".." in training.parts:
+        raise ReproductionError("canonical training root is invalid")
+    if training.exists() or training.is_symlink():
+        raise ReproductionError("canonical training root or completed canonical training receipts exist")
+    staging = _regular_directory(Path(staging_root), "training evidence staging root")
+    upstream = _regular_directory(Path(upstream_output), "upstream training output")
+    if staging != Path(f"{training}.evidence-staging").resolve():
+        raise ReproductionError("training evidence staging root is not canonical")
+    expected_upstream = (
+        verified.checkout / "outputs/train/groot_four_types_merged_batch64_lr2e-4"
+    )
+    if upstream != expected_upstream.resolve():
+        raise ReproductionError("upstream training output root is not canonical")
+    if any(
+        candidate.exists() or candidate.is_symlink()
+        for candidate in (
+            staging / "training-identity.json",
+            staging / "training-publication.json",
+            upstream / "training-identity.json",
+            upstream / "training-publication.json",
+        )
+    ):
+        raise ReproductionError("completed canonical training receipts exist")
+    save_freq = contract.training.get("save_freq")
+    total_steps = contract.training.get("steps")
+    if (
+        type(requested_step) is not int
+        or type(save_freq) is not int
+        or type(total_steps) is not int
+        or requested_step <= 0
+        or requested_step >= total_steps
+        or requested_step % save_freq != 0
+    ):
+        raise ReproductionError("requested resume step is not an admitted checkpoint boundary")
+    step_name = f"{requested_step:06d}"
+    last = upstream / "checkpoints/last"
+    if not last.is_symlink() or os.readlink(last) != step_name:
+        raise ReproductionError("resume last-checkpoint link is missing or invalid")
+    checkpoint = _regular_directory(
+        upstream / "checkpoints" / step_name, "requested resume checkpoint"
+    )
+    checkpoint_files = _required_nonempty_checkpoint_files(checkpoint)
+    step_path = checkpoint / "training_state/training_step.json"
+    try:
+        step_raw = step_path.read_bytes()
+        step_receipt = json.loads(step_raw)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ReproductionError("resume training-step evidence is invalid") from None
+    if step_raw != _canonical_bytes(step_receipt) or step_receipt != {"step": requested_step}:
+        raise ReproductionError("resume training-step evidence does not bind the requested step")
+    config_path = checkpoint / "pretrained_model/train_config.json"
+    try:
+        config_raw = config_path.read_bytes()
+        train_config = json.loads(config_raw)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ReproductionError("saved training recipe is invalid") from None
+    if not isinstance(train_config, dict):
+        raise ReproductionError("saved training recipe is invalid")
+    for key, expected in contract.training.items():
+        if _unique_nested_config_value(train_config, key) != expected:
+            raise ReproductionError(f"saved training recipe differs from the pinned recipe: {key}")
+    saved_output = _unique_nested_config_value(train_config, "output_dir")
+    if not isinstance(saved_output, str):
+        raise ReproductionError("saved training output path is invalid")
+    saved_output_path = Path(saved_output)
+    if ".." in saved_output_path.parts:
+        raise ReproductionError("saved training output path is invalid")
+    if not saved_output_path.is_absolute():
+        saved_output_path = verified.checkout / saved_output_path
+    if saved_output_path.resolve() != upstream:
+        raise ReproductionError("saved training output path differs from the original upstream output")
+
+    evidence_root = _regular_directory(staging / "evidence", "staged training evidence")
+    required_evidence = {
+        "source-receipt.json": verified.source_receipt,
+        "resolved-snapshots-receipt.json": verified.resolved_snapshots_receipt,
+        "uv.lock": verified.checkout / "uv.lock",
+    }
+    evidence_files: dict[str, Path] = {}
+    for relative, expected in required_evidence.items():
+        actual = _regular_file(evidence_root / relative, f"training {relative}")
+        if actual.read_bytes() != expected.read_bytes():
+            label = "source receipt" if relative == "source-receipt.json" else relative
+            raise ReproductionError(f"training {label} mismatch")
+        evidence_files[relative] = actual
+    execution_path = _regular_file(
+        evidence_root / "execution-manifest.json", "training execution manifest"
+    )
+    _, _, execution = _load_receipt(execution_path, "training execution manifest")
+    if execution != build_training_manifest(verified=verified, contract=contract):
+        raise ReproductionError("training execution manifest mismatch")
+    evidence_files["execution-manifest.json"] = execution_path
+    image_path = _regular_file(
+        evidence_root / "runtime-image-receipt.json", "training runtime image receipt"
+    )
+    _, _, image = _load_receipt(image_path, "training runtime image receipt")
+    if image != {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_training_runtime_image_v1",
+        "image_id": _TRAINING_CONTAINER_IMAGE_ID,
+    }:
+        raise ReproductionError("training runtime image identity mismatch")
+    evidence_files["runtime-image-receipt.json"] = image_path
+    upstream_wheel = _regular_file(
+        evidence_root / "upstream/lerobot-0.4.3-py3-none-any.whl",
+        "upstream training LeRobot wheel",
+    )
+    if _sha256_file(upstream_wheel) != contract.lerobot_wheel_sha256:
+        raise ReproductionError("upstream training LeRobot wheel digest mismatch")
+    compatible_wheel = _regular_file(
+        evidence_root / "compatibility/lerobot-0.4.3-py3-none-any.whl",
+        "compatible training LeRobot wheel",
+    )
+    compatibility_receipt = _regular_file(
+        evidence_root / "compatibility/lerobot-compatibility-receipt.json",
+        "compatible training LeRobot wheel receipt",
+    )
+    compatibility_wheel_identity(
+        wheel=compatible_wheel,
+        receipt=compatibility_receipt,
+        upstream_wheel=upstream_wheel,
+        expected_upstream_sha256=contract.lerobot_wheel_sha256,
+    )
+    evidence_files.update(
+        {
+            "upstream/lerobot-0.4.3-py3-none-any.whl": upstream_wheel,
+            "compatibility/lerobot-0.4.3-py3-none-any.whl": compatible_wheel,
+            "compatibility/lerobot-compatibility-receipt.json": compatibility_receipt,
+        }
+    )
+    resume_argv = [
+        _TRAINING_CONTAINER_PYTHON.removesuffix("/python") + "/lerobot-train",
+        f"--config_path={config_path}",
+        "--resume=true",
+        "--wandb.mode=offline",
+    ]
+    return {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_resume_lineage_v1",
+        "requested_step": requested_step,
+        "checkpoint": f"checkpoints/{step_name}",
+        "checkpoint_files": {
+            relative: _sha256_file(path)
+            for relative, path in sorted(checkpoint_files.items())
+        },
+        "evidence_files": {
+            relative: _sha256_file(path)
+            for relative, path in sorted(evidence_files.items())
+        },
+        "original_upstream_output_dir": str(upstream),
+        "config_path": str(config_path),
+        "pythonpath": _TRAINING_CONTAINER_PYTHONPATH,
+        "resume_argv": resume_argv,
+    }
+
+
+def _verified_resume_lineage(
+    root: Path, artifacts: Mapping[str, Path], contract: ReproductionContract
+) -> list[dict[str, object]]:
+    receipt_pattern = re.compile(r"evidence/resume-attempts/step-([0-9]{6})\.json")
+    log_pattern = re.compile(r"logs/train-resume-([0-9]{6})\.log")
+    receipts = {
+        int(match.group(1)): (relative, path)
+        for relative, path in artifacts.items()
+        if (match := receipt_pattern.fullmatch(relative)) is not None
+    }
+    logs = {
+        int(match.group(1)): path
+        for relative, path in artifacts.items()
+        if (match := log_pattern.fullmatch(relative)) is not None
+    }
+    if set(receipts) != set(logs):
+        raise ReproductionError("resume receipt and distinct resume log set mismatch")
+    lineage: list[dict[str, object]] = []
+    for requested_step in sorted(receipts):
+        relative, receipt_path = receipts[requested_step]
+        _, _, receipt = _load_receipt(receipt_path, "resume lineage receipt")
+        expected_keys = {
+            "schema_version", "kind", "requested_step", "checkpoint",
+            "checkpoint_files", "evidence_files", "original_upstream_output_dir",
+            "config_path", "pythonpath", "resume_argv",
+        }
+        save_freq = contract.training.get("save_freq")
+        total_steps = contract.training.get("steps")
+        if (
+            set(receipt) != expected_keys
+            or receipt.get("schema_version") != 1
+            or receipt.get("kind") != "lehome_public_n15_resume_lineage_v1"
+            or receipt.get("requested_step") != requested_step
+            or type(save_freq) is not int
+            or type(total_steps) is not int
+            or requested_step <= 0
+            or requested_step >= total_steps
+            or requested_step % save_freq != 0
+        ):
+            raise ReproductionError("resume lineage receipt identity is invalid")
+        step_name = f"{requested_step:06d}"
+        checkpoint_relative = f"checkpoints/{step_name}"
+        upstream = receipt.get("original_upstream_output_dir")
+        config_path = receipt.get("config_path")
+        if (
+            receipt.get("checkpoint") != checkpoint_relative
+            or not isinstance(upstream, str)
+            or not Path(upstream).is_absolute()
+            or config_path != f"{upstream}/{checkpoint_relative}/pretrained_model/train_config.json"
+            or receipt.get("pythonpath") != _TRAINING_CONTAINER_PYTHONPATH
+            or receipt.get("resume_argv") != [
+                _TRAINING_CONTAINER_PYTHON.removesuffix("/python") + "/lerobot-train",
+                f"--config_path={config_path}",
+                "--resume=true",
+                "--wandb.mode=offline",
+            ]
+        ):
+            raise ReproductionError("resume lineage command or path identity is invalid")
+        checkpoint_files = receipt.get("checkpoint_files")
+        evidence_files = receipt.get("evidence_files")
+        if not isinstance(checkpoint_files, dict) or not checkpoint_files:
+            raise ReproductionError("resume checkpoint tree hash manifest is invalid")
+        if not isinstance(evidence_files, dict) or not evidence_files:
+            raise ReproductionError("resume evidence tree hash manifest is invalid")
+        required_evidence = {
+            "source-receipt.json",
+            "resolved-snapshots-receipt.json",
+            "uv.lock",
+            "execution-manifest.json",
+            "runtime-image-receipt.json",
+            "upstream/lerobot-0.4.3-py3-none-any.whl",
+            "compatibility/lerobot-0.4.3-py3-none-any.whl",
+            "compatibility/lerobot-compatibility-receipt.json",
+        }
+        if set(evidence_files) != required_evidence:
+            raise ReproductionError("resume evidence tree hash manifest is incomplete")
+        checkpoint = _regular_directory(
+            root / checkpoint_relative, "authenticated resume checkpoint"
+        )
+        required = _required_nonempty_checkpoint_files(checkpoint)
+        expected_checkpoint_hashes = {
+            item: _sha256_file(path) for item, path in sorted(required.items())
+        }
+        if checkpoint_files != expected_checkpoint_hashes:
+            raise ReproductionError("resume checkpoint tree hashes do not match")
+        for item, digest in evidence_files.items():
+            if (
+                not isinstance(item, str)
+                or PurePosixPath(item).is_absolute()
+                or any(part in {"", ".", ".."} for part in PurePosixPath(item).parts)
+                or not isinstance(digest, str)
+                or _SHA256.fullmatch(digest) is None
+            ):
+                raise ReproductionError("resume evidence tree hash manifest is invalid")
+            path = artifacts.get(f"evidence/{item}")
+            if path is None or _sha256_file(path) != digest:
+                raise ReproductionError("resume evidence tree hashes do not match")
+        log = logs[requested_step]
+        if log.stat().st_size == 0:
+            raise ReproductionError("resume attempt log is empty")
+        lineage.append(
+            {
+                "requested_step": requested_step,
+                "receipt": relative,
+                "receipt_sha256": _sha256_file(receipt_path),
+            }
+        )
+    return lineage
+
+
 def verify_training_output(
     *,
     verified: VerifiedInputs,
@@ -1452,20 +1806,29 @@ def verify_training_output(
         or package_tree_sha256 != compatibility["derived_package_tree_sha256"]
     ):
         raise ReproductionError("installed LeRobot package differs from the compatible wheel")
+    resume_lineage = _verified_resume_lineage(root, artifacts, contract)
     log = artifacts.get("logs/train.log")
     if log is None or log.stat().st_size == 0:
         raise ReproductionError("training log is missing or empty")
+    completion_log = (
+        artifacts[f"logs/train-resume-{resume_lineage[-1]['requested_step']:06d}.log"]
+        if resume_lineage
+        else log
+    )
     try:
         log_text = log.read_text(encoding="utf-8")
+        completion_log_text = completion_log.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         raise ReproductionError("training log is unreadable") from None
     if (
-        "Checkpoint policy after step 12000" not in log_text
-        or "End of training" not in log_text
+        "Checkpoint policy after step 12000" not in completion_log_text
+        or "End of training" not in completion_log_text
     ):
+        if not resume_lineage and re.search(r"Checkpoint policy after step (?:0*[1-9][0-9]{0,4})\b", log_text):
+            raise ReproductionError("resume completion evidence is missing")
         raise ReproductionError("training log lacks successful step-12000 completion evidence")
 
-    return {
+    identity = {
         "schema_version": 1,
         "kind": "lehome_public_n15_verified_training_output_v1",
         "training_root": str(root),
@@ -1480,3 +1843,6 @@ def verify_training_output(
         "source_receipt_sha256": verified.source_receipt_sha256,
         "resolved_snapshots_receipt_sha256": verified.resolved_snapshots_receipt_sha256,
     }
+    if resume_lineage:
+        identity["resume_lineage"] = resume_lineage
+    return identity
