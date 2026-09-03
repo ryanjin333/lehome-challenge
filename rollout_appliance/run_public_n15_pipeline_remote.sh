@@ -45,6 +45,7 @@ readonly LEROBOT_WHEEL="${LEHOME_N15_LEROBOT_WHEEL:-}"
 readonly RESUME_PARTIAL="${LEHOME_N15_RESUME_PARTIAL:-0}"
 readonly RESUME_CHECKPOINT="${LEHOME_N15_RESUME_CHECKPOINT:-}"
 readonly RESUME_STEP="${LEHOME_N15_RESUME_STEP:-}"
+readonly RESUME_ATTEMPT_ID="${LEHOME_N15_RESUME_ATTEMPT_ID:-}"
 readonly ASSETS_ROOT="${LEHOME_OFFICIAL_ASSETS_ROOT:-}"
 readonly METADATA_ROOT="${LEHOME_OFFICIAL_METADATA_ROOT:-}"
 readonly REFERENCE_CHECKPOINT="${LEHOME_N15_REFERENCE_CHECKPOINT:-}"
@@ -67,6 +68,9 @@ readonly HARVEST_PUBLICATION_RECEIPT="$PIPELINE_ROOT/harvest-publication.json"
 readonly HARVEST_TERMINAL_RECEIPT="$PIPELINE_ROOT/harvest-terminal.json"
 PROVIDER_STOPPED_RECEIPT="$PIPELINE_ROOT/provider-stopped.json"
 PIPELINE_COMPLETE=0
+PROVIDER_CLEANUP_REQUIRED=0
+CONTROLLER_LOCK_PID=""
+CONTROLLER_LOCK_READY=""
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
 require_abs_dir() { [[ "$1" == /* && "$1" != *".."* && -d "$1" && ! -L "$1" ]] || fail "$2 is unavailable or unsafe"; }
@@ -110,8 +114,102 @@ stop_exact_vm() {
   done
   rm -f -- "$response"; return 1
 }
-trap stop_exact_vm EXIT
 trap 'exit 130' INT TERM
+
+acquire_controller_lock() {
+  local lock_path="$PIPELINE_ROOT/controller.lock"
+  CONTROLLER_LOCK_READY="$PIPELINE_ROOT/.controller-lock-ready.$$.$RANDOM"
+  python3 - "$lock_path" "$CONTROLLER_LOCK_READY" "$RUN_ID" "$SCRIPT_DIR/run_public_n15_pipeline_remote.sh" "$$" <<'PY' &
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+
+lock_path, ready_path = map(Path, sys.argv[1:3])
+run_id, script_path, controller_pid = sys.argv[3], sys.argv[4], int(sys.argv[5])
+try:
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+except OSError:
+    raise SystemExit(73)
+acquired = False
+try:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(73)
+    acquired = True
+    value = {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_controller_lock_v1",
+        "run_id": run_id,
+        "controller_pid": controller_pid,
+        "holder_pid": os.getpid(),
+        "script_path": script_path,
+    }
+    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+    os.ftruncate(fd, 0)
+    remaining = memoryview(payload)
+    while remaining:
+        remaining = remaining[os.write(fd, remaining):]
+    os.fsync(fd)
+    ready_fd = os.open(ready_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(ready_fd)
+    def stop(_signum, _frame):
+        nonlocal_stopped[0] = True
+    nonlocal_stopped = [False]
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+    while not nonlocal_stopped[0]:
+        signal.pause()
+finally:
+    if acquired:
+        try:
+            metadata = os.stat(lock_path, follow_symlinks=False)
+            held = os.fstat(fd)
+            if (metadata.st_dev, metadata.st_ino) == (held.st_dev, held.st_ino):
+                lock_path.unlink()
+        except FileNotFoundError:
+            pass
+    try:
+        ready_path.unlink()
+    except FileNotFoundError:
+        pass
+    os.close(fd)
+PY
+  CONTROLLER_LOCK_PID=$!
+  local attempt
+  for (( attempt = 1; attempt <= 100; attempt++ )); do
+    if [[ -f "$CONTROLLER_LOCK_READY" && ! -L "$CONTROLLER_LOCK_READY" ]]; then return 0; fi
+    if ! kill -0 "$CONTROLLER_LOCK_PID" 2>/dev/null; then
+      wait "$CONTROLLER_LOCK_PID" || true
+      CONTROLLER_LOCK_PID=""
+      return 1
+    fi
+    sleep 0.02
+  done
+  kill -TERM "$CONTROLLER_LOCK_PID" 2>/dev/null || true
+  wait "$CONTROLLER_LOCK_PID" 2>/dev/null || true
+  CONTROLLER_LOCK_PID=""
+  return 1
+}
+
+release_controller_lock() {
+  if [[ -n "$CONTROLLER_LOCK_PID" ]]; then
+    kill -TERM "$CONTROLLER_LOCK_PID" 2>/dev/null || true
+    wait "$CONTROLLER_LOCK_PID" 2>/dev/null || true
+    CONTROLLER_LOCK_PID=""
+  fi
+}
+
+controller_cleanup() {
+  local status=$?
+  trap - EXIT
+  if [[ "$PROVIDER_CLEANUP_REQUIRED" == 1 ]]; then stop_exact_vm || true; fi
+  release_controller_lock
+  exit "$status"
+}
 
 remote() { ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$SSH_TARGET" "$@"; }
 probe_ssh_readiness() {
@@ -219,7 +317,7 @@ PY
   # macOS has no external ``setsid``. This tiny controller-owned Python
   # launcher creates the session before execing an allowlisted Bash dispatcher.
   export -f remote train_stage focused_stage harvest_stage
-  export REMOTE_ROOT SSH_TARGET HF_TOKEN_FILE RUNTIME_REVISION SOURCE_ROOT SOURCE_RECEIPT SNAPSHOTS_RECEIPT TRAINING_ROOT EXACT_VM_ID PROTECTED_DISK_ID TRAINING_HF_CACHE TRAINING_PYTHON TRAINING_UV LEROBOT_WHEEL RUNTIME_IMAGE_ID RESUME_PARTIAL RESUME_CHECKPOINT RESUME_STEP ASSETS_ROOT METADATA_ROOT REFERENCE_CHECKPOINT REFERENCE_SANITIZED_CONFIG REFERENCE_COMPATIBILITY NATIVE_RUNTIME_EVIDENCE NATIVE_DEPENDENCIES FOCUSED_HF_CACHE FOCUSED_OUTPUT_ROOT PUBLIC_REPOSITORY ROLLOUT_IMAGE_RECEIPT REMOTE_PIPELINE_ROOT
+  export REMOTE_ROOT SSH_TARGET HF_TOKEN_FILE RUNTIME_REVISION SOURCE_ROOT SOURCE_RECEIPT SNAPSHOTS_RECEIPT TRAINING_ROOT EXACT_VM_ID PROTECTED_DISK_ID TRAINING_HF_CACHE TRAINING_PYTHON TRAINING_UV LEROBOT_WHEEL RUNTIME_IMAGE_ID RESUME_PARTIAL RESUME_CHECKPOINT RESUME_STEP RESUME_ATTEMPT_ID ASSETS_ROOT METADATA_ROOT REFERENCE_CHECKPOINT REFERENCE_SANITIZED_CONFIG REFERENCE_COMPATIBILITY NATIVE_RUNTIME_EVIDENCE NATIVE_DEPENDENCIES FOCUSED_HF_CACHE FOCUSED_OUTPUT_ROOT PUBLIC_REPOSITORY ROLLOUT_IMAGE_RECEIPT REMOTE_PIPELINE_ROOT
   python3 - "$stage_function" <<'PY' &
 import os
 import sys
@@ -357,15 +455,16 @@ wait_for_remote_runtime() {
 }
 
 train_stage() {
-  remote bash -s -- "$REMOTE_ROOT" "$SOURCE_ROOT" "$SOURCE_RECEIPT" "$SNAPSHOTS_RECEIPT" "$TRAINING_ROOT" "$EXACT_VM_ID" "$PROTECTED_DISK_ID" "$TRAINING_HF_CACHE" "$TRAINING_PYTHON" "$TRAINING_UV" "$LEROBOT_WHEEL" "$RUNTIME_IMAGE_ID" "$RESUME_PARTIAL" "$RESUME_CHECKPOINT" "$RESUME_STEP" <<'SH'
+  remote bash -s -- "$REMOTE_ROOT" "$SOURCE_ROOT" "$SOURCE_RECEIPT" "$SNAPSHOTS_RECEIPT" "$TRAINING_ROOT" "$EXACT_VM_ID" "$PROTECTED_DISK_ID" "$TRAINING_HF_CACHE" "$TRAINING_PYTHON" "$TRAINING_UV" "$LEROBOT_WHEEL" "$RUNTIME_IMAGE_ID" "$RESUME_PARTIAL" "$RESUME_CHECKPOINT" "$RESUME_STEP" "$RESUME_ATTEMPT_ID" <<'SH'
 set -euo pipefail
-root="$1"; source_root="$2"; source_receipt="$3"; snapshots="$4"; training_root="$5"; vm_id="$6"; disk_id="$7"; hf_cache="$8"; python_bin="$9"; uv_bin="${10}"; wheel="${11}"; runtime_image_id="${12}"; resume_partial="${13}"; resume_checkpoint="${14}"; resume_step="${15}"
+root="$1"; source_root="$2"; source_receipt="$3"; snapshots="$4"; training_root="$5"; vm_id="$6"; disk_id="$7"; hf_cache="$8"; python_bin="$9"; uv_bin="${10}"; wheel="${11}"; runtime_image_id="${12}"; resume_partial="${13}"; resume_checkpoint="${14}"; resume_step="${15}"; resume_attempt_id="${16}"
 upstream_output="$source_root/outputs/train/groot_four_types_merged_batch64_lr2e-4"
 staging_root="${training_root}.evidence-staging"
 resume_name=""
 resume_log="$staging_root/logs/train.log"
 if [[ "$resume_partial" == 1 ]]; then
   [[ "$resume_step" =~ ^[0-9]+$ ]] || { echo "explicit resume step is invalid" >&2; exit 2; }
+  [[ "$resume_attempt_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$ ]] || { echo "explicit resume attempt identity is invalid" >&2; exit 2; }
   printf -v resume_name '%06d' "$resume_step"
   [[ "$resume_checkpoint" == "$upstream_output/checkpoints/$resume_name" ]] || { echo "explicit resume checkpoint path is not the configured boundary" >&2; exit 2; }
   test ! -e "$training_root" && test ! -L "$training_root"
@@ -375,7 +474,7 @@ if [[ "$resume_partial" == 1 ]]; then
   [[ "$(findmnt -T "$staging_root" --noheadings --output MAJ:MIN)" == "$protected_device" ]]
   [[ "$(findmnt -T "$upstream_output" --noheadings --output MAJ:MIN)" == "$protected_device" ]]
   ! pgrep -f '/opt/lehome-challenge/.venv/bin/lerobot-train([[:space:]]|$)' >/dev/null
-  resume_log="$staging_root/logs/train-resume-${resume_name}.log"
+  resume_log="$staging_root/logs/train-resume-${resume_attempt_id}.log"
   test ! -e "$resume_log" && test ! -L "$resume_log"
   mkdir -m 0700 -p "$staging_root/evidence/resume-attempts"
   python3 "$root/scripts/run_public_n15_reproduction.py" verify-resume-checkpoint \
@@ -383,7 +482,9 @@ if [[ "$resume_partial" == 1 ]]; then
     --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" \
     --training-root "$training_root" --staging-root "$staging_root" \
     --upstream-output "$upstream_output" --resume-step "$resume_step" \
-    --output "$staging_root/evidence/resume-attempts/step-${resume_name}.json" >/dev/null
+    --attempt-id "$resume_attempt_id" \
+    --output "$staging_root/evidence/resume-attempts/${resume_attempt_id}.json" >/dev/null
+  printf 'resume attempt %s admitted at checkpoint %s\n' "$resume_attempt_id" "$resume_name" >"$resume_log"
 else
   test ! -e "$training_root" && test ! -L "$training_root"
   test ! -e "$upstream_output" && test ! -L "$upstream_output"
@@ -691,7 +792,7 @@ sudo -n docker run --rm -i --pull never --gpus all --network none \
   --mount "type=bind,src=$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl,dst=/runtime/lerobot-0.4.3-py3-none-any.whl,readonly" \
   --mount "type=bind,src=/mnt/lehome/reference-native/dependencies,dst=/deps,readonly" \
   --mount "type=bind,src=/mnt/lehome/reference-native/dependencies,dst=/mnt/lehome/reference-native/dependencies,readonly" \
-  --entrypoint bash "$runtime_image_id" -s -- "$source_root" "$eagle_home" "$hf_cache" "$staging_root" "$resume_partial" "$resume_checkpoint" <<'CONTAINER' 2>&1 | tee "$resume_log"
+  --entrypoint bash "$runtime_image_id" -s -- "$source_root" "$eagle_home" "$hf_cache" "$staging_root" "$resume_partial" "$resume_checkpoint" <<'CONTAINER' 2>&1 | tee -a "$resume_log"
 set -euo pipefail
 source_root="$1"; eagle_home="$2"; hf_cache="$3"; staging_root="$4"; resume_partial="$5"; resume_checkpoint="$6"
 python_bin=/opt/lehome-challenge/.venv/bin/python
@@ -821,12 +922,36 @@ exec "$root/rollout_appliance/run_public_n15_harvest.sh"
 SH
 }
 
+run_pipeline_after_runtime() {
+  if ! remote_file_exists "$TRAINING_IDENTITY_RECEIPT"; then run_paid_stage train "$TRAIN_TIMEOUT_SECONDS" train_stage; fi
+  verify_remote_training_chain || fail "training receipt chain failed"
+  if ! remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; then publish_training_readback || fail "training publication/readback failed"; fi
+  verify_remote_training_publication || fail "training publication chain failed"
+  if ! remote_file_exists "$FOCUSED_PROMOTION_RECEIPT"; then run_paid_stage focused_gate "$FOCUSED_TIMEOUT_SECONDS" focused_stage; fi
+  verify_remote_focused_chain || fail "focused receipt chain failed"
+  if [[ ! -e "$HARVEST_TERMINAL_RECEIPT" ]]; then
+    run_paid_stage harvest "$HARVEST_TIMEOUT_SECONDS" harvest_stage
+    verify_remote_harvest_chain || fail "harvest pre-stop receipt chain failed"
+    fetch_remote_immutable "$HARVEST_ROOT/manifest.json" "$HARVEST_MANIFEST"
+    fetch_remote_immutable "$HARVEST_ROOT/manifest-receipt.json" "$HARVEST_MANIFEST_RECEIPT"
+    fetch_remote_immutable "$REMOTE_PIPELINE_ROOT/harvest.publication.json" "$HARVEST_PUBLICATION_RECEIPT"
+    stop_exact_vm || fail "exact VM could not be stopped"
+    finalize_host_harvest_terminal || fail "host harvest terminal verification failed"
+  else
+    python3 "$HARVEST_BUILDER" verify-terminal --manifest "$HARVEST_MANIFEST" --manifest-receipt "$HARVEST_MANIFEST_RECEIPT" --publication-receipt "$HARVEST_PUBLICATION_RECEIPT" --provider-receipt "$PROVIDER_STOPPED_RECEIPT" --output "$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-verify-terminal.XXXXXX")/receipt.json" >/dev/null || fail "existing host harvest terminal chain failed"
+  fi
+  stop_exact_vm || fail "exact VM could not be stopped"
+  PIPELINE_COMPLETE=1
+}
+
+main() {
 [[ $# -eq 0 ]] || fail "this wrapper accepts no positional arguments"
 [[ "$RESUME_PARTIAL" == 0 || "$RESUME_PARTIAL" == 1 ]] || fail "resume-partial mode must be explicitly 0 or 1"
 if [[ "$RESUME_PARTIAL" == 1 ]]; then
   [[ "$RESUME_STEP" =~ ^[0-9]+$ && "$RESUME_CHECKPOINT" == "$SOURCE_ROOT/outputs/train/groot_four_types_merged_batch64_lr2e-4/checkpoints/$(printf '%06d' "$RESUME_STEP")" ]] || fail "resume requires the exact configured checkpoint path and step"
+  [[ "$RESUME_ATTEMPT_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$ ]] || fail "resume requires a distinct attempt identity"
 else
-  [[ -z "$RESUME_CHECKPOINT" && -z "$RESUME_STEP" ]] || fail "resume checkpoint inputs require explicit resume-partial mode"
+  [[ -z "$RESUME_CHECKPOINT" && -z "$RESUME_STEP" && -z "$RESUME_ATTEMPT_ID" ]] || fail "resume checkpoint inputs require explicit resume-partial mode"
 fi
 command -v nebius >/dev/null 2>&1 || fail "Nebius CLI is unavailable"
 command -v ssh >/dev/null 2>&1 || fail "SSH is unavailable"
@@ -838,6 +963,10 @@ require_abs_file "$PROVIDER_VERIFIER" "checked-in exact Nebius provider parser";
 # Immutable pre-start cost admission: run_public_n15_reproduction.py lifecycle-plan.
 if [[ ! -e "$PLAN_RECEIPT" ]]; then python3 "$BUILDER" lifecycle-plan --run-id "$RUN_ID" --repository "$PUBLIC_REPOSITORY" --remote-pipeline-root "$REMOTE_PIPELINE_ROOT" --budget-usd "$MAX_BUDGET_USD" --estimated-cost-usd "$ESTIMATED_COST_USD" --output "$PLAN_RECEIPT" >/dev/null; fi
 python3 "$BUILDER" verify-lifecycle-plan --run-id "$RUN_ID" --repository "$PUBLIC_REPOSITORY" --remote-pipeline-root "$REMOTE_PIPELINE_ROOT" --budget-usd "$MAX_BUDGET_USD" --estimated-cost-usd "$ESTIMATED_COST_USD" --output "$PLAN_RECEIPT" >/dev/null
+aggregate_deadline="$(initialize_deadline)" || fail "aggregate paid deadline is invalid"
+(( $(date +%s) < aggregate_deadline )) || fail "aggregate paid deadline has expired"
+acquire_controller_lock || fail "another N1.5 controller already owns this run"
+trap controller_cleanup EXIT
 if [[ "$RESUME_PARTIAL" == 1 && -f "$HARVEST_TERMINAL_RECEIPT" ]]; then
   fail "explicit partial resume is forbidden for a completed canonical pipeline"
 fi
@@ -861,6 +990,7 @@ fi
 # or prior controller can already be live when this controller admits resume.
 # provider must be STOPPED before explicit partial resume.
 response="$PIPELINE_ROOT/.provider-start.$$.json"; capture_exact_provider_state STOPPED "$response" || fail "Nebius Compute API is unavailable or exact VM is not stopped"; rm -f -- "$response"
+PROVIDER_CLEANUP_REQUIRED=1
 nebius compute instance start --id "$EXACT_VM_ID" --format json --no-browser --no-progress --no-check-update --retries 1 --timeout 60s >/dev/null
 running_observed=0
 for _ in {1..60}; do
@@ -874,21 +1004,9 @@ wait_for_remote_runtime || fail "runtime/cloud-init/workspace/GPU/upstream gate 
 if [[ "$RESUME_PARTIAL" == 1 ]] && { remote_file_exists "$TRAINING_IDENTITY_RECEIPT" || remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; }; then
   fail "explicit partial resume is forbidden after canonical training receipts exist"
 fi
-if ! remote_file_exists "$TRAINING_IDENTITY_RECEIPT"; then run_paid_stage train "$TRAIN_TIMEOUT_SECONDS" train_stage; fi
-verify_remote_training_chain || fail "training receipt chain failed"
-if ! remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; then publish_training_readback || fail "training publication/readback failed"; fi
-verify_remote_training_publication || fail "training publication chain failed"
-if ! remote_file_exists "$FOCUSED_PROMOTION_RECEIPT"; then run_paid_stage focused_gate "$FOCUSED_TIMEOUT_SECONDS" focused_stage; fi
-verify_remote_focused_chain || fail "focused receipt chain failed"
-if [[ ! -e "$HARVEST_TERMINAL_RECEIPT" ]]; then
-  run_paid_stage harvest "$HARVEST_TIMEOUT_SECONDS" harvest_stage
-  verify_remote_harvest_chain || fail "harvest pre-stop receipt chain failed"
-  fetch_remote_immutable "$HARVEST_ROOT/manifest.json" "$HARVEST_MANIFEST"
-  fetch_remote_immutable "$HARVEST_ROOT/manifest-receipt.json" "$HARVEST_MANIFEST_RECEIPT"
-  fetch_remote_immutable "$REMOTE_PIPELINE_ROOT/harvest.publication.json" "$HARVEST_PUBLICATION_RECEIPT"
-  stop_exact_vm || fail "exact VM could not be stopped"
-  finalize_host_harvest_terminal || fail "host harvest terminal verification failed"
-else
-  python3 "$HARVEST_BUILDER" verify-terminal --manifest "$HARVEST_MANIFEST" --manifest-receipt "$HARVEST_MANIFEST_RECEIPT" --publication-receipt "$HARVEST_PUBLICATION_RECEIPT" --provider-receipt "$PROVIDER_STOPPED_RECEIPT" --output "$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-verify-terminal.XXXXXX")/receipt.json" >/dev/null || fail "existing host harvest terminal chain failed"
+run_pipeline_after_runtime
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
 fi
-stop_exact_vm || fail "exact VM could not be stopped"; PIPELINE_COMPLETE=1

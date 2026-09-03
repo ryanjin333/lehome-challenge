@@ -1063,10 +1063,19 @@ def _materialize_partial_training(
     state = checkpoint / "training_state/training_step.json"
     state.write_bytes(_canonical({"step": step}))
     config = checkpoint / "pretrained_model/train_config.json"
-    config.write_bytes(
-        _canonical({**dict(contract.training), "output_dir": str(upstream_output)})
-    )
+    # Authentic LeRobot 0.4.3 TrainPipelineConfig serialization from the
+    # public 12K recipe.  Only the source YAML's lora_rank and run-specific
+    # paths/id are resolved here.
+    train_config = json.loads(_AUTHENTIC_PUBLIC_12K_TRAIN_CONFIG)
+    train_config["dataset"]["root"] = str(verified.dataset_root)
+    train_config["output_dir"] = str(upstream_output)
+    train_config["wandb"]["run_id"] = "a1b2c3d4"
+    train_config["wandb"]["mode"] = "offline"
+    config.write_bytes(_canonical(train_config))
     return training_root, staging_root, upstream_output
+
+
+_AUTHENTIC_PUBLIC_12K_TRAIN_CONFIG = r'''{"dataset":{"repo_id":"repo_groot","root":"Datasets/example/four_types_merged","episodes":null,"image_transforms":{"enable":false,"max_num_transforms":3,"random_order":false,"tfs":{"brightness":{"weight":1.0,"type":"ColorJitter","kwargs":{"brightness":[0.8,1.2]}},"contrast":{"weight":1.0,"type":"ColorJitter","kwargs":{"contrast":[0.8,1.2]}},"saturation":{"weight":1.0,"type":"ColorJitter","kwargs":{"saturation":[0.5,1.5]}},"hue":{"weight":1.0,"type":"ColorJitter","kwargs":{"hue":[-0.05,0.05]}},"sharpness":{"weight":1.0,"type":"SharpnessJitter","kwargs":{"sharpness":[0.5,1.5]}},"affine":{"weight":1.0,"type":"RandomAffine","kwargs":{"degrees":[-5.0,5.0],"translate":[0.05,0.05]}}}},"revision":null,"use_imagenet_stats":true,"video_backend":"torchcodec","streaming":false},"env":null,"policy":{"type":"groot","n_obs_steps":1,"input_features":{"observation.state":{"type":"STATE","shape":[12]},"observation.images.top_rgb":{"type":"VISUAL","shape":[3,480,640]},"observation.images.left_rgb":{"type":"VISUAL","shape":[3,480,640]},"observation.images.right_rgb":{"type":"VISUAL","shape":[3,480,640]},"observation.images.top_depth":{"type":"STATE","shape":[1,480,640]}},"output_features":{"action":{"type":"ACTION","shape":[12]}},"device":"cuda","use_amp":false,"use_peft":false,"push_to_hub":false,"repo_id":null,"private":null,"tags":null,"license":null,"pretrained_path":null,"chunk_size":50,"n_action_steps":50,"max_state_dim":64,"max_action_dim":32,"normalization_mapping":{"VISUAL":"IDENTITY","STATE":"MEAN_STD","ACTION":"MEAN_STD"},"image_size":[224,224],"base_model_path":"nvidia/GR00T-N1.5-3B","tokenizer_assets_repo":"lerobot/eagle2hg-processor-groot-n1p5","embodiment_tag":"new_embodiment","tune_llm":false,"tune_visual":false,"tune_projector":true,"tune_diffusion_model":true,"lora_rank":0,"lora_alpha":16,"lora_dropout":0.05,"lora_full_model":false,"optimizer_lr":0.0002,"optimizer_betas":[0.95,0.999],"optimizer_eps":1e-08,"optimizer_weight_decay":1e-05,"warmup_ratio":0.05,"num_decay_steps":12000,"decay_lr_ratio":0.1,"use_bf16":true,"video_backend":"decord","balance_dataset_weights":true,"balance_trajectory_weights":true,"dataset_paths":null,"output_dir":"./tmp/gr00t","save_steps":1000,"max_steps":10000,"batch_size":32,"dataloader_num_workers":8,"report_to":"wandb","resume":false},"output_dir":"outputs/train/groot_four_types_merged_batch64_lr2e-4","job_name":"groot","resume":false,"seed":1000,"num_workers":4,"batch_size":64,"steps":12000,"eval_freq":20000,"log_freq":500,"tolerance_s":0.0001,"save_checkpoint":true,"save_freq":1500,"use_policy_training_preset":true,"optimizer":{"type":"adamw","lr":0.0002,"weight_decay":1e-05,"grad_clip_norm":10.0,"betas":[0.95,0.999],"eps":1e-08},"scheduler":{"type":"cosine_decay_with_warmup","num_warmup_steps":600,"num_decay_steps":12000,"peak_lr":0.0002,"decay_lr":2e-05},"eval":{"n_episodes":50,"batch_size":50,"use_async_envs":false},"wandb":{"enable":true,"disable_artifact":true,"project":"lehome-challenge","entity":null,"notes":null,"run_id":"iqfjc8st","mode":null},"peft":null,"use_rabc":false,"rabc_progress_path":null,"rabc_kappa":0.01,"rabc_epsilon":1e-06,"rabc_head_mode":"sparse","rename_map":{},"checkpoint_path":null}'''
 
 
 def test_verify_resume_checkpoint_accepts_complete_001500_and_renders_exact_command(
@@ -1088,6 +1097,7 @@ def test_verify_resume_checkpoint_accepts_complete_001500_and_renders_exact_comm
     training_root, staging_root, upstream_output = _materialize_partial_training(
         tmp_path, verified=verified, contract=contract
     )
+    (upstream_output / "checkpoints/001500/regular-extra.bin").write_bytes(b"extra\n")
 
     receipt = reproduction.verify_resume_checkpoint(
         verified=verified,
@@ -1095,11 +1105,13 @@ def test_verify_resume_checkpoint_accepts_complete_001500_and_renders_exact_comm
         staging_root=staging_root,
         upstream_output=upstream_output,
         requested_step=1500,
+        attempt_id="attempt-a",
         contract=contract,
     )
 
     config = upstream_output / "checkpoints/001500/pretrained_model/train_config.json"
     assert receipt["requested_step"] == 1500
+    assert receipt["attempt_id"] == "attempt-a"
     assert receipt["resume_argv"] == [
         "/opt/lehome-challenge/.venv/bin/lerobot-train",
         f"--config_path={config}",
@@ -1125,6 +1137,7 @@ def test_verify_resume_checkpoint_accepts_complete_001500_and_renders_exact_comm
         ("empty_extra", "empty"),
         ("wrong_step", "training-step"),
         ("modified_recipe", "recipe"),
+        ("unknown_recipe_field", "recipe"),
         ("wrong_output", "output"),
         ("completed_identity", "canonical training"),
         ("completed_publication", "canonical training"),
@@ -1177,12 +1190,15 @@ def test_verify_resume_checkpoint_fails_closed(
         (checkpoint / "training_state/training_step.json").write_bytes(
             _canonical({"step": 1499})
         )
-    elif mutation in {"modified_recipe", "wrong_output"}:
+    elif mutation in {"modified_recipe", "unknown_recipe_field", "wrong_output"}:
         path = checkpoint / "pretrained_model/train_config.json"
         value = json.loads(path.read_text())
-        value["batch_size" if mutation == "modified_recipe" else "output_dir"] = (
-            32 if mutation == "modified_recipe" else "/wrong/output"
-        )
+        if mutation == "modified_recipe":
+            value["batch_size"] = 32
+        elif mutation == "unknown_recipe_field":
+            value["unreviewed_flag"] = True
+        else:
+            value["output_dir"] = "/wrong/output"
         path.write_bytes(_canonical(value))
     elif mutation == "completed_identity":
         training_root.mkdir(); (training_root / "training-identity.json").write_bytes(b"{}\n")
@@ -1206,6 +1222,7 @@ def test_verify_resume_checkpoint_fails_closed(
             staging_root=staging_root,
             upstream_output=upstream_output,
             requested_step=1500,
+            attempt_id="attempt-a",
             contract=contract,
         )
 
@@ -1230,15 +1247,17 @@ def test_verify_resume_checkpoint_rejects_non_boundary_steps(
     with pytest.raises(reproduction.ReproductionError, match="resume step"):
         reproduction.verify_resume_checkpoint(
             verified=verified, training_root=training_root, staging_root=staging_root,
-            upstream_output=upstream_output, requested_step=step, contract=contract,
+            upstream_output=upstream_output, requested_step=step,
+            attempt_id="attempt-a", contract=contract,
         )
 
 
 def _complete_resumed_training(
     *, training_root: Path, staging_root: Path, upstream_output: Path, receipt: dict[str, object]
 ) -> Path:
-    lineage = staging_root / "evidence/resume-attempts/step-001500.json"
-    lineage.parent.mkdir()
+    attempt_id = str(receipt["attempt_id"])
+    lineage = staging_root / f"evidence/resume-attempts/{attempt_id}.json"
+    lineage.parent.mkdir(parents=True, exist_ok=True)
     lineage.write_bytes(_canonical(receipt))
     checkpoint_1500 = upstream_output / "checkpoints/001500"
     shutil.copytree(checkpoint_1500, upstream_output / "checkpoints/012000")
@@ -1249,7 +1268,7 @@ def _complete_resumed_training(
     (staging_root / "logs/train.log").write_text(
         "Checkpoint policy after step 1500\n", encoding="utf-8"
     )
-    (staging_root / "logs/train-resume-001500.log").write_text(
+    (staging_root / f"logs/train-resume-{attempt_id}.log").write_text(
         "Checkpoint policy after step 12000\nEnd of training\n", encoding="utf-8"
     )
     upstream_output.rename(training_root)
@@ -1280,7 +1299,8 @@ def test_resumed_final_identity_authenticates_resume_lineage(tmp_path: Path) -> 
     )
     lineage = reproduction.verify_resume_checkpoint(
         verified=verified, training_root=training_root, staging_root=staging_root,
-        upstream_output=upstream_output, requested_step=1500, contract=contract,
+        upstream_output=upstream_output, requested_step=1500,
+        attempt_id="attempt-a", contract=contract,
     )
     _complete_resumed_training(
         training_root=training_root, staging_root=staging_root,
@@ -1292,10 +1312,15 @@ def test_resumed_final_identity_authenticates_resume_lineage(tmp_path: Path) -> 
     )
     assert identity["resume_lineage"] == [
         {
+            "attempt_id": "attempt-a",
             "requested_step": 1500,
-            "receipt": "evidence/resume-attempts/step-001500.json",
+            "receipt": "evidence/resume-attempts/attempt-a.json",
             "receipt_sha256": _sha(
-                (training_root / "evidence/resume-attempts/step-001500.json").read_bytes()
+                (training_root / "evidence/resume-attempts/attempt-a.json").read_bytes()
+            ),
+            "log": "logs/train-resume-attempt-a.log",
+            "log_sha256": _sha(
+                (training_root / "logs/train-resume-attempt-a.log").read_bytes()
             ),
         }
     ]
@@ -1306,6 +1331,66 @@ def test_resumed_final_identity_authenticates_resume_lineage(tmp_path: Path) -> 
         expected_pretrained_root=training_root / "checkpoints/012000/pretrained_model",
     )
     assert admitted["resume_lineage"] == identity["resume_lineage"]
+
+
+def test_same_checkpoint_boundary_supports_distinct_authenticated_attempts(
+    tmp_path: Path,
+) -> None:
+    """Preemption before a new checkpoint must not poison the 001500 boundary."""
+    from lehome import n15_reproduction as reproduction
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout, source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id, disk_id=contract.disk_id, contract=contract,
+    )
+    training_root, staging_root, upstream_output = _materialize_partial_training(
+        tmp_path, verified=verified, contract=contract
+    )
+    first = reproduction.verify_resume_checkpoint(
+        verified=verified, training_root=training_root, staging_root=staging_root,
+        upstream_output=upstream_output, requested_step=1500,
+        attempt_id="attempt-first", contract=contract,
+    )
+    attempts = staging_root / "evidence/resume-attempts"
+    attempts.mkdir(parents=True)
+    (attempts / "attempt-first.json").write_bytes(_canonical(first))
+    # A process can die after authenticating the checkpoint but before its
+    # launch log is created.  That immutable orphan remains valid lineage.
+    preempted = reproduction.verify_resume_checkpoint(
+        verified=verified, training_root=training_root, staging_root=staging_root,
+        upstream_output=upstream_output, requested_step=1500,
+        attempt_id="attempt-preempted", contract=contract,
+    )
+    (attempts / "attempt-preempted.json").write_bytes(_canonical(preempted))
+    (staging_root / "logs/train-resume-attempt-preempted.log").write_text(
+        "resume admitted at step 1500\npreempted\n", encoding="utf-8"
+    )
+
+    second = reproduction.verify_resume_checkpoint(
+        verified=verified, training_root=training_root, staging_root=staging_root,
+        upstream_output=upstream_output, requested_step=1500,
+        attempt_id="attempt-second", contract=contract,
+    )
+    _complete_resumed_training(
+        training_root=training_root, staging_root=staging_root,
+        upstream_output=upstream_output, receipt=second,
+    )
+    identity = reproduction.verify_training_output(
+        verified=verified, training_root=training_root, contract=contract
+    )
+
+    assert [item["attempt_id"] for item in identity["resume_lineage"]] == [
+        "attempt-first", "attempt-preempted", "attempt-second"
+    ]
+    assert [item["requested_step"] for item in identity["resume_lineage"]] == [
+        1500, 1500, 1500
+    ]
+    assert identity["resume_lineage"][0]["log_sha256"] is None
+    assert all(item["log_sha256"] for item in identity["resume_lineage"][1:])
 
 
 @pytest.mark.parametrize(
@@ -1330,22 +1415,23 @@ def test_resumed_final_verification_rejects_missing_or_wrong_resume_evidence(
     )
     lineage = reproduction.verify_resume_checkpoint(
         verified=verified, training_root=training_root, staging_root=staging_root,
-        upstream_output=upstream_output, requested_step=1500, contract=contract,
+        upstream_output=upstream_output, requested_step=1500,
+        attempt_id="attempt-a", contract=contract,
     )
     _complete_resumed_training(
         training_root=training_root, staging_root=staging_root,
         upstream_output=upstream_output, receipt=lineage,
     )
     if mutation == "missing_receipt":
-        (training_root / "evidence/resume-attempts/step-001500.json").unlink()
+        (training_root / "evidence/resume-attempts/attempt-a.json").unlink()
     elif mutation == "wrong_receipt":
-        path = training_root / "evidence/resume-attempts/step-001500.json"
+        path = training_root / "evidence/resume-attempts/attempt-a.json"
         value = json.loads(path.read_text()); value["requested_step"] = 3000
         path.write_bytes(_canonical(value))
     elif mutation == "missing_log":
-        (training_root / "logs/train-resume-001500.log").unlink()
+        (training_root / "logs/train-resume-attempt-a.log").unlink()
     else:
-        path = training_root / "evidence/resume-attempts/step-001500.json"
+        path = training_root / "evidence/resume-attempts/attempt-a.json"
         value = json.loads(path.read_text())
         mapping = value[
             "checkpoint_files" if mutation == "missing_checkpoint_hash" else "evidence_files"

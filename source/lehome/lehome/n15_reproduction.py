@@ -26,6 +26,7 @@ from base64 import urlsafe_b64encode
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _REVISION = re.compile(r"[0-9a-f]{40}")
+_RESUME_ATTEMPT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{2,63}")
 _TRAINING_CONTAINER_IMAGE_ID = (
     "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"
 )
@@ -35,6 +36,13 @@ _TRAINING_CONTAINER_PYTHONPATH = (
     "/deps/peft-0.18.1-py3-none-any.whl"
 )
 _TRAINING_CONTAINER_LEROBOT_ROOT = "/flash/site-packages/lerobot"
+# Complete LeRobot 0.4.3 serialization structure is based on the public
+# pretrained_model/train_config.json (source sha256 8fed45ce...6052f), then
+# resolved against the byte-pinned submission-4 YAML (lora_rank=0) and this
+# controller's required offline W&B override before path/id normalization.
+_PUBLIC_12K_NORMALIZED_TRAIN_CONFIG_SHA256 = (
+    "14db86649a124aedcfd8b88e2f2c668dfe7b628f6e3191d2a5150084a9c58fd6"
+)
 
 
 class ReproductionError(RuntimeError):
@@ -1205,23 +1213,51 @@ def _required_nonempty_checkpoint_files(checkpoint_root: Path) -> dict[str, Path
     return files
 
 
-def _unique_nested_config_value(value: object, key: str) -> object:
-    found: list[object] = []
+def _verify_exact_saved_train_config(
+    value: object, *, verified: VerifiedInputs, upstream: Path
+) -> None:
+    """Verify the complete LeRobot 0.4.3 serialization of the pinned recipe.
 
-    def visit(candidate: object) -> None:
-        if isinstance(candidate, dict):
-            for nested_key, nested_value in candidate.items():
-                if nested_key == key:
-                    found.append(nested_value)
-                visit(nested_value)
-        elif isinstance(candidate, list):
-            for nested_value in candidate:
-                visit(nested_value)
+    The digest is derived from an authentic public TrainPipelineConfig emitted
+    by the pinned LeRobot version.  Only the two resolved filesystem paths and
+    W&B's generated run id are normalized; every key, nested value, and unknown
+    field remains covered by the digest.
+    """
 
-    visit(value)
-    if len(found) != 1:
-        raise ReproductionError(f"saved training recipe field is missing or ambiguous: {key}")
-    return found[0]
+    if not isinstance(value, dict):
+        raise ReproductionError("saved training recipe is invalid")
+    try:
+        normalized = json.loads(json.dumps(value, allow_nan=False))
+        dataset_root = normalized["dataset"]["root"]
+        saved_output = normalized["output_dir"]
+        wandb_run_id = normalized["wandb"]["run_id"]
+    except (KeyError, TypeError, ValueError):
+        raise ReproductionError("saved training recipe differs from the pinned recipe") from None
+    for saved, expected, label in (
+        (dataset_root, verified.dataset_root, "dataset root"),
+        (saved_output, upstream, "output path"),
+    ):
+        if not isinstance(saved, str):
+            raise ReproductionError(f"saved training {label} is invalid")
+        saved_path = Path(saved)
+        if ".." in saved_path.parts:
+            raise ReproductionError(f"saved training {label} is invalid")
+        if not saved_path.is_absolute():
+            saved_path = verified.checkout / saved_path
+        if saved_path.resolve() != expected:
+            raise ReproductionError(
+                f"saved training {label} differs from the original upstream recipe"
+            )
+    if (
+        not isinstance(wandb_run_id, str)
+        or re.fullmatch(r"[a-z0-9]{8}", wandb_run_id) is None
+    ):
+        raise ReproductionError("saved training recipe has an invalid W&B run id")
+    normalized["dataset"]["root"] = "<DATASET_ROOT>"
+    normalized["output_dir"] = "<OUTPUT_DIR>"
+    normalized["wandb"]["run_id"] = "<WANDB_RUN_ID>"
+    if _sha256_bytes(_canonical_bytes(normalized)) != _PUBLIC_12K_NORMALIZED_TRAIN_CONFIG_SHA256:
+        raise ReproductionError("saved training recipe differs from the pinned recipe")
 
 
 def verify_resume_checkpoint(
@@ -1231,9 +1267,13 @@ def verify_resume_checkpoint(
     staging_root: Path | str,
     upstream_output: Path | str,
     requested_step: int,
+    attempt_id: str,
     contract: ReproductionContract = CONTRACT,
 ) -> dict[str, object]:
     """Authenticate one explicitly requested native LeRobot resume boundary."""
+
+    if not isinstance(attempt_id, str) or _RESUME_ATTEMPT_ID.fullmatch(attempt_id) is None:
+        raise ReproductionError("resume attempt identity is invalid")
 
     training = Path(training_root)
     if not training.is_absolute() or ".." in training.parts:
@@ -1292,21 +1332,7 @@ def verify_resume_checkpoint(
         train_config = json.loads(config_raw)
     except (OSError, UnicodeError, json.JSONDecodeError):
         raise ReproductionError("saved training recipe is invalid") from None
-    if not isinstance(train_config, dict):
-        raise ReproductionError("saved training recipe is invalid")
-    for key, expected in contract.training.items():
-        if _unique_nested_config_value(train_config, key) != expected:
-            raise ReproductionError(f"saved training recipe differs from the pinned recipe: {key}")
-    saved_output = _unique_nested_config_value(train_config, "output_dir")
-    if not isinstance(saved_output, str):
-        raise ReproductionError("saved training output path is invalid")
-    saved_output_path = Path(saved_output)
-    if ".." in saved_output_path.parts:
-        raise ReproductionError("saved training output path is invalid")
-    if not saved_output_path.is_absolute():
-        saved_output_path = verified.checkout / saved_output_path
-    if saved_output_path.resolve() != upstream:
-        raise ReproductionError("saved training output path differs from the original upstream output")
+    _verify_exact_saved_train_config(train_config, verified=verified, upstream=upstream)
 
     evidence_root = _regular_directory(staging / "evidence", "staged training evidence")
     required_evidence = {
@@ -1375,6 +1401,7 @@ def verify_resume_checkpoint(
     return {
         "schema_version": 1,
         "kind": "lehome_public_n15_resume_lineage_v1",
+        "attempt_id": attempt_id,
         "requested_step": requested_step,
         "checkpoint": f"checkpoints/{step_name}",
         "checkpoint_files": {
@@ -1395,26 +1422,37 @@ def verify_resume_checkpoint(
 def _verified_resume_lineage(
     root: Path, artifacts: Mapping[str, Path], contract: ReproductionContract
 ) -> list[dict[str, object]]:
-    receipt_pattern = re.compile(r"evidence/resume-attempts/step-([0-9]{6})\.json")
-    log_pattern = re.compile(r"logs/train-resume-([0-9]{6})\.log")
+    receipt_pattern = re.compile(r"evidence/resume-attempts/([A-Za-z0-9][A-Za-z0-9._-]{2,63})\.json")
+    log_pattern = re.compile(r"logs/train-resume-([A-Za-z0-9][A-Za-z0-9._-]{2,63})\.log")
     receipts = {
-        int(match.group(1)): (relative, path)
+        match.group(1): (relative, path)
         for relative, path in artifacts.items()
         if (match := receipt_pattern.fullmatch(relative)) is not None
     }
     logs = {
-        int(match.group(1)): path
+        match.group(1): (relative, path)
         for relative, path in artifacts.items()
         if (match := log_pattern.fullmatch(relative)) is not None
     }
-    if set(receipts) != set(logs):
+    receipt_candidates = {
+        relative for relative in artifacts
+        if relative.startswith("evidence/resume-attempts/")
+    }
+    log_candidates = {
+        relative for relative in artifacts if relative.startswith("logs/train-resume-")
+    }
+    if receipt_candidates != {relative for relative, _path in receipts.values()}:
+        raise ReproductionError("resume attempt receipt path is invalid")
+    if log_candidates != {relative for relative, _path in logs.values()}:
+        raise ReproductionError("resume attempt log path is invalid")
+    if not set(logs).issubset(receipts):
         raise ReproductionError("resume receipt and distinct resume log set mismatch")
     lineage: list[dict[str, object]] = []
-    for requested_step in sorted(receipts):
-        relative, receipt_path = receipts[requested_step]
+    for attempt_id in sorted(receipts):
+        relative, receipt_path = receipts[attempt_id]
         _, _, receipt = _load_receipt(receipt_path, "resume lineage receipt")
         expected_keys = {
-            "schema_version", "kind", "requested_step", "checkpoint",
+            "schema_version", "kind", "attempt_id", "requested_step", "checkpoint",
             "checkpoint_files", "evidence_files", "original_upstream_output_dir",
             "config_path", "pythonpath", "resume_argv",
         }
@@ -1424,10 +1462,15 @@ def _verified_resume_lineage(
             set(receipt) != expected_keys
             or receipt.get("schema_version") != 1
             or receipt.get("kind") != "lehome_public_n15_resume_lineage_v1"
-            or receipt.get("requested_step") != requested_step
+            or receipt.get("attempt_id") != attempt_id
+            or type(receipt.get("requested_step")) is not int
             or type(save_freq) is not int
             or type(total_steps) is not int
-            or requested_step <= 0
+        ):
+            raise ReproductionError("resume lineage receipt identity is invalid")
+        requested_step = receipt["requested_step"]
+        if (
+            requested_step <= 0
             or requested_step >= total_steps
             or requested_step % save_freq != 0
         ):
@@ -1489,14 +1532,17 @@ def _verified_resume_lineage(
             path = artifacts.get(f"evidence/{item}")
             if path is None or _sha256_file(path) != digest:
                 raise ReproductionError("resume evidence tree hashes do not match")
-        log = logs[requested_step]
-        if log.stat().st_size == 0:
+        log_item = logs.get(attempt_id)
+        if log_item is not None and log_item[1].stat().st_size == 0:
             raise ReproductionError("resume attempt log is empty")
         lineage.append(
             {
+                "attempt_id": attempt_id,
                 "requested_step": requested_step,
                 "receipt": relative,
                 "receipt_sha256": _sha256_file(receipt_path),
+                "log": None if log_item is None else log_item[0],
+                "log_sha256": None if log_item is None else _sha256_file(log_item[1]),
             }
         )
     return lineage
@@ -1810,16 +1856,30 @@ def verify_training_output(
     log = artifacts.get("logs/train.log")
     if log is None or log.stat().st_size == 0:
         raise ReproductionError("training log is missing or empty")
-    completion_log = (
-        artifacts[f"logs/train-resume-{resume_lineage[-1]['requested_step']:06d}.log"]
-        if resume_lineage
-        else log
-    )
     try:
         log_text = log.read_text(encoding="utf-8")
-        completion_log_text = completion_log.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         raise ReproductionError("training log is unreadable") from None
+    if resume_lineage:
+        completion_logs: list[str] = []
+        for attempt in resume_lineage:
+            relative = attempt["log"]
+            if relative is None:
+                continue
+            try:
+                attempt_text = artifacts[str(relative)].read_text(encoding="utf-8")
+            except (KeyError, OSError, UnicodeError):
+                raise ReproductionError("resume attempt log is unreadable") from None
+            if (
+                "Checkpoint policy after step 12000" in attempt_text
+                and "End of training" in attempt_text
+            ):
+                completion_logs.append(attempt_text)
+        if len(completion_logs) != 1:
+            raise ReproductionError("resume completion evidence is missing or ambiguous")
+        completion_log_text = completion_logs[0]
+    else:
+        completion_log_text = log_text
     if (
         "Checkpoint policy after step 12000" not in completion_log_text
         or "End of training" not in completion_log_text

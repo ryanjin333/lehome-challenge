@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,36 @@ def _load_cli():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _wrapper_env(tmp_path: Path, fake_bin: Path, run_id: str) -> dict[str, str]:
+    pipeline = tmp_path / "pipeline"
+    pipeline.mkdir(exist_ok=True)
+    remote_pipeline = f"/mnt/lehome/runs/{run_id}"
+    return {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "LEHOME_N15_RUN_ID": run_id,
+        "LEHOME_N15_PIPELINE_ROOT": str(pipeline),
+        "LEHOME_N15_SSH_TARGET": "operator@example",
+        "LEHOME_N15_REMOTE_ROOT": "/mnt/lehome/runtime",
+        "LEHOME_N15_REMOTE_RUNS_BASE": "/mnt/lehome/runs",
+        "LEHOME_N15_REMOTE_PIPELINE_ROOT": remote_pipeline,
+        "LEHOME_N15_PUBLIC_HF_REPOSITORY": "ryanjin333/public-n15",
+        "LEHOME_OFFICIAL_ASSETS_ROOT": "/mnt/assets",
+        "LEHOME_OFFICIAL_METADATA_ROOT": "/mnt/source",
+        "LEHOME_N15_REFERENCE_CHECKPOINT": "/mnt/reference",
+        "LEHOME_N15_REFERENCE_SANITIZED_CONFIG_ROOT": "/mnt/reference-config",
+        "LEHOME_N15_REFERENCE_COMPATIBILITY_RECEIPT": "/mnt/reference-receipt",
+        "LEHOME_N15_NATIVE_RUNTIME_EVIDENCE_ROOT": "/mnt/evidence",
+        "LEHOME_N15_NATIVE_DEPENDENCIES_ROOT": "/mnt/deps",
+        "LEHOME_N15_FOCUSED_HF_CACHE_ROOT": "/mnt/cache",
+        "LEHOME_N15_ROLLOUT_IMAGE_RECEIPT": "/mnt/image.json",
+        "LEHOME_N15_TRAINING_HF_CACHE_ROOT": "/mnt/train-cache",
+        "LEHOME_N15_TRAINING_UV": "/mnt/uv",
+        "LEHOME_N15_LEROBOT_WHEEL": "/mnt/lerobot.whl",
+        "LEHOME_N15_TRAINING_ROOT": f"{remote_pipeline}/training",
+    }
 
 
 def test_lifecycle_plan_is_immutable_and_has_exact_paid_stage_order(tmp_path: Path) -> None:
@@ -79,16 +110,16 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'PROTECTED_DISK_ID="computedisk-u00pbe55crxy7jr56x"' in text
     assert 'EXACT_IMAGE_ID="computeimage-u00zf6w3yf72gakhcy"' in text
     assert 'RUNTIME_IMAGE_ID="sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"' in text
-    assert '"$LEROBOT_WHEEL" "$RUNTIME_IMAGE_ID" "$RESUME_PARTIAL" "$RESUME_CHECKPOINT" "$RESUME_STEP" <<\'SH\'' in text
+    assert '"$LEROBOT_WHEEL" "$RUNTIME_IMAGE_ID" "$RESUME_PARTIAL" "$RESUME_CHECKPOINT" "$RESUME_STEP" "$RESUME_ATTEMPT_ID" <<\'SH\'' in text
     assert 'runtime_image_id="${12}"' in text
-    assert " LEROBOT_WHEEL RUNTIME_IMAGE_ID RESUME_PARTIAL RESUME_CHECKPOINT RESUME_STEP ASSETS_ROOT" in text
+    assert " LEROBOT_WHEEL RUNTIME_IMAGE_ID RESUME_PARTIAL RESUME_CHECKPOINT RESUME_STEP RESUME_ATTEMPT_ID ASSETS_ROOT" in text
     assert "LEHOME_N15_EXPECTED_IMAGE_ID" not in text
     assert "nebius compute instance start --id" in text
     assert "nebius compute instance stop --id" in text
     assert "compute instance create" not in text
     assert "compute disk create" not in text
     assert "compute image create" not in text
-    assert "trap stop_exact_vm EXIT" in text
+    assert "trap controller_cleanup EXIT" in text
     assert text.count("StrictHostKeyChecking=accept-new") == 2
     assert "LEHOME_N15_MAX_BUDGET_USD" in text
     assert "LEHOME_N15_ESTIMATED_COST_USD" not in text
@@ -205,21 +236,26 @@ def test_remote_wrapper_resume_is_explicit_exact_and_preserves_immutable_evidenc
     assert 'readonly RESUME_PARTIAL="${LEHOME_N15_RESUME_PARTIAL:-0}"' in text
     assert 'readonly RESUME_CHECKPOINT="${LEHOME_N15_RESUME_CHECKPOINT:-}"' in text
     assert 'readonly RESUME_STEP="${LEHOME_N15_RESUME_STEP:-}"' in text
+    assert 'readonly RESUME_ATTEMPT_ID="${LEHOME_N15_RESUME_ATTEMPT_ID:-}"' in text
     assert '[[ "$RESUME_PARTIAL" == 0 || "$RESUME_PARTIAL" == 1 ]]' in text
     assert '[[ "$resume_checkpoint" == "$upstream_output/checkpoints/$resume_name" ]]' in text
     assert "verify-resume-checkpoint" in text
     assert '--resume-step "$resume_step"' in text
+    assert '--attempt-id "$resume_attempt_id"' in text
     assert '--config_path="$resume_checkpoint/pretrained_model/train_config.json"' in text
     assert "--resume=true" in text
     assert (
         'PYTHONPATH="/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl" '
         '/opt/lehome-challenge/.venv/bin/lerobot-train'
     ) in text
-    assert 'logs/train-resume-${resume_name}.log' in text
-    assert 'evidence/resume-attempts/step-${resume_name}.json' in text
+    assert 'logs/train-resume-${resume_attempt_id}.log' in text
+    assert 'evidence/resume-attempts/${resume_attempt_id}.json' in text
     assert 'cmp -s "$temporary_receipt" "$immutable_receipt"' in text
     assert 'mv -- "$temporary_receipt" "$immutable_receipt"' not in text
     assert "provider must be STOPPED before explicit partial resume" in text
+    assert "acquire_controller_lock" in text
+    assert "release_controller_lock" in text
+    assert text.index('aggregate_deadline="$(initialize_deadline)"') < text.index("nebius compute instance start --id")
     assert "pgrep -f" in text
     assert 'findmnt -T "$staging_root" --noheadings --output MAJ:MIN' in text
     assert 'findmnt -T "$upstream_output" --noheadings --output MAJ:MIN' in text
@@ -268,7 +304,228 @@ def test_over_budget_plan_never_starts_the_mocked_exact_vm(tmp_path: Path) -> No
     env.update({"LEHOME_N15_TRAINING_HF_CACHE_ROOT": "/mnt/train-cache", "LEHOME_N15_TRAINING_UV": "/mnt/uv", "LEHOME_N15_LEROBOT_WHEEL": "/mnt/lerobot.whl", "LEHOME_N15_TRAINING_ROOT": "/mnt/lehome/runs/n15-over-budget/training"})
     result = subprocess.run(["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True)
     assert result.returncode != 0
-    assert " start " not in f" {log.read_text(encoding='utf-8')} "
+    assert not log.exists()
+
+
+@pytest.mark.parametrize("deadline_kind", ["invalid", "expired"])
+def test_invalid_immutable_deadline_fails_before_any_provider_action(
+    tmp_path: Path, deadline_kind: str,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    provider_log = tmp_path / "provider.log"
+    (fake_bin / "nebius").write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$FAKE_PROVIDER_LOG\"\nexit 97\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "ssh").write_text("#!/usr/bin/env bash\nexit 97\n", encoding="utf-8")
+    for command in (fake_bin / "nebius", fake_bin / "ssh"): command.chmod(0o755)
+    env = _wrapper_env(tmp_path, fake_bin, "n15-invalid-deadline")
+    env["FAKE_PROVIDER_LOG"] = str(provider_log)
+    module = _load_cli()
+    pipeline = Path(env["LEHOME_N15_PIPELINE_ROOT"])
+    assert module.main([
+        "lifecycle-plan", "--run-id", env["LEHOME_N15_RUN_ID"],
+        "--repository", env["LEHOME_N15_PUBLIC_HF_REPOSITORY"],
+        "--remote-pipeline-root", env["LEHOME_N15_REMOTE_PIPELINE_ROOT"],
+        "--budget-usd", "100", "--estimated-cost-usd", "72",
+        "--output", str(pipeline / "lifecycle-plan.json"),
+    ]) == 0
+    if deadline_kind == "invalid":
+        deadline = {}
+    else:
+        plan_sha = hashlib.sha256((pipeline / "lifecycle-plan.json").read_bytes()).hexdigest()
+        deadline = {
+            "schema_version": 1,
+            "kind": "lehome_public_n15_paid_deadline_v1",
+            "run_id": env["LEHOME_N15_RUN_ID"],
+            "lifecycle_plan_sha256": plan_sha,
+            "started_unix_seconds": 1,
+            "deadline_unix_seconds": 86401,
+        }
+    (pipeline / "paid-deadline.json").write_text(
+        json.dumps(deadline, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii"
+    )
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True
+    )
+
+    assert result.returncode != 0
+    assert "deadline" in result.stderr.lower()
+    assert not provider_log.exists()
+
+
+def test_atomic_controller_singleton_rejects_second_live_controller_without_stopping_vm(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    state = tmp_path / "state"; state.write_text("STOPPED", encoding="ascii")
+    trace = tmp_path / "trace"
+    provider = {
+        "metadata": {"id": "computeinstance-u00t6xfqhadrcmssa2", "name": "lehome-rollout"},
+        "status": {"state": "STATE"},
+        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}]},
+    }
+    (fake_bin / "nebius").write_text(
+        "#!/usr/bin/env python3\nimport json, os, sys\nfrom pathlib import Path\n"
+        "state=Path(os.environ['FAKE_STATE']); trace=Path(os.environ['FAKE_TRACE']); command=sys.argv[1:4]\n"
+        "if command == ['compute','instance','start']: trace.open('a').write('start\\n'); state.write_text('RUNNING')\n"
+        "elif command == ['compute','instance','stop']: trace.open('a').write('stop\\n'); state.write_text('STOPPED')\n"
+        "else:\n value=" + repr(provider) + "; value['status']['state']=state.read_text().strip(); print(json.dumps(value))\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "ssh").write_text(
+        "#!/usr/bin/env bash\nwhile :; do /bin/sleep 1; done\n", encoding="utf-8"
+    )
+    for command in (fake_bin / "nebius", fake_bin / "ssh"): command.chmod(0o755)
+    env = _wrapper_env(tmp_path, fake_bin, "n15-singleton")
+    env.update({"FAKE_STATE": str(state), "FAKE_TRACE": str(trace)})
+    first = subprocess.Popen(
+        ["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while (not trace.exists() or "start" not in trace.read_text()) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert trace.exists() and trace.read_text().splitlines() == ["start"]
+        lock_path = Path(env["LEHOME_N15_PIPELINE_ROOT"]) / "controller.lock"
+        owner = json.loads(lock_path.read_text(encoding="ascii"))
+        assert owner == {
+            "schema_version": 1,
+            "kind": "lehome_public_n15_controller_lock_v1",
+            "run_id": "n15-singleton",
+            "controller_pid": first.pid,
+            "holder_pid": owner["holder_pid"],
+            "script_path": str(WRAPPER.resolve()),
+        }
+        os.kill(owner["holder_pid"], 0)
+
+        second = subprocess.run(
+            ["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True,
+            capture_output=True, timeout=5,
+        )
+        assert second.returncode != 0
+        assert "controller" in second.stderr.lower()
+        assert trace.read_text().splitlines() == ["start"]
+        assert lock_path.is_file()
+    finally:
+        if first.poll() is None:
+            os.killpg(first.pid, signal.SIGTERM)
+        first.communicate(timeout=5)
+    assert trace.read_text().splitlines() == ["start", "stop"]
+
+
+def test_stale_controller_lock_is_reclaimed_without_killing_a_process(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    trace = tmp_path / "trace"
+    provider = {
+        "metadata": {"id": "computeinstance-u00t6xfqhadrcmssa2", "name": "lehome-rollout"},
+        "status": {"state": "STOPPED"},
+        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}]},
+    }
+    (fake_bin / "nebius").write_text(
+        "#!/usr/bin/env python3\nimport json, os, sys\nfrom pathlib import Path\n"
+        "Path(os.environ['FAKE_TRACE']).open('a').write(' '.join(sys.argv[1:4])+'\\n')\n"
+        "print(json.dumps(" + repr(provider) + "))\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "ssh").write_text("#!/usr/bin/env bash\nexit 97\n", encoding="utf-8")
+    (fake_bin / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    for command in (fake_bin / "nebius", fake_bin / "ssh", fake_bin / "sleep"): command.chmod(0o755)
+    env = _wrapper_env(tmp_path, fake_bin, "n15-stale-lock")
+    env["FAKE_TRACE"] = str(trace)
+    pipeline = Path(env["LEHOME_N15_PIPELINE_ROOT"])
+    stale = {
+        "schema_version": 1, "kind": "lehome_public_n15_controller_lock_v1",
+        "run_id": env["LEHOME_N15_RUN_ID"], "controller_pid": 99999998,
+        "holder_pid": 99999999, "script_path": str(WRAPPER.resolve()),
+    }
+    (pipeline / "controller.lock").write_text(
+        json.dumps(stale, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii"
+    )
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True
+    )
+
+    assert result.returncode != 0
+    assert "compute instance start" in trace.read_text()
+    assert not (pipeline / "controller.lock").exists()
+
+
+def test_wrapper_dispatches_preemption_resume_completion_and_downstream_exactly_once(
+    tmp_path: Path,
+) -> None:
+    """Exercise the wrapper's real post-runtime control flow with stage doubles."""
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, "n15-wrapper-resume")
+    state = tmp_path / "state"; state.mkdir()
+    trace = tmp_path / "trace.log"
+    env.update({
+        "FAKE_STATE_DIR": str(state),
+        "FAKE_TRACE": str(trace),
+        "LEHOME_N15_RESUME_PARTIAL": "1",
+        "LEHOME_N15_RESUME_STEP": "1500",
+        "LEHOME_N15_RESUME_ATTEMPT_ID": "attempt-integration",
+        "LEHOME_N15_RESUME_CHECKPOINT": (
+            "/mnt/source/outputs/train/groot_four_types_merged_batch64_lr2e-4/checkpoints/001500"
+        ),
+        "LEHOME_N15_PUBLIC_SOURCE_ROOT": "/mnt/source",
+    })
+    harness = r'''
+source "$WRAPPER_PATH"
+remote_file_exists() {
+  case "$1" in
+    "$TRAINING_IDENTITY_RECEIPT") test -f "$FAKE_STATE_DIR/training-012000" ;;
+    "$TRAINING_PUBLICATION_RECEIPT") test -f "$FAKE_STATE_DIR/training-publication" ;;
+    "$FOCUSED_PROMOTION_RECEIPT") test -f "$FAKE_STATE_DIR/focused-promotion" ;;
+    *) return 1 ;;
+  esac
+}
+run_paid_stage() {
+  printf 'paid:%s\n' "$1" >> "$FAKE_TRACE"
+  case "$1" in
+    train)
+      test "${ALLOW_TRAIN_COMPLETION:-0}" = 1 || return 17
+      printf '012000\n' > "$FAKE_STATE_DIR/training-012000"
+      ;;
+    focused_gate) touch "$FAKE_STATE_DIR/focused-promotion" ;;
+    harvest) touch "$FAKE_STATE_DIR/harvest-1000" ;;
+  esac
+}
+verify_remote_training_chain() { printf 'verify:training\n' >> "$FAKE_TRACE"; test "$(cat "$FAKE_STATE_DIR/training-012000")" = 012000; }
+publish_training_readback() { printf 'publish:training\n' >> "$FAKE_TRACE"; touch "$FAKE_STATE_DIR/training-publication"; }
+verify_remote_training_publication() { printf 'verify:training-publication\n' >> "$FAKE_TRACE"; test -f "$FAKE_STATE_DIR/training-publication"; }
+verify_remote_focused_chain() { printf 'verify:focused\n' >> "$FAKE_TRACE"; test -f "$FAKE_STATE_DIR/focused-promotion"; }
+verify_remote_harvest_chain() { printf 'verify:harvest-1000\n' >> "$FAKE_TRACE"; test -f "$FAKE_STATE_DIR/harvest-1000"; }
+fetch_remote_immutable() { printf 'fetch\n' >> "$FAKE_TRACE"; touch "$2"; }
+stop_exact_vm() { printf 'stop\n' >> "$FAKE_TRACE"; }
+finalize_host_harvest_terminal() { printf 'finalize\n' >> "$FAKE_TRACE"; touch "$HARVEST_TERMINAL_RECEIPT"; }
+python3() { return 0; }
+set +e
+( set -e; run_pipeline_after_runtime )
+first_status=$?
+set -e
+test "$first_status" = 17
+test ! -e "$FAKE_STATE_DIR/training-012000"
+ALLOW_TRAIN_COMPLETION=1
+run_pipeline_after_runtime
+run_pipeline_after_runtime
+'''
+    result = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={**env, "WRAPPER_PATH": str(WRAPPER)}, text=True, capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    lines = trace.read_text(encoding="utf-8").splitlines()
+    assert lines.count("paid:train") == 2
+    assert lines.count("publish:training") == 1
+    assert lines.count("paid:focused_gate") == 1
+    assert lines.count("paid:harvest") == 1
+    assert lines.count("verify:harvest-1000") == 1
+    assert (state / "training-012000").read_text(encoding="ascii") == "012000\n"
 
 
 def test_running_observation_waits_for_cloud_init_after_ssh_is_ready(tmp_path: Path) -> None:

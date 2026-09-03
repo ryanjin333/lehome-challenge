@@ -155,7 +155,7 @@ def test_cli_writes_an_immutable_explicit_resume_lineage_receipt(tmp_path: Path)
     training_root, staging_root, upstream_output = _materialize_partial_training(
         tmp_path, verified=verified, contract=contract
     )
-    output = staging_root / "evidence/resume-attempts/step-001500.json"
+    output = staging_root / "evidence/resume-attempts/attempt-a.json"
     output.parent.mkdir()
 
     arguments = [
@@ -165,12 +165,14 @@ def test_cli_writes_an_immutable_explicit_resume_lineage_receipt(tmp_path: Path)
         "--staging-root", str(staging_root),
         "--upstream-output", str(upstream_output),
         "--resume-step", "1500",
+        "--attempt-id", "attempt-a",
         "--output", str(output),
     ]
     assert _cli_main(arguments, contract=contract) == 0
     receipt = json.loads(output.read_text(encoding="ascii"))
     assert receipt["kind"] == "lehome_public_n15_resume_lineage_v1"
     assert receipt["requested_step"] == 1500
+    assert receipt["attempt_id"] == "attempt-a"
     assert output.stat().st_mode & 0o777 == 0o444
     assert _cli_main(arguments, contract=contract) == 2
 

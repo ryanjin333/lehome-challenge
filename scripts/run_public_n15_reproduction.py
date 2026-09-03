@@ -61,6 +61,7 @@ def _parser() -> argparse.ArgumentParser:
     resume.add_argument("--staging-root", type=Path, required=True)
     resume.add_argument("--upstream-output", type=Path, required=True)
     resume.add_argument("--resume-step", type=int, required=True)
+    resume.add_argument("--attempt-id", required=True)
     compatibility = commands.add_parser(
         "build-compatible-wheel",
         help="build the sealed two-field LeRobot 0.4.3 compatibility wheel",
@@ -246,6 +247,7 @@ def main(
                     staging_root=args.staging_root,
                     upstream_output=args.upstream_output,
                     requested_step=args.resume_step,
+                    attempt_id=args.attempt_id,
                     contract=contract,
                 )
                 stored = write_receipt(
