@@ -71,6 +71,8 @@ readonly HARVEST_TERMINAL_RECEIPT="$PIPELINE_ROOT/harvest-terminal.json"
 PROVIDER_STOPPED_RECEIPT="$PIPELINE_ROOT/provider-stopped.json"
 PIPELINE_COMPLETE=0
 PROVIDER_CLEANUP_REQUIRED=0
+ACTIVE_PAID_STAGE_PID=""
+ACTIVE_PAID_STAGE_PGID=""
 CONTROLLER_LOCK_FD=""
 CONTROLLER_LOCK_PATH=""
 PRESTART_ADMITTED_STAGE=""
@@ -293,11 +295,50 @@ PY
   fi
 }
 
+terminate_active_paid_stage() {
+  local attempt
+  if [[ -n "$ACTIVE_PAID_STAGE_PGID" ]]; then
+    kill -TERM -- "-$ACTIVE_PAID_STAGE_PGID" 2>/dev/null || true
+    for (( attempt = 1; attempt <= 25; attempt++ )); do
+      kill -0 -- "-$ACTIVE_PAID_STAGE_PGID" 2>/dev/null || break
+      sleep 0.2
+    done
+    if kill -0 -- "-$ACTIVE_PAID_STAGE_PGID" 2>/dev/null; then
+      kill -KILL -- "-$ACTIVE_PAID_STAGE_PGID" 2>/dev/null || true
+    fi
+  elif [[ -n "$ACTIVE_PAID_STAGE_PID" ]]; then
+    kill -TERM "$ACTIVE_PAID_STAGE_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$ACTIVE_PAID_STAGE_PID" ]]; then
+    wait "$ACTIVE_PAID_STAGE_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$ACTIVE_PAID_STAGE_PGID" ]] && kill -0 -- "-$ACTIVE_PAID_STAGE_PGID" 2>/dev/null; then
+    return 1
+  fi
+  ACTIVE_PAID_STAGE_PID=""
+  ACTIVE_PAID_STAGE_PGID=""
+}
+
 controller_cleanup() {
   local status=$?
+  local cleanup_failed=0
   trap - EXIT
-  if [[ "$PROVIDER_CLEANUP_REQUIRED" == 1 ]]; then stop_exact_vm || true; fi
+  trap '' INT TERM
+  while ! terminate_active_paid_stage; do
+    cleanup_failed=1
+    printf 'error: paid-stage process group survived cleanup; retaining controller lock and retrying\n' >&2
+    sleep 1
+  done
+  if [[ "$PROVIDER_CLEANUP_REQUIRED" == 1 ]]; then
+    while ! stop_exact_vm; do
+      cleanup_failed=1
+      printf 'error: exact VM stop confirmation failed; retaining controller lock and retrying\n' >&2
+      sleep 1
+    done
+    PROVIDER_CLEANUP_REQUIRED=0
+  fi
   release_controller_lock
+  if (( cleanup_failed == 1 && status == 0 )); then status=2; fi
   exit "$status"
 }
 
@@ -451,37 +492,42 @@ os.execvpe(
 )
 PY
   pid=$!
+  ACTIVE_PAID_STAGE_PID="$pid"
+  ACTIVE_PAID_STAGE_PGID=""
   ready_pid=""
   for (( attempt = 1; attempt <= 200; attempt++ )); do
     if [[ -f "$launcher_ready" && ! -L "$launcher_ready" ]]; then
+      # The launcher creates its session before publishing this handshake.
+      # Track the group before parsing so even a malformed handshake cannot
+      # leave detached descendants behind.
+      ACTIVE_PAID_STAGE_PGID="$pid"
       IFS= read -r ready_pid < "$launcher_ready"
-      [[ "$ready_pid" == "$pid" ]] || { kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf -- "$launcher_root"; fail "$label launcher handshake identity mismatch"; }
+      [[ "$ready_pid" == "$pid" ]] || { terminate_active_paid_stage || true; rm -rf -- "$launcher_root"; fail "$label launcher handshake identity mismatch"; }
       break
     fi
     if ! kill -0 "$pid" 2>/dev/null; then
-      wait "$pid" 2>/dev/null || true; rm -rf -- "$launcher_root"; fail "$label launcher exited before setsid handshake"
+      wait "$pid" 2>/dev/null || true; ACTIVE_PAID_STAGE_PID=""; rm -rf -- "$launcher_root"; fail "$label launcher exited before setsid handshake"
     fi
     now="$(date +%s)"
     if (( now >= stage_deadline )); then
-      kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf -- "$launcher_root"; fail "$label launcher handshake exceeded its paid timeout"
+      terminate_active_paid_stage || true; rm -rf -- "$launcher_root"; fail "$label launcher handshake exceeded its paid timeout"
     fi
     sleep 0.02
   done
-  [[ "$ready_pid" == "$pid" ]] || { kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf -- "$launcher_root"; fail "$label launcher setsid handshake failed"; }
+  [[ "$ready_pid" == "$pid" ]] || { terminate_active_paid_stage || true; rm -rf -- "$launcher_root"; fail "$label launcher setsid handshake failed"; }
+  ACTIVE_PAID_STAGE_PGID="$pid"
   rm -rf -- "$launcher_root"
   while kill -0 -- "-$pid" 2>/dev/null; do
     now="$(date +%s)"
     if (( now >= stage_deadline )); then
-      kill -TERM -- "-$pid" 2>/dev/null || true
-      for _ in {1..15}; do kill -0 -- "-$pid" 2>/dev/null || break; sleep 1; done
-      if kill -0 -- "-$pid" 2>/dev/null; then kill -KILL -- "-$pid" 2>/dev/null || true; fi
-      wait "$pid" || true
-      kill -0 -- "-$pid" 2>/dev/null && fail "$label process group survived watchdog termination"
+      terminate_active_paid_stage || fail "$label process group survived watchdog termination"
       fail "$label exceeded its code-owned paid timeout"
     fi
     sleep 1
   done
-  wait "$pid"; status=$?
+  if wait "$pid"; then status=0; else status=$?; fi
+  ACTIVE_PAID_STAGE_PID=""
+  ACTIVE_PAID_STAGE_PGID=""
   (( status == 0 )) || fail "$label failed"
   if [[ "$label" == "$PRESTART_ADMITTED_STAGE" ]]; then
     PRESTART_ADMITTED_STAGE=""
@@ -507,16 +553,82 @@ SH
 }
 
 verify_remote_training_publication() {
-  remote bash -s -- "$TRAINING_PUBLICATION_RECEIPT" "$PUBLIC_REPOSITORY" "n15-public/$RUN_ID/training" "$TRAINING_IDENTITY_RECEIPT" <<'SH'
+  remote bash -s -- "$TRAINING_PUBLICATION_RECEIPT" "$PUBLIC_REPOSITORY" "n15-public/$RUN_ID/training" "$TRAINING_ROOT" <<'SH'
 set -euo pipefail
 python3 - "$1" "$2" "$3" "$4" <<'PY'
-import hashlib, json, re, sys
-from pathlib import Path
-receipt, repository, prefix, training = map(Path if False else str, sys.argv[1:])
-raw = Path(receipt).read_bytes(); value = json.loads(raw)
-if raw != (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(): raise SystemExit("training publication is not canonical")
-if (set(value) != {"schema_version", "kind", "repository", "remote_prefix", "immutable_revision", "entries", "anonymous_byte_readback_verified"} or value["schema_version"] != 1 or value["kind"] != "lehome_public_n15_training_publication_v1" or value["repository"] != repository or value["remote_prefix"] != prefix or re.fullmatch(r"[0-9a-f]{40}", value["immutable_revision"]) is None or value["anonymous_byte_readback_verified"] is not True or not isinstance(value["entries"], list) or not value["entries"]): raise SystemExit("training publication receipt is invalid")
-if not any(item.get("path") == Path(training).name + "/training-identity.json" or item.get("path") == "training-identity.json" for item in value["entries"] if isinstance(item, dict)): raise SystemExit("training publication does not bind training identity")
+import hashlib, json, re, stat, sys
+from pathlib import Path, PurePosixPath
+from huggingface_hub import HfApi, hf_hub_download
+
+receipt, repository, prefix, training = Path(sys.argv[1]), sys.argv[2], sys.argv[3], Path(sys.argv[4])
+receipt_metadata = receipt.lstat()
+training_metadata = training.lstat()
+if (
+    receipt.is_symlink() or not stat.S_ISREG(receipt_metadata.st_mode)
+    or stat.S_IMODE(receipt_metadata.st_mode) != 0o444
+    or training.is_symlink() or not stat.S_ISDIR(training_metadata.st_mode)
+):
+    raise SystemExit("training publication receipt or root is unsafe")
+raw = receipt.read_bytes(); value = json.loads(raw)
+if raw != (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii"):
+    raise SystemExit("training publication is not canonical")
+if (
+    set(value) != {"schema_version", "kind", "repository", "remote_prefix", "immutable_revision", "entries", "anonymous_byte_readback_verified"}
+    or value["schema_version"] != 1
+    or value["kind"] != "lehome_public_n15_training_publication_v1"
+    or value["repository"] != repository
+    or value["remote_prefix"] != prefix
+    or re.fullmatch(r"[0-9a-f]{40}", str(value["immutable_revision"])) is None
+    or value["anonymous_byte_readback_verified"] is not True
+    or not isinstance(value["entries"], list) or not value["entries"]
+):
+    raise SystemExit("training publication receipt is invalid")
+expected = {}
+for item in value["entries"]:
+    if not isinstance(item, dict) or set(item) != {"path", "sha256"}:
+        raise SystemExit("training publication entry schema is invalid")
+    relative, digest = item["path"], item["sha256"]
+    pure = PurePosixPath(str(relative))
+    if (
+        not isinstance(relative, str) or pure.is_absolute()
+        or any(part in {"", ".", ".."} for part in pure.parts)
+        or relative in expected or re.fullmatch(r"[0-9a-f]{64}", str(digest)) is None
+        or relative == "training-publication.json"
+    ):
+        raise SystemExit("training publication entry is invalid")
+    expected[relative] = digest
+current = {}
+for path in sorted(training.rglob("*")):
+    relative = path.relative_to(training).as_posix()
+    metadata = path.lstat()
+    if path.is_symlink() or stat.S_ISDIR(metadata.st_mode):
+        continue
+    if not stat.S_ISREG(metadata.st_mode) or path == receipt or relative.startswith(".training-publication.json."):
+        if path != receipt:
+            raise SystemExit("training publication tree contains an unsafe entry")
+        continue
+    current[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+if current != expected or expected.get("training-identity.json") != hashlib.sha256((training / "training-identity.json").read_bytes()).hexdigest():
+    raise SystemExit("training publication does not bind the current verified training tree")
+revision = value["immutable_revision"]
+tree = HfApi(token=False).list_repo_tree(
+    repo_id=repository, repo_type="model", path_in_repo=prefix,
+    revision=revision, recursive=True, token=False,
+)
+remote_paths = {
+    item.rfilename[len(prefix) + 1:]
+    for item in tree
+    if getattr(item, "size", None) is not None and item.rfilename.startswith(prefix + "/")
+}
+if remote_paths != set(expected):
+    raise SystemExit("immutable publication revision tree mismatch")
+for relative, digest in expected.items():
+    fetched = hf_hub_download(
+        repo_id=repository, repo_type="model", filename=prefix + "/" + relative,
+        revision=revision, token=False,
+    )
+    if hashlib.sha256(Path(fetched).read_bytes()).hexdigest() != digest:
+        raise SystemExit("immutable publication revision byte mismatch")
 PY
 SH
 }
@@ -811,6 +923,28 @@ if [[ -d "${training_root}.finalizing" || -f "$staging_root/training-finalizatio
     --training-root "$training_root" --staging-root "$staging_root" \
     --upstream-output "$upstream_output" >/dev/null
   exit 0
+fi
+if [[ -d "$upstream_output" && ! -L "$upstream_output" && -d "$staging_root" && ! -L "$staging_root" ]]; then
+  completed_state="$(python3 "$root/scripts/run_public_n15_reproduction.py" verify-completed-upstream \
+    --checkout "$source_root" --source-receipt "$source_receipt" \
+    --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" \
+    --training-root "$training_root" --staging-root "$staging_root" \
+    --upstream-output "$upstream_output")"
+  if [[ "$completed_state" == '{"complete":true}' ]]; then
+    recovery_eagle_home="$staging_root/eagle-home"
+    if [[ -e "$recovery_eagle_home" || -L "$recovery_eagle_home" ]]; then
+      test -d "$recovery_eagle_home" && test ! -L "$recovery_eagle_home"
+      find "$recovery_eagle_home" -depth -type f -delete
+      find "$recovery_eagle_home" -depth -type d -empty -delete
+      test ! -e "$recovery_eagle_home"
+    fi
+    python3 "$root/scripts/run_public_n15_reproduction.py" finalize-training-output \
+      --checkout "$source_root" --source-receipt "$source_receipt" \
+      --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" \
+      --training-root "$training_root" --staging-root "$staging_root" \
+      --upstream-output "$upstream_output" >/dev/null
+    exit 0
+  fi
 fi
 if [[ "$resume_partial" == 1 ]]; then
   [[ "$resume_step" =~ ^[0-9]+$ ]] || { echo "explicit resume step is invalid" >&2; exit 2; }
@@ -1200,6 +1334,7 @@ test -d "$eagle_home" && test ! -L "$eagle_home"
 test -d "$staging_root" && test ! -L "$staging_root"
 sudo -n chown -R --no-dereference "$(id -u):$(id -g)" "$upstream_output" "$eagle_home" "$staging_root"
 test -z "$(find "$upstream_output" "$eagle_home" "$staging_root" ! -user "$(id -u)" -print -quit)"
+if [[ "${FAKE_INTERRUPT_POINT:-}" == after-trainer && "${PYTEST_CURRENT_TEST:-}" == tests/infrastructure/test_public_n15_pipeline_remote.py::* ]]; then kill -TERM "$$"; fi
 find "$eagle_home" -depth -type f -delete
 find "$eagle_home" -depth -type d -empty -delete
 test ! -e "$eagle_home"

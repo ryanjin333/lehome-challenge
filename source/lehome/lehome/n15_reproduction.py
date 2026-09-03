@@ -1792,6 +1792,129 @@ def _verify_resumed_checkpoint_advancement(
     )
 
 
+def verify_completed_upstream_for_finalization(
+    *,
+    verified: VerifiedInputs,
+    training_root: Path | str,
+    staging_root: Path | str,
+    upstream_output: Path | str,
+    contract: ReproductionContract = CONTRACT,
+) -> bool:
+    """Authenticate a native step-12,000 output before moving any final state."""
+
+    requested_training = Path(training_root)
+    requested_upstream = Path(upstream_output)
+    expected_upstream = (
+        verified.checkout / "outputs/train/groot_four_types_merged_batch64_lr2e-4"
+    )
+    if requested_upstream != expected_upstream:
+        raise ReproductionError("upstream training output root is not canonical")
+    if requested_training.exists() or requested_training.is_symlink():
+        raise ReproductionError("canonical training output already exists")
+    staging = _regular_directory(Path(staging_root), "training evidence staging root")
+    upstream = _regular_directory(requested_upstream, "upstream training output")
+    training_parent = _regular_directory(
+        requested_training.parent, "canonical training parent"
+    )
+    if len({staging.stat().st_dev, upstream.stat().st_dev, training_parent.stat().st_dev}) != 1:
+        raise ReproductionError("training finalization roots are not on one filesystem")
+    last = upstream / "checkpoints/last"
+    if not last.is_symlink() or os.readlink(last) != "012000":
+        return False
+    checkpoint = _regular_directory(
+        upstream / "checkpoints/012000", "completed upstream checkpoint"
+    )
+    checkpoint_files = _required_nonempty_checkpoint_files(checkpoint)
+    try:
+        train_config = json.loads(
+            checkpoint_files["pretrained_model/train_config.json"].read_text(
+                encoding="utf-8"
+            )
+        )
+        policy_config = json.loads(
+            checkpoint_files["pretrained_model/config.json"].read_text(
+                encoding="utf-8"
+            )
+        )
+        step = json.loads(
+            checkpoint_files["training_state/training_step.json"].read_text(
+                encoding="utf-8"
+            )
+        )
+        scheduler = json.loads(
+            checkpoint_files["training_state/scheduler_state.json"].read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ReproductionError("completed upstream checkpoint JSON is invalid") from None
+    _verify_exact_saved_train_config(train_config, verified=verified, upstream=upstream)
+    if not isinstance(policy_config, dict) or policy_config.get("type") != "groot":
+        raise ReproductionError("completed upstream policy configuration is invalid")
+    if not isinstance(step, dict) or set(step) != {"step"} or step.get("step") != 12000:
+        raise ReproductionError("completed upstream step evidence is invalid")
+    if not isinstance(scheduler, dict) or scheduler.get("last_epoch") != 12000:
+        raise ReproductionError("completed upstream scheduler evidence is invalid")
+
+    source_copy = _regular_file(
+        staging / "evidence/source-receipt.json", "staged source receipt"
+    )
+    snapshots_copy = _regular_file(
+        staging / "evidence/resolved-snapshots-receipt.json",
+        "staged resolved snapshots receipt",
+    )
+    if source_copy.read_bytes() != verified.source_receipt.read_bytes():
+        raise ReproductionError("staged source receipt mismatch")
+    if snapshots_copy.read_bytes() != verified.resolved_snapshots_receipt.read_bytes():
+        raise ReproductionError("staged resolved snapshots receipt mismatch")
+    completion_logs = [
+        path for path in (staging / "logs").glob("train*.log")
+        if path.is_file() and not path.is_symlink()
+    ]
+    if not any(
+        "Checkpoint policy after step 12000" in path.read_text(encoding="utf-8")
+        and "End of training" in path.read_text(encoding="utf-8")
+        for path in completion_logs
+    ):
+        raise ReproductionError("completed upstream training log evidence is missing")
+    combined_artifacts = _artifact_files(upstream)
+    for component in ("evidence", "logs", "runtime"):
+        component_root = _regular_directory(
+            staging / component, f"staged training {component}"
+        )
+        for path in sorted(component_root.rglob("*")):
+            relative = path.relative_to(component_root).as_posix()
+            metadata = path.lstat()
+            if path.is_symlink() or (not stat.S_ISDIR(metadata.st_mode) and not stat.S_ISREG(metadata.st_mode)):
+                raise ReproductionError("staged training evidence contains an unsafe entry")
+            if stat.S_ISREG(metadata.st_mode):
+                combined_artifacts[f"{component}/{relative}"] = path.resolve(strict=True)
+    lineage = _verified_resume_lineage(upstream, combined_artifacts, contract)
+    if lineage:
+        source_hashes: list[Mapping[str, str]] = []
+        for item in lineage:
+            receipt_path = combined_artifacts[str(item["receipt"])]
+            _, _, receipt = _load_receipt(
+                receipt_path, "resume advancement lineage receipt"
+            )
+            hashes = receipt.get("checkpoint_files")
+            if not isinstance(hashes, dict):
+                raise ReproductionError(
+                    "resume checkpoint advancement evidence is invalid"
+                )
+            source_hashes.append(hashes)
+        validate_resume_advancement_hashes(
+            final_checkpoint_hashes={
+                relative: _sha256_file(path)
+                for relative, path in checkpoint_files.items()
+            },
+            source_checkpoint_hashes=source_hashes,
+            scheduler_last_epoch=scheduler.get("last_epoch"),
+            final_step=12000,
+        )
+    return True
+
+
 def verify_training_output(
     *,
     verified: VerifiedInputs,
@@ -2245,6 +2368,14 @@ def finalize_training_output(
 
     source_locations: dict[str, Path] = {}
     if not marker_path.exists() and not marker_path.is_symlink():
+        if not verify_completed_upstream_for_finalization(
+            verified=verified,
+            training_root=training,
+            staging_root=requested_staging,
+            upstream_output=requested_upstream,
+            contract=contract,
+        ):
+            raise ReproductionError("upstream training output is not complete")
         staging = _regular_directory(requested_staging, "training evidence staging root")
         upstream = _regular_directory(requested_upstream, "upstream training output")
         if finalizing.exists() or finalizing.is_symlink():

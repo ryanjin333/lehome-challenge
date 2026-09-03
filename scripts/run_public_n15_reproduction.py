@@ -29,6 +29,7 @@ from lehome.n15_reproduction import (  # noqa: E402
     verify_resume_checkpoint,
     verify_inputs,
     verify_training_output,
+    verify_completed_upstream_for_finalization,
     write_receipt,
 )
 
@@ -64,6 +65,19 @@ def _parser() -> argparse.ArgumentParser:
         "vm-id", "disk-id", "training-root", "staging-root", "upstream-output",
     ):
         finalization.add_argument(
+            f"--{name}",
+            type=Path if name not in {"vm-id", "disk-id"} else str,
+            required=True,
+        )
+    completed = commands.add_parser(
+        "verify-completed-upstream",
+        help="authenticate a completed native 12K output before finalization",
+    )
+    for name in (
+        "checkout", "source-receipt", "resolved-snapshots-receipt",
+        "vm-id", "disk-id", "training-root", "staging-root", "upstream-output",
+    ):
+        completed.add_argument(
             f"--{name}",
             type=Path if name not in {"vm-id", "disk-id"} else str,
             required=True,
@@ -281,6 +295,16 @@ def main(
                     upstream_output=args.upstream_output,
                     contract=contract,
                 )
+            elif args.command == "verify-completed-upstream":
+                result = {
+                    "complete": verify_completed_upstream_for_finalization(
+                        verified=verified,
+                        training_root=args.training_root,
+                        staging_root=args.staging_root,
+                        upstream_output=args.upstream_output,
+                        contract=contract,
+                    )
+                }
             elif args.command == "verify-resume-checkpoint":
                 value = verify_resume_checkpoint(
                     verified=verified,

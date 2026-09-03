@@ -444,6 +444,28 @@ def test_actual_remote_train_stage_runs_native_resume_and_production_finalizatio
     ) == 2
 
 
+def test_completed_12k_upstream_is_authenticated_and_finalized_without_retraining(
+    tmp_path: Path,
+) -> None:
+    env, _contract, training, staging, upstream = _remote_train_fixture(tmp_path)
+
+    interrupted = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-after-trainer",
+        interrupt_point="after-trainer", complete=True,
+    )
+    assert interrupted.returncode == 130, interrupted.stderr
+    assert upstream.is_dir() and staging.is_dir() and not training.exists()
+    assert (upstream / "checkpoints/last").readlink() == Path("012000")
+
+    recovered = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-after-trainer-recovery", complete=False,
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert training.is_dir() and not upstream.exists() and not staging.exists()
+    trace = Path(env["FAKE_TRACE"]).read_text(encoding="utf-8")
+    assert trace.count("native:/opt/lehome-challenge/.venv/bin/lerobot-train") == 1
+
+
 def test_lifecycle_plan_is_immutable_and_has_exact_paid_stage_order(tmp_path: Path) -> None:
     module = _load_cli()
     output = tmp_path / "pipeline-plan.json"
@@ -1332,6 +1354,69 @@ while :; do /bin/sleep 1; done
     assert not lock_path.exists()
 
 
+def test_interrupted_paid_stage_is_reaped_and_stop_is_confirmed_before_unlock(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, "n15-paid-interrupt-cleanup")
+    trace = tmp_path / "trace"
+    stage_pid = tmp_path / "stage-pid"
+    allow_stop = tmp_path / "allow-stop"
+    harness = r'''
+source "$WRAPPER_PATH"
+initialize_deadline() { echo "$(( $(date +%s) + 60 ))"; }
+initialize_stage_deadline() { echo "$(( $(date +%s) + 60 ))"; }
+train_stage() { printf '%s\n' "$$" > "$STAGE_PID"; while :; do /bin/sleep 1; done; }
+stop_exact_vm() {
+  if [[ ! -e "$ALLOW_STOP" ]]; then printf 'stop-failed\n' >> "$TRACE"; return 1; fi
+  printf 'stopped\n' >> "$TRACE"; return 0
+}
+acquire_controller_lock
+PROVIDER_CLEANUP_REQUIRED=1
+trap controller_cleanup EXIT
+run_paid_stage train 60 train_stage
+'''
+    process = subprocess.Popen(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env, "WRAPPER_PATH": str(WRAPPER), "TRACE": str(trace),
+            "STAGE_PID": str(stage_pid), "ALLOW_STOP": str(allow_stop),
+        },
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    lock_path = _controller_lock_path(env)
+    try:
+        deadline = time.monotonic() + 5
+        while (not stage_pid.exists() or not lock_path.exists()) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert stage_pid.exists() and lock_path.exists()
+        os.kill(process.pid, signal.SIGTERM)
+        deadline = time.monotonic() + 5
+        while (not trace.exists() or "stop-failed" not in trace.read_text()) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert trace.exists() and "stop-failed" in trace.read_text()
+        assert lock_path.exists()
+        contender = subprocess.run(
+            ["bash", "-c", 'source "$WRAPPER_PATH"; acquire_controller_lock'],
+            cwd=ROOT, env={**env, "WRAPPER_PATH": str(WRAPPER)},
+            text=True, capture_output=True, timeout=5,
+        )
+        assert contender.returncode != 0
+        allow_stop.touch()
+        stdout, stderr = process.communicate(timeout=8)
+        assert process.returncode != 0, (stdout, stderr)
+        assert "stop confirmation failed" in stderr
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(stage_pid.read_text()), 0)
+        assert trace.read_text().splitlines()[-1] == "stopped"
+        assert not lock_path.exists()
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=3)
+
+
 def test_stale_controller_lock_is_reclaimed_without_killing_a_process(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"; fake_bin.mkdir()
     trace = tmp_path / "trace"
@@ -1600,6 +1685,56 @@ def hf_hub_download(*, filename, revision, **kwargs):
     receipt = json.loads((training / "training-publication.json").read_text())
     assert receipt["immutable_revision"] == "a" * 40
     assert receipt["anonymous_byte_readback_verified"] is True
+
+    verify_harness = (
+        'source "$WRAPPER_PATH"; remote() { command "$@"; }; '
+        "verify_remote_training_publication"
+    )
+
+    def verify_publication() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "-c", verify_harness], cwd=ROOT,
+            env={**env, "WRAPPER_PATH": str(WRAPPER)},
+            text=True, capture_output=True,
+        )
+
+    assert verify_publication().returncode == 0
+    receipt_path = training / "training-publication.json"
+    original_receipt = receipt_path.read_bytes()
+
+    receipt_path.chmod(0o644)
+    assert verify_publication().returncode != 0
+    receipt_path.chmod(0o444)
+
+    forged = json.loads(original_receipt)
+    forged["entries"][0]["extra"] = "forged"
+    receipt_path.chmod(0o644)
+    receipt_path.write_bytes(_canonical_json_bytes(forged))
+    receipt_path.chmod(0o444)
+    assert verify_publication().returncode != 0
+
+    forged = json.loads(original_receipt)
+    forged["entries"][0]["sha256"] = "0" * 64
+    receipt_path.chmod(0o644)
+    receipt_path.write_bytes(_canonical_json_bytes(forged))
+    receipt_path.chmod(0o444)
+    assert verify_publication().returncode != 0
+    receipt_path.chmod(0o644)
+    receipt_path.write_bytes(original_receipt)
+    receipt_path.chmod(0o444)
+
+    relative = receipt["entries"][0]["path"]
+    local_artifact = training / relative
+    original_local = local_artifact.read_bytes()
+    local_artifact.chmod(0o644)
+    local_artifact.write_bytes(original_local + b"tampered")
+    assert verify_publication().returncode != 0
+    local_artifact.write_bytes(original_local)
+
+    remote_artifact = remote_store / ("a" * 40) / receipt["remote_prefix"] / relative
+    original_remote = remote_artifact.read_bytes()
+    remote_artifact.write_bytes(original_remote + b"tampered")
+    assert verify_publication().returncode != 0
 
 
 def test_fetch_remote_immutable_cleans_partial_transfer_and_retries(
