@@ -78,9 +78,9 @@ _TRAINING_CONTAINER_IMAGE_ID = (
 )
 _TRAINING_CONTAINER_PYTHON = "/opt/lehome-challenge/.venv/bin/python"
 _TRAINING_CONTAINER_PYTHONPATH = (
-    "/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:"
-    "/deps/peft-0.18.1-py3-none-any.whl"
+    "/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl"
 )
+_TRAINING_CONTAINER_LEROBOT_ROOT = "/flash/site-packages/lerobot"
 
 
 class TrainingIdentityError(RuntimeError):
@@ -545,7 +545,7 @@ def validate_training_identity_receipt(
         or container_runtime.get("python_executable") != _TRAINING_CONTAINER_PYTHON
         or container_runtime.get("pythonpath") != _TRAINING_CONTAINER_PYTHONPATH
         or container_runtime.get("lerobot_origin")
-        != "/runtime/lerobot-0.4.3-py3-none-any.whl/lerobot/__init__.py"
+        != _TRAINING_CONTAINER_LEROBOT_ROOT + "/__init__.py"
         or container_runtime.get("peft_origin")
         != "/deps/peft-0.18.1-py3-none-any.whl/peft/__init__.py"
         or container_runtime.get("flash_attn_origin")

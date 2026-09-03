@@ -419,7 +419,7 @@ sudo -n docker run --rm -i --pull never --gpus all --network none \
   --entrypoint bash "$runtime_image_id" -s -- "$root" "$staging_root/evidence/peft-overlay-receipt.json" "$staging_root/evidence/flash-attention-overlay-receipt.json" "$staging_root/evidence/flash-attention-runtime-receipt.json" "$staging_root/evidence/training-container-runtime-receipt.json" "$runtime_image_id" <<'CONTAINER'
 set -euo pipefail
 python_bin=/opt/lehome-challenge/.venv/bin/python
-pythonpath=/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl
+pythonpath=/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl
 root="$1"
 peft_wheel="/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl"
 PYTHONSAFEPATH=1 PYTHONPATH="$peft_wheel" "$python_bin" "$root/scripts/verify_native_reference_evaluator_gate.py" \
@@ -432,12 +432,16 @@ mkdir -m 0700 /flash/site-packages
 import os, sys, zipfile
 from pathlib import Path
 
-wheel, target = map(Path, sys.argv[1:])
-with zipfile.ZipFile(wheel) as archive:
+flash_wheel, target = map(Path, sys.argv[1:])
+lerobot_wheel = Path("/runtime/lerobot-0.4.3-py3-none-any.whl")
+with zipfile.ZipFile(lerobot_wheel) as archive:
+    archive.extractall(target)
+with zipfile.ZipFile(flash_wheel) as archive:
     for item in archive.infolist():
         if item.filename.startswith(("flash_attn/", "flash_attn_2_cuda")):
             archive.extract(item, target)
 PY
+PYTHONPATH="$pythonpath" "$python_bin" -c 'import lerobot.scripts.lerobot_train'
 PYTHONPATH="$pythonpath" "$python_bin" - "$4" "$5" "$6" <<'PY'
 import importlib.util, json, os, sys
 from pathlib import Path
@@ -497,8 +501,8 @@ container_payload = {
 expected_container = {
     "image_id": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
     "python_executable": "/opt/lehome-challenge/.venv/bin/python",
-    "pythonpath": "/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl",
-    "lerobot_origin": "/runtime/lerobot-0.4.3-py3-none-any.whl/lerobot/__init__.py",
+    "pythonpath": "/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl",
+    "lerobot_origin": "/flash/site-packages/lerobot/__init__.py",
     "peft_origin": "/deps/peft-0.18.1-py3-none-any.whl/peft/__init__.py",
 }
 if any(container_payload.get(key) != value for key, value in expected_container.items()):
@@ -561,15 +565,19 @@ mkdir -m 0700 /flash/site-packages
 "$python_bin" - /deps/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl /flash/site-packages <<'PY'
 import sys, zipfile
 from pathlib import Path
-wheel, target = map(Path, sys.argv[1:])
-with zipfile.ZipFile(wheel) as archive:
+flash_wheel, target = map(Path, sys.argv[1:])
+lerobot_wheel = Path("/runtime/lerobot-0.4.3-py3-none-any.whl")
+with zipfile.ZipFile(lerobot_wheel) as archive:
+    archive.extractall(target)
+with zipfile.ZipFile(flash_wheel) as archive:
     for item in archive.infolist():
         if item.filename.startswith(("flash_attn/", "flash_attn_2_cuda")):
             archive.extract(item, target)
 PY
 cd "$source_root"
 export HF_HOME="$eagle_home" HF_LEROBOT_HOME="$eagle_home/lerobot" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"
-PYTHONPATH="/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl" /opt/lehome-challenge/.venv/bin/lerobot-train --config_path=configs/train_groot.yaml --wandb.mode=offline
+PYTHONPATH="/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl" /opt/lehome-challenge/.venv/bin/python -c 'import lerobot.scripts.lerobot_train'
+PYTHONPATH="/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl" /opt/lehome-challenge/.venv/bin/lerobot-train --config_path=configs/train_groot.yaml --wandb.mode=offline
 CONTAINER
 test -d "$upstream_output" && test ! -L "$upstream_output"
 test -d "$eagle_home" && test ! -L "$eagle_home"

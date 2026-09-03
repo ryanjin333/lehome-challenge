@@ -782,12 +782,12 @@ def test_render_training_writes_an_atomic_offline_manifest_without_execution(
         "container": {
             "image_id": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
             "python_executable": "/opt/lehome-challenge/.venv/bin/python",
-            "pythonpath": "/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl",
+            "pythonpath": "/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl",
         },
         "env": {
             "HF_HUB_CACHE": str((tmp_path / "hub").resolve()),
             "HF_HUB_OFFLINE": "1",
-            "PYTHONPATH": "/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl",
+            "PYTHONPATH": "/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl",
         },
         "shell_argv": "lerobot-train --config_path=configs/train_groot.yaml --wandb.mode=offline",
     }
@@ -907,8 +907,8 @@ def _materialize_training_output(
                 "image_id": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
                 "python_executable": "/opt/lehome-challenge/.venv/bin/python",
                 "python_version": [3, 11, 13],
-                "pythonpath": "/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl",
-                "lerobot_origin": "/runtime/lerobot-0.4.3-py3-none-any.whl/lerobot/__init__.py",
+                "pythonpath": "/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl",
+                "lerobot_origin": "/flash/site-packages/lerobot/__init__.py",
                 "peft_origin": "/deps/peft-0.18.1-py3-none-any.whl/peft/__init__.py",
                 "flash_attn_origin": "/flash/site-packages/flash_attn/__init__.py",
                 "torch_version": "2.7.0+cu128",

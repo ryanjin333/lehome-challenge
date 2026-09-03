@@ -78,6 +78,7 @@ def test_cli_verify_inputs_render_training_and_verify_output_are_offline_and_ato
     assert manifest["execution"]["env"] == {
         "HF_HUB_CACHE": str((tmp_path / "hub").resolve()),
         "HF_HUB_OFFLINE": "1",
+        "PYTHONPATH": "/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl",
     }
     assert manifest["execution"]["shell_argv"] == (
         "lerobot-train --config_path=configs/train_groot.yaml --wandb.mode=offline"

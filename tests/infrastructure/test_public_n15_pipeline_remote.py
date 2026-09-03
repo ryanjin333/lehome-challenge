@@ -102,7 +102,7 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'sudo -n docker image inspect -- "$runtime_image_id"' in text
     assert 'sudo -n docker run --rm -i --pull never --gpus all --network none' in text
     assert '--tmpfs "/flash:rw,exec,size=2g,mode=700,uid=$(id -u),gid=$(id -g)"' in text
-    assert 'with zipfile.ZipFile(wheel) as archive:' in text
+    assert 'with zipfile.ZipFile(flash_wheel) as archive:' in text
     assert 'PYTHONPATH="$pythonpath" "$python_bin"' in text
     assert 'expected = "/flash/site-packages/flash_attn/__init__.py"' in text
     assert "grep -Eq '^(disk|part|lvm|crypt)$'" in text
@@ -120,7 +120,7 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'prepare-peft-overlay --receipt "$2"' in text
     assert '"$staging_root/evidence/peft-overlay-receipt.json"' in text
     assert 'peft_wheel="/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl"' in text
-    assert 'PYTHONPATH="/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl"' in text
+    assert 'PYTHONPATH="/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl"' in text
     assert 'prepare-flash-attention-overlay --receipt "$3"' in text
     assert '"$staging_root/evidence/flash-attention-overlay-receipt.json"' in text
     assert 'flash_wheel="/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"' in text
@@ -135,6 +135,9 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert "prepare-peft-overlay" not in host_preflight
     assert "prepare-flash-attention-overlay" not in host_preflight
     assert 'flash_attn_2_cuda' in text
+    assert 'lerobot_wheel = Path("/runtime/lerobot-0.4.3-py3-none-any.whl")' in text
+    assert 'with zipfile.ZipFile(lerobot_wheel) as archive:' in text
+    assert "import lerobot.scripts.lerobot_train" in text
     assert '--mount "type=bind,src=$hf_cache,dst=$hf_cache,readonly"' in text
     assert '--mount "type=bind,src=$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl,dst=/runtime/lerobot-0.4.3-py3-none-any.whl,readonly"' in text
     assert 'find "$eagle_home" -depth -type f -delete' in text

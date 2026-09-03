@@ -30,12 +30,11 @@ _TRAINING_CONTAINER_IMAGE_ID = (
     "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"
 )
 _TRAINING_CONTAINER_PYTHON = "/opt/lehome-challenge/.venv/bin/python"
-_TRAINING_CONTAINER_LEROBOT_WHEEL = "/runtime/lerobot-0.4.3-py3-none-any.whl"
 _TRAINING_CONTAINER_PYTHONPATH = (
     "/flash/site-packages:"
-    f"{_TRAINING_CONTAINER_LEROBOT_WHEEL}:"
     "/deps/peft-0.18.1-py3-none-any.whl"
 )
+_TRAINING_CONTAINER_LEROBOT_ROOT = "/flash/site-packages/lerobot"
 
 
 class ReproductionError(RuntimeError):
@@ -1263,7 +1262,7 @@ def verify_training_output(
         or container_runtime.get("python_executable") != _TRAINING_CONTAINER_PYTHON
         or container_runtime.get("pythonpath") != _TRAINING_CONTAINER_PYTHONPATH
         or container_runtime.get("lerobot_origin")
-        != _TRAINING_CONTAINER_LEROBOT_WHEEL + "/lerobot/__init__.py"
+        != _TRAINING_CONTAINER_LEROBOT_ROOT + "/__init__.py"
         or container_runtime.get("peft_origin")
         != "/deps/peft-0.18.1-py3-none-any.whl/peft/__init__.py"
         or container_runtime.get("flash_attn_origin")
