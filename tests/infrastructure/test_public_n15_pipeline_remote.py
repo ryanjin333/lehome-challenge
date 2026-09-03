@@ -101,7 +101,6 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'export UV_LINK_MODE=copy' in text
     assert 'sudo -n docker image inspect -- "$runtime_image_id"' in text
     assert 'sudo -n docker run --rm -i --pull never --gpus all --network none' in text
-    assert '--user "$(id -u):$(id -g)"' in text
     assert '--tmpfs "/flash:rw,exec,size=2g,mode=700,uid=$(id -u),gid=$(id -g)"' in text
     assert 'with zipfile.ZipFile(wheel) as archive:' in text
     assert 'PYTHONPATH="$pythonpath" "$python_bin"' in text
@@ -126,6 +125,8 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert '"$staging_root/evidence/flash-attention-overlay-receipt.json"' in text
     assert 'flash_wheel="/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"' in text
     pinned_preflight = text.index('sudo -n docker run --rm -i --pull never --gpus all --network none')
+    preflight_command = text[pinned_preflight:text.index("<<'CONTAINER'", pinned_preflight)]
+    assert '--user "$(id -u):$(id -g)"' not in preflight_command
     assert pinned_preflight < text.index('prepare-peft-overlay --receipt "$2"')
     assert pinned_preflight < text.index('prepare-flash-attention-overlay --receipt "$3"')
     assert '--mount "type=bind,src=$root,dst=$root,readonly"' in text
@@ -141,6 +142,13 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'training-container-runtime-receipt.json' in text
     assert '"$runtime_image_id" -s --' in text
     assert 'lehome-rollout:build -s --' not in text
+    training_command = text[text.index('sudo -n docker run --rm -i --pull never --gpus all --network none', pinned_preflight + 1):]
+    training_command = training_command[:training_command.index("<<'CONTAINER'")]
+    assert '--user "$(id -u):$(id -g)"' not in training_command
+    ownership_handoff = 'sudo -n chown -R --no-dereference "$(id -u):$(id -g)" "$upstream_output" "$eagle_home" "$staging_root"'
+    assert ownership_handoff in text
+    assert text.index(ownership_handoff) > text.index('/opt/lehome-challenge/.venv/bin/lerobot-train --config_path=configs/train_groot.yaml')
+    assert 'find "$upstream_output" "$eagle_home" "$staging_root" ! -user "$(id -u)" -print -quit' in text
     assert text.index('export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"') < text.index('/opt/lehome-challenge/.venv/bin/lerobot-train --config_path=configs/train_groot.yaml')
     assert 'eagle_asset_source="$(readlink -f "$eagle_snapshot/$eagle_asset")"' in text
     assert '[[ "$eagle_asset_source" == "$eagle_repository/blobs/"* ]]' in text

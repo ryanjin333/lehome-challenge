@@ -410,7 +410,6 @@ with os.fdopen(fd, "w", encoding="ascii") as stream:
 source.unlink()
 PY
 sudo -n docker run --rm -i --pull never --gpus all --network none \
-  --user "$(id -u):$(id -g)" \
   --tmpfs "/flash:rw,exec,size=2g,mode=700,uid=$(id -u),gid=$(id -g)" \
   --mount "type=bind,src=$root,dst=$root,readonly" \
   --mount "type=bind,src=$staging_root,dst=$staging_root" \
@@ -548,7 +547,6 @@ cd "$source_root"; export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$
 HF_LEROBOT_HOME="$eagle_home/lerobot"
 export HF_HOME HF_LEROBOT_HOME HF_HUB_OFFLINE HF_HUB_CACHE
 sudo -n docker run --rm -i --pull never --gpus all --network none \
-  --user "$(id -u):$(id -g)" \
   --tmpfs "/flash:rw,exec,size=2g,mode=700,uid=$(id -u),gid=$(id -g)" \
   --mount "type=bind,src=$source_root,dst=$source_root" \
   --mount "type=bind,src=$staging_root,dst=$staging_root" \
@@ -574,6 +572,10 @@ export HF_HOME="$eagle_home" HF_LEROBOT_HOME="$eagle_home/lerobot" HF_HUB_OFFLIN
 PYTHONPATH="/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl" /opt/lehome-challenge/.venv/bin/lerobot-train --config_path=configs/train_groot.yaml --wandb.mode=offline
 CONTAINER
 test -d "$upstream_output" && test ! -L "$upstream_output"
+test -d "$eagle_home" && test ! -L "$eagle_home"
+test -d "$staging_root" && test ! -L "$staging_root"
+sudo -n chown -R --no-dereference "$(id -u):$(id -g)" "$upstream_output" "$eagle_home" "$staging_root"
+test -z "$(find "$upstream_output" "$eagle_home" "$staging_root" ! -user "$(id -u)" -print -quit)"
 find "$eagle_home" -depth -type f -delete
 find "$eagle_home" -depth -type d -empty -delete
 test ! -e "$eagle_home"
