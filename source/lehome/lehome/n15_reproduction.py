@@ -608,6 +608,54 @@ def _load_receipt(path: Path | str, label: str) -> tuple[Path, bytes, dict[str, 
     return safe, payload, value
 
 
+def resolve_dataset_blobs_mount(
+    *,
+    resolved_snapshots_receipt: Path | str,
+    expected_dataset_root: Path | str,
+    protected_root: Path | str = "/mnt/lehome",
+    contract: ReproductionContract = CONTRACT,
+) -> Path:
+    """Return the canonical Hub blobs directory needed by staged dataset links."""
+
+    _, _, value = _load_receipt(resolved_snapshots_receipt, "resolved snapshots receipt")
+    dataset = value.get("dataset")
+    if not isinstance(dataset, dict):
+        raise ReproductionError("resolved snapshots receipt lacks the dataset identity")
+    if (
+        dataset.get("repository") != contract.dataset_repository
+        or dataset.get("revision") != contract.dataset_revision
+    ):
+        raise ReproductionError("resolved dataset identity mismatch")
+    raw_root = Path(str(dataset.get("root", "")))
+    raw_snapshot = Path(str(dataset.get("snapshot_root", "")))
+    root = _regular_directory(raw_root, "staged dataset root")
+    snapshot = _regular_directory(raw_snapshot, "dataset Hub snapshot root")
+    if raw_root != root or raw_snapshot != snapshot:
+        raise ReproductionError("resolved dataset paths must be canonical")
+    expected = _regular_directory(Path(expected_dataset_root), "expected staged dataset root")
+    if root != expected:
+        raise ReproductionError("resolved dataset root mismatch")
+    expected_repository = "datasets--" + contract.dataset_repository.replace("/", "--")
+    if (
+        snapshot.name != contract.dataset_revision
+        or snapshot.parent.name != "snapshots"
+        or snapshot.parent.parent.name != expected_repository
+    ):
+        raise ReproductionError("resolved dataset snapshot path mismatch")
+    blobs = _regular_directory(snapshot.parent.parent / "blobs", "dataset Hub blobs root")
+    protected = _regular_directory(Path(protected_root), "protected workspace root")
+    try:
+        relative = blobs.relative_to(protected)
+    except ValueError:
+        raise ReproductionError("dataset Hub blobs root escapes the protected workspace") from None
+    if not relative.parts:
+        raise ReproductionError("dataset Hub blobs root is not a strict protected child")
+    text = str(blobs)
+    if any(character in text for character in "\r\n,"):
+        raise ReproductionError("dataset Hub blobs root is unsafe for a container bind")
+    return blobs
+
+
 def _safe_relative_file(root: Path, relative: str, label: str) -> Path:
     pure = PurePosixPath(relative)
     if pure.is_absolute() or not pure.parts or any(part in {"", ".", ".."} for part in pure.parts):

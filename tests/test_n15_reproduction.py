@@ -390,6 +390,51 @@ def _materialize_snapshots(tmp_path: Path, checkout: Path) -> tuple[Path, Path, 
     return model, dataset, receipt_path
 
 
+def test_resolve_dataset_blobs_mount_returns_verified_canonical_path(tmp_path: Path) -> None:
+    from lehome import n15_reproduction as reproduction
+
+    checkout, _ = _materialize_source(tmp_path)
+    _, dataset, receipt_path = _materialize_snapshots(tmp_path, checkout)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    snapshot = Path(receipt["dataset"]["snapshot_root"])
+
+    assert reproduction.resolve_dataset_blobs_mount(
+        resolved_snapshots_receipt=receipt_path,
+        expected_dataset_root=dataset,
+        protected_root=tmp_path,
+    ) == snapshot.parent.parent / "blobs"
+
+
+@pytest.mark.parametrize("alias_kind", ["traversal", "symlink_ancestor"])
+def test_resolve_dataset_blobs_mount_rejects_noncanonical_aliases(
+    tmp_path: Path, alias_kind: str
+) -> None:
+    from lehome import n15_reproduction as reproduction
+
+    checkout, _ = _materialize_source(tmp_path)
+    _, dataset, receipt_path = _materialize_snapshots(tmp_path, checkout)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    snapshot = Path(receipt["dataset"]["snapshot_root"])
+    if alias_kind == "traversal":
+        receipt["dataset"]["snapshot_root"] = str(
+            snapshot.parent / ".." / snapshot.parent.name / snapshot.name
+        )
+    else:
+        alias = tmp_path / "hub-alias"
+        alias.symlink_to(snapshot.parents[2], target_is_directory=True)
+        receipt["dataset"]["snapshot_root"] = str(
+            alias.joinpath(*snapshot.relative_to(snapshot.parents[2]).parts)
+        )
+    receipt_path.write_bytes(_canonical(receipt))
+
+    with pytest.raises(reproduction.ReproductionError, match="canonical"):
+        reproduction.resolve_dataset_blobs_mount(
+            resolved_snapshots_receipt=receipt_path,
+            expected_dataset_root=dataset,
+            protected_root=tmp_path,
+        )
+
+
 def _fixture_contract(checkout: Path):
     from dataclasses import replace
     from lehome.n15_reproduction import (

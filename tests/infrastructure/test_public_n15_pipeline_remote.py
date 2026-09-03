@@ -139,6 +139,10 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'with zipfile.ZipFile(lerobot_wheel) as archive:' in text
     assert "import lerobot.scripts.lerobot_train" in text
     assert '--mount "type=bind,src=$hf_cache,dst=$hf_cache,readonly"' in text
+    assert 'dataset_blobs="$(' in text
+    assert "from lehome.n15_reproduction import resolve_dataset_blobs_mount" in text
+    assert "print(resolve_dataset_blobs_mount(" in text
+    assert '--mount "type=bind,src=$dataset_blobs,dst=$dataset_blobs,readonly"' in text
     assert '--mount "type=bind,src=$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl,dst=/runtime/lerobot-0.4.3-py3-none-any.whl,readonly"' in text
     assert 'find "$eagle_home" -depth -type f -delete' in text
     assert 'flash-attention-runtime-receipt.json' in text

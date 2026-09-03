@@ -528,6 +528,20 @@ with output.open("x", encoding="ascii") as stream: stream.write(json.dumps(value
 os.chmod(output, 0o444)
 PY
 python3 "$root/scripts/run_public_n15_reproduction.py" render-training --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --output "$staging_root/evidence/execution-manifest.json" >/dev/null
+dataset_blobs="$("$python_bin" - "$root/source/lehome" "$snapshots" "$source_root/Datasets/example/four_types_merged" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from lehome.n15_reproduction import resolve_dataset_blobs_mount
+
+print(resolve_dataset_blobs_mount(
+    resolved_snapshots_receipt=Path(sys.argv[2]),
+    expected_dataset_root=Path(sys.argv[3]),
+))
+PY
+)"
+test -d "$dataset_blobs" && test ! -L "$dataset_blobs"
 eagle_repository="$hf_cache/models--lerobot--eagle2hg-processor-groot-n1p5"
 eagle_snapshot="$eagle_repository/snapshots/baf604d8a5caf26fda5cc545f141bc1814156237"
 test -d "$eagle_snapshot" && test ! -L "$eagle_snapshot"
@@ -555,6 +569,7 @@ sudo -n docker run --rm -i --pull never --gpus all --network none \
   --mount "type=bind,src=$source_root,dst=$source_root" \
   --mount "type=bind,src=$staging_root,dst=$staging_root" \
   --mount "type=bind,src=$hf_cache,dst=$hf_cache,readonly" \
+  --mount "type=bind,src=$dataset_blobs,dst=$dataset_blobs,readonly" \
   --mount "type=bind,src=$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl,dst=/runtime/lerobot-0.4.3-py3-none-any.whl,readonly" \
   --mount "type=bind,src=/mnt/lehome/reference-native/dependencies,dst=/deps,readonly" \
   --entrypoint bash "$runtime_image_id" -s -- "$source_root" "$eagle_home" "$hf_cache" "$staging_root" <<'CONTAINER' 2>&1 | tee "$staging_root/logs/train.log"
