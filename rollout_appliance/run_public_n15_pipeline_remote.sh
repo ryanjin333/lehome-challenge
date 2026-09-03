@@ -875,6 +875,25 @@ print("harvest" if focused_complete else "focused_gate" if training_complete els
 PY
 }
 
+advance_paid_stage_admission_from_host_seals() {
+  local completed="$1" expected_current expected_next current next
+  current="$PRESTART_ADMITTED_STAGE"
+  case "$completed" in
+    training) expected_current=train; expected_next=focused_gate ;;
+    focused) expected_current=focused_gate; expected_next=harvest ;;
+    *) fail "unknown completed stage admission transition" ;;
+  esac
+  next="$(host_next_unfinished_stage)" \
+    || fail "host-sealed stage transition is invalid"
+  if [[ -z "$current" || "$current" == "$expected_current" ]]; then
+    [[ "$next" == "$expected_next" ]] \
+      || fail "host-sealed stage transition skipped or regressed"
+  elif [[ "$current" != "$next" ]]; then
+    fail "host-sealed stage transition drifted from pre-start admission"
+  fi
+  PRESTART_ADMITTED_STAGE="$next"
+}
+
 record_host_stage_completion() {
   local stage="$1" output="$2" temporary_root index remote_path
   shift 2
@@ -1607,11 +1626,13 @@ run_pipeline_after_runtime() {
   verify_remote_training_publication || fail "training publication chain failed"
   record_host_stage_completion training "$HOST_TRAINING_STAGE_RECEIPT" \
     "$TRAINING_IDENTITY_RECEIPT" "$TRAINING_PUBLICATION_RECEIPT"
+  advance_paid_stage_admission_from_host_seals training
   if ! remote_file_exists "$FOCUSED_PROMOTION_RECEIPT"; then run_paid_stage focused_gate "$FOCUSED_TIMEOUT_SECONDS" focused_stage; fi
   verify_remote_focused_chain || fail "focused receipt chain failed"
   record_host_stage_completion focused "$HOST_FOCUSED_STAGE_RECEIPT" \
     "$FOCUSED_OUTPUT_ROOT/comparison-receipt.json" \
     "$FOCUSED_OUTPUT_ROOT/publication.json" "$FOCUSED_PROMOTION_RECEIPT"
+  advance_paid_stage_admission_from_host_seals focused
   if [[ ! -e "$HARVEST_TERMINAL_RECEIPT" ]]; then
     if ! remote_file_exists "$REMOTE_PIPELINE_ROOT/harvest.publication.json"; then
       run_paid_stage harvest "$HARVEST_TIMEOUT_SECONDS" harvest_stage

@@ -940,6 +940,7 @@ remote_file_exists() {
 }
 run_paid_stage() { printf '%s\n' "$1" >> "$FAKE_TRACE"; }
 record_host_stage_completion() { :; }
+advance_paid_stage_admission_from_host_seals() { PRESTART_ADMITTED_STAGE=""; }
 verify_remote_training_chain() { return 0; }
 verify_remote_training_publication() { return 0; }
 verify_remote_focused_chain() { return 0; }
@@ -1238,6 +1239,7 @@ def test_main_explicit_resume_adopts_identity_only_completion_before_publication
         "LEHOME_N15_RESUME_CHECKPOINT": "/mnt/source/outputs/train/groot_four_types_merged_batch64_lr2e-4/checkpoints/001500",
     })
     trace = tmp_path / "trace"; publication = tmp_path / "publication"
+    focused = tmp_path / "focused"; harvest = tmp_path / "harvest"
     harness = r'''
 source "$WRAPPER_PATH"
 verify_conservative_task_budget() { :; }
@@ -1250,13 +1252,20 @@ wait_for_remote_runtime() { :; }
 remote_file_exists() {
   [[ "$1" == "$TRAINING_IDENTITY_RECEIPT" ]] && return 0
   [[ "$1" == "$TRAINING_PUBLICATION_RECEIPT" && -f "$PUBLICATION" ]] && return 0
+  [[ "$1" == "$FOCUSED_PROMOTION_RECEIPT" && -f "$FOCUSED_STATE" ]] && return 0
+  [[ "$1" == "$REMOTE_PIPELINE_ROOT/harvest.publication.json" && -f "$HARVEST_STATE" ]] && return 0
   return 1
 }
 verify_remote_training_chain() { printf 'verify-identity\n' >> "$TRACE"; }
 publish_training_readback() { printf 'publish\n' >> "$TRACE"; touch "$PUBLICATION"; }
 verify_remote_training_publication() { test -f "$PUBLICATION"; printf 'verify-publication\n' >> "$TRACE"; }
-record_host_stage_completion() { printf 'seal:%s\n' "$1" >> "$TRACE"; }
-run_paid_stage() { printf 'paid:%s\n' "$1" >> "$TRACE"; return 77; }
+focused_stage() { printf 'paid:focused_gate\n' >> "$TRACE"; touch "$FOCUSED_STATE"; }
+harvest_stage() { printf 'paid:harvest\n' >> "$TRACE"; touch "$HARVEST_STATE"; }
+train_stage() { printf 'paid:train\n' >> "$TRACE"; return 91; }
+verify_remote_focused_chain() { test -f "$FOCUSED_STATE"; }
+verify_remote_harvest_chain() { test -f "$HARVEST_STATE"; }
+fetch_remote_immutable() { printf '{"remote":"%s"}\n' "$1" > "$2"; chmod 0444 "$2"; }
+finalize_host_harvest_terminal() { touch "$HARVEST_TERMINAL_RECEIPT"; }
 stop_exact_vm() { printf 'stop\n' >> "$TRACE"; }
 main
 '''
@@ -1264,16 +1273,24 @@ main
         ["bash", "-c", harness], cwd=ROOT,
         env={
             **env, "WRAPPER_PATH": str(WRAPPER), "TRACE": str(trace),
-            "PUBLICATION": str(publication),
+            "PUBLICATION": str(publication), "FOCUSED_STATE": str(focused),
+            "HARVEST_STATE": str(harvest),
         }, text=True, capture_output=True,
     )
-    assert result.returncode != 0
+    assert result.returncode == 0, (
+        result.stderr, trace.read_text(encoding="ascii") if trace.exists() else "no trace"
+    )
     assert trace.exists(), result.stderr
     lines = trace.read_text(encoding="ascii").splitlines()
     assert "paid:train" not in lines
     assert "publish" in lines, (lines, result.stderr)
-    assert lines.index("publish") < lines.index("verify-publication") < lines.index("seal:training")
-    assert lines.index("seal:training") < lines.index("paid:focused_gate")
+    assert lines.count("paid:focused_gate") == 1
+    assert lines.count("paid:harvest") == 1
+    assert lines.index("publish") < lines.index("verify-publication") < lines.index("paid:focused_gate")
+    assert lines.index("paid:focused_gate") < lines.index("paid:harvest")
+    pipeline = Path(env["LEHOME_N15_PIPELINE_ROOT"])
+    assert (pipeline / "host-stage-training-complete.json").is_file()
+    assert (pipeline / "host-stage-focused-complete.json").is_file()
 
 
 def test_completed_terminal_chain_is_processed_before_stale_stage_deadlines(
@@ -1816,6 +1833,7 @@ verify_remote_harvest_chain() { printf 'verify:harvest-1000\n' >> "$FAKE_TRACE";
 fetch_remote_immutable() { printf 'fetch\n' >> "$FAKE_TRACE"; touch "$2"; }
 stop_exact_vm() { printf 'stop\n' >> "$FAKE_TRACE"; }
 finalize_host_harvest_terminal() { printf 'finalize\n' >> "$FAKE_TRACE"; touch "$HARVEST_TERMINAL_RECEIPT"; }
+advance_paid_stage_admission_from_host_seals() { PRESTART_ADMITTED_STAGE=""; }
 python3() { return 0; }
 set +e
 ( set -e; run_pipeline_after_runtime )
@@ -2158,6 +2176,7 @@ verify_remote_training_publication() { :; }
 verify_remote_focused_chain() { :; }
 verify_remote_harvest_chain() { printf 'verify-harvest\n' >> "$TRACE"; }
 record_host_stage_completion() { :; }
+advance_paid_stage_admission_from_host_seals() { PRESTART_ADMITTED_STAGE=""; }
 publish_training_readback() { return 90; }
 run_paid_stage() { printf 'unexpected-paid:%s\n' "$1" >> "$TRACE"; return 91; }
 remote() { local source="${!#}"; cat "$REMOTE_STORE/${source##*/}"; }
