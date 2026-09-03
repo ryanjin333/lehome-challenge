@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import signal
 import shutil
 import stat
@@ -334,6 +335,10 @@ ln -s 012000 "$output/checkpoints/last"
         "FAKE_DATASET_BLOBS": str(
             Path(snapshots_value["dataset"]["snapshot_root"]).parents[1] / "blobs"
         ),
+        # Production recovery requires Linux openat2.  The real remote-train
+        # fixture is also exercised on macOS, where this narrowly scoped test
+        # switch permits the portable descriptor/scope assertions below.
+        "LEHOME_N15_TEST_ALLOW_UNSAFE_OPENAT2": "1",
         "LEHOME_N15_REMOTE_ROOT": str(ROOT),
         "LEHOME_N15_PUBLIC_SOURCE_ROOT": str(checkout),
         "LEHOME_N15_SOURCE_RECEIPT": str(source_receipt),
@@ -544,6 +549,71 @@ def test_completed_12k_recovery_rejects_a_symlinked_mount_escape_before_mutating
     assert trace.count("native:/opt/lehome-challenge/.venv/bin/lerobot-train") == 1
 
 
+def test_completed_12k_recovery_rejects_hardlinked_artifact_before_mutating(
+    tmp_path: Path,
+) -> None:
+    env, _contract, training, staging, upstream = _remote_train_fixture(tmp_path)
+    interrupted = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-hardlink", interrupt_point="after-trainer", complete=True,
+    )
+    assert interrupted.returncode == 130, interrupted.stderr
+    source = upstream / "checkpoints/012000/pretrained_model/model.safetensors"
+    external = tmp_path / "outside-hardlink"
+    os.link(source, external)
+    before = source.stat()
+    recovered = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-hardlink-recovery", complete=False,
+    )
+    assert recovered.returncode != 0
+    after = source.stat()
+    assert (before.st_uid, before.st_gid, before.st_ino, before.st_nlink) == (
+        after.st_uid, after.st_gid, after.st_ino, after.st_nlink
+    )
+    assert not training.exists() and upstream.is_dir() and staging.is_dir()
+    trace = Path(env["FAKE_TRACE"]).read_text(encoding="utf-8")
+    assert trace.count("native:/opt/lehome-challenge/.venv/bin/lerobot-train") == 1
+
+
+@pytest.mark.skipif(
+    platform.system() != "Linux" or os.geteuid() != 0,
+    reason="requires a Linux root mount namespace",
+)
+def test_linux_root_recovery_rejects_bind_mount_before_foreign_uid_mutation(
+    tmp_path: Path,
+) -> None:
+    """openat2 must reject a same-device bind mount before any fchown."""
+    if shutil.which("mount") is None or shutil.which("umount") is None:
+        pytest.skip("mount tools are unavailable")
+    env, _contract, training, staging, upstream = _remote_train_fixture(tmp_path)
+    interrupted = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-linux-bind", interrupt_point="after-trainer", complete=True,
+    )
+    assert interrupted.returncode == 130, interrupted.stderr
+    foreign_uid = 65534
+    sentinel = upstream / "checkpoints/012000/pretrained_model/model.safetensors"
+    external = tmp_path / "external-bind-source"; external.mkdir()
+    external_sentinel = external / "must-not-chown"; external_sentinel.write_text("outside", encoding="ascii")
+    escape = upstream / "same-device-bind"; escape.mkdir()
+    sentinel.chown(foreign_uid, foreign_uid)
+    upstream.chown(foreign_uid, foreign_uid); upstream.chmod(0o700)
+    mounted = subprocess.run(["mount", "--bind", str(external), str(escape)], text=True, capture_output=True)
+    if mounted.returncode:
+        pytest.skip(f"bind mount unavailable: {mounted.stderr.strip()}")
+    try:
+        result = _run_actual_remote_train_stage(
+            env, attempt_id="attempt-linux-bind-recovery", complete=False,
+        )
+        assert result.returncode != 0
+        assert sentinel.stat().st_uid == foreign_uid
+        assert external_sentinel.stat().st_uid == 0
+        assert not training.exists()
+        assert Path(env["FAKE_TRACE"]).read_text(encoding="utf-8").count(
+            "native:/opt/lehome-challenge/.venv/bin/lerobot-train"
+        ) == 1
+    finally:
+        subprocess.run(["umount", str(escape)], check=True)
+
+
 def test_completed_12k_canonical_unsealed_topology_is_sealed_without_retraining(
     tmp_path: Path,
 ) -> None:
@@ -568,7 +638,15 @@ def test_completed_12k_canonical_unsealed_topology_is_sealed_without_retraining(
     sudo_trace = tmp_path / "canonical-sudo-argv.json"
 
     recovered = _run_actual_remote_train_stage(
-        {**env, "FAKE_SUDO_TRACE": str(sudo_trace)},
+        {
+                **env,
+                "FAKE_SUDO_TRACE": str(sudo_trace),
+                "LEHOME_N15_RECOVER_COMPLETED_12K": "1",
+                "LEHOME_N15_RESUME_PARTIAL": "0",
+                "LEHOME_N15_RESUME_STEP": "",
+                "LEHOME_N15_RESUME_CHECKPOINT": "",
+                "LEHOME_N15_RESUME_ATTEMPT_ID": "",
+        },
         attempt_id="attempt-canonical-unsealed-recovery", complete=False,
     )
 
@@ -579,6 +657,81 @@ def test_completed_12k_canonical_unsealed_topology_is_sealed_without_retraining(
     assert json.loads(sudo_trace.read_text(encoding="utf-8"))[7] == "canonical"
     trace = Path(env["FAKE_TRACE"]).read_text(encoding="utf-8")
     assert trace.count("native:/opt/lehome-challenge/.venv/bin/lerobot-train") == 1
+
+
+def test_recovery_only_mode_rejects_absent_canonical_output_without_trainer(
+    tmp_path: Path,
+) -> None:
+    env, _contract, training, staging, upstream = _remote_train_fixture(tmp_path)
+    # The normal partial tree is deliberately not an admissible recovery-only
+    # topology.  A production restart must stop/fail rather than using it to
+    # enter the ordinary resume/fresh trainer path.
+    result = _run_actual_remote_train_stage(
+        {**env, "LEHOME_N15_RECOVER_COMPLETED_12K": "1"},
+        attempt_id="attempt-recovery-only-absent", complete=False,
+    )
+    assert result.returncode != 0
+    assert not training.exists() and staging.is_dir() and upstream.is_dir()
+    assert not Path(env["FAKE_TRACE"]).exists()
+
+
+def test_recovery_only_main_bypasses_only_expired_train_stage_deadline(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, "n15-recovery-expired-train")
+    env["LEHOME_N15_RECOVER_COMPLETED_12K"] = "1"
+    pipeline = Path(env["LEHOME_N15_PIPELINE_ROOT"])
+    module = _load_cli()
+    plan = pipeline / "lifecycle-plan.json"
+    assert module.main([
+        "lifecycle-plan", "--run-id", env["LEHOME_N15_RUN_ID"],
+        "--repository", env["LEHOME_N15_PUBLIC_HF_REPOSITORY"],
+        "--remote-pipeline-root", env["LEHOME_N15_REMOTE_PIPELINE_ROOT"],
+        "--budget-usd", "100", "--estimated-cost-usd", "72", "--output", str(plan),
+    ]) == 0
+    digest = hashlib.sha256(plan.read_bytes()).hexdigest()
+    now = int(time.time())
+    paid = {
+        "schema_version": 1, "kind": "lehome_public_n15_paid_deadline_v1",
+        "run_id": env["LEHOME_N15_RUN_ID"], "lifecycle_plan_sha256": digest,
+        "started_unix_seconds": now - 60, "deadline_unix_seconds": now + 86340,
+    }
+    train = {
+        "schema_version": 1, "kind": "lehome_public_n15_stage_deadline_v1",
+        "run_id": env["LEHOME_N15_RUN_ID"], "stage": "train",
+        "lifecycle_plan_sha256": digest, "started_unix_seconds": now - 43201,
+        "deadline_unix_seconds": now - 1,
+    }
+    for path, value in ((pipeline / "paid-deadline.json", paid), (pipeline / "stage-train-deadline.json", train)):
+        path.write_bytes(_canonical_json_bytes(value)); path.chmod(0o444)
+    trace = tmp_path / "trace"
+    harness = r'''
+source "$WRAPPER_PATH"
+acquire_controller_lock() { :; }
+release_controller_lock() { :; }
+host_next_unfinished_stage() { printf 'train\n'; }
+initialize_stage_deadline() { printf 'stage-deadline:%s\n' "$1" >> "$TRACE"; return 88; }
+capture_exact_provider_state() { printf 'provider-read:%s\n' "$1" >> "$TRACE"; : > "$2"; }
+nebius() { printf 'provider-start\n' >> "$TRACE"; }
+run_aggregate_supervised_lifecycle() { printf 'recovery-lifecycle:%s\n' "$PRESTART_ADMITTED_STAGE" >> "$TRACE"; train_stage; }
+train_stage() { printf 'recovery-authentication-failed-no-trainer\n' >> "$TRACE"; return 91; }
+stop_exact_vm() { printf 'provider-stop\n' >> "$TRACE"; }
+main
+'''
+    result = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={**env, "WRAPPER_PATH": str(WRAPPER), "TRACE": str(trace)},
+        text=True, capture_output=True,
+    )
+    assert result.returncode != 0
+    lines = trace.read_text(encoding="ascii").splitlines()
+    assert "stage-deadline:train" not in lines
+    assert "provider-start" in lines
+    assert "recovery-lifecycle:completed_12k_recovery" in lines
+    assert "recovery-authentication-failed-no-trainer" in lines
+    assert lines[-1] == "provider-stop"
+    assert (pipeline / "stage-train-deadline.json").read_bytes() == _canonical_json_bytes(train)
 
 
 def test_lifecycle_plan_is_immutable_and_has_exact_paid_stage_order(tmp_path: Path) -> None:
@@ -634,9 +787,10 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'PROTECTED_DISK_ID="computedisk-u00pbe55crxy7jr56x"' in text
     assert 'EXACT_IMAGE_ID="computeimage-u00zf6w3yf72gakhcy"' in text
     assert 'RUNTIME_IMAGE_ID="sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"' in text
-    assert '"$LEROBOT_WHEEL" "$RUNTIME_IMAGE_ID" "$RESUME_PARTIAL" "$RESUME_CHECKPOINT" "$RESUME_STEP" "$RESUME_ATTEMPT_ID" <<\'SH\'' in text
+    assert '"$LEROBOT_WHEEL" "$RUNTIME_IMAGE_ID" "$RESUME_PARTIAL" "$RESUME_CHECKPOINT" "$RESUME_STEP" "$RESUME_ATTEMPT_ID" "$RECOVER_COMPLETED_12K" <<\'SH\'' in text
     assert 'runtime_image_id="${12}"' in text
-    assert " LEROBOT_WHEEL RUNTIME_IMAGE_ID RESUME_PARTIAL RESUME_CHECKPOINT RESUME_STEP RESUME_ATTEMPT_ID ASSETS_ROOT" in text
+    assert 'recovery_only="${17}"' in text
+    assert " LEROBOT_WHEEL RUNTIME_IMAGE_ID RESUME_PARTIAL RESUME_CHECKPOINT RESUME_STEP RESUME_ATTEMPT_ID RECOVER_COMPLETED_12K ASSETS_ROOT" in text
     assert "LEHOME_N15_EXPECTED_IMAGE_ID" not in text
     assert "nebius compute instance start --id" in text
     assert "nebius compute instance stop --id" in text

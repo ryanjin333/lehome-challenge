@@ -46,6 +46,10 @@ readonly RESUME_PARTIAL="${LEHOME_N15_RESUME_PARTIAL:-0}"
 readonly RESUME_CHECKPOINT="${LEHOME_N15_RESUME_CHECKPOINT:-}"
 readonly RESUME_STEP="${LEHOME_N15_RESUME_STEP:-}"
 readonly RESUME_ATTEMPT_ID="${LEHOME_N15_RESUME_ATTEMPT_ID:-}"
+# This is intentionally an opt-in, one-purpose admission.  It exists only to
+# seal the preserved 12K output after a post-training controller crash; it is
+# never a synonym for a fresh or partial training retry.
+readonly RECOVER_COMPLETED_12K="${LEHOME_N15_RECOVER_COMPLETED_12K:-0}"
 readonly ASSETS_ROOT="${LEHOME_OFFICIAL_ASSETS_ROOT:-}"
 readonly METADATA_ROOT="${LEHOME_OFFICIAL_METADATA_ROOT:-}"
 readonly REFERENCE_CHECKPOINT="${LEHOME_N15_REFERENCE_CHECKPOINT:-}"
@@ -589,14 +593,23 @@ run_paid_stage() {
     fail "$label is not the host-sealed next unfinished stage"
   fi
   aggregate_deadline="$(initialize_deadline)" || fail "aggregate paid deadline is invalid"
-  stage_deadline="$(initialize_stage_deadline "$label" "$limit_seconds" "$aggregate_deadline")" || fail "$label deadline receipt is invalid"
-  (( stage_deadline <= aggregate_deadline )) || fail "$label deadline exceeds aggregate deadline"
   now="$(date +%s)"
+  if [[ "$label" == completed_12k_recovery ]]; then
+    # Never mint or replace a train-stage receipt here: the one historical
+    # receipt is expired and immutable.  The aggregate paid deadline is still
+    # binding, and train_stage itself accepts only the exact canonical 12K
+    # topology before it can return success.
+    [[ "$RECOVER_COMPLETED_12K" == 1 ]] || fail "completed-output recovery requires explicit admission"
+    stage_deadline="$aggregate_deadline"
+  else
+    stage_deadline="$(initialize_stage_deadline "$label" "$limit_seconds" "$aggregate_deadline")" || fail "$label deadline receipt is invalid"
+    (( stage_deadline <= aggregate_deadline )) || fail "$label deadline exceeds aggregate deadline"
+  fi
   (( now < stage_deadline )) || fail "$label has no remaining paid time"
   # macOS has no external ``setsid``. This tiny controller-owned Python
   # launcher creates the session before execing an allowlisted Bash dispatcher.
   export -f remote train_stage focused_stage harvest_stage
-  export REMOTE_ROOT SSH_TARGET HF_TOKEN_FILE RUNTIME_REVISION SOURCE_ROOT SOURCE_RECEIPT SNAPSHOTS_RECEIPT TRAINING_ROOT EXACT_VM_ID PROTECTED_DISK_ID TRAINING_HF_CACHE TRAINING_PYTHON TRAINING_UV LEROBOT_WHEEL RUNTIME_IMAGE_ID RESUME_PARTIAL RESUME_CHECKPOINT RESUME_STEP RESUME_ATTEMPT_ID ASSETS_ROOT METADATA_ROOT REFERENCE_CHECKPOINT REFERENCE_SANITIZED_CONFIG REFERENCE_COMPATIBILITY NATIVE_RUNTIME_EVIDENCE NATIVE_DEPENDENCIES FOCUSED_HF_CACHE FOCUSED_OUTPUT_ROOT PUBLIC_REPOSITORY ROLLOUT_IMAGE_RECEIPT REMOTE_PIPELINE_ROOT
+  export REMOTE_ROOT SSH_TARGET HF_TOKEN_FILE RUNTIME_REVISION SOURCE_ROOT SOURCE_RECEIPT SNAPSHOTS_RECEIPT TRAINING_ROOT EXACT_VM_ID PROTECTED_DISK_ID TRAINING_HF_CACHE TRAINING_PYTHON TRAINING_UV LEROBOT_WHEEL RUNTIME_IMAGE_ID RESUME_PARTIAL RESUME_CHECKPOINT RESUME_STEP RESUME_ATTEMPT_ID RECOVER_COMPLETED_12K ASSETS_ROOT METADATA_ROOT REFERENCE_CHECKPOINT REFERENCE_SANITIZED_CONFIG REFERENCE_COMPATIBILITY NATIVE_RUNTIME_EVIDENCE NATIVE_DEPENDENCIES FOCUSED_HF_CACHE FOCUSED_OUTPUT_ROOT PUBLIC_REPOSITORY ROLLOUT_IMAGE_RECEIPT REMOTE_PIPELINE_ROOT
   launcher_root="$(mktemp -d "$PIPELINE_ROOT/.stage-launcher-${label}.XXXXXX")"
   launcher_ready="$launcher_root/ready"
   launcher_ack="$launcher_root/ack"
@@ -1130,7 +1143,12 @@ advance_paid_stage_admission_from_host_seals() {
   local completed="$1" expected_current expected_next current next
   current="$PRESTART_ADMITTED_STAGE"
   case "$completed" in
-    training) expected_current=train; expected_next=focused_gate ;;
+    training)
+      # The recovery-only label is consumed by the same completed training
+      # seal.  It may not be used for any later stage transition.
+      if [[ "$current" == completed_12k_recovery ]]; then expected_current=completed_12k_recovery; else expected_current=train; fi
+      expected_next=focused_gate
+      ;;
     focused) expected_current=focused_gate; expected_next=harvest ;;
     *) fail "unknown completed stage admission transition" ;;
   esac
@@ -1378,9 +1396,9 @@ wait_for_remote_runtime() {
 }
 
 train_stage() {
-  remote bash -s -- "$REMOTE_ROOT" "$SOURCE_ROOT" "$SOURCE_RECEIPT" "$SNAPSHOTS_RECEIPT" "$TRAINING_ROOT" "$EXACT_VM_ID" "$PROTECTED_DISK_ID" "$TRAINING_HF_CACHE" "$TRAINING_PYTHON" "$TRAINING_UV" "$LEROBOT_WHEEL" "$RUNTIME_IMAGE_ID" "$RESUME_PARTIAL" "$RESUME_CHECKPOINT" "$RESUME_STEP" "$RESUME_ATTEMPT_ID" <<'SH'
+  remote bash -s -- "$REMOTE_ROOT" "$SOURCE_ROOT" "$SOURCE_RECEIPT" "$SNAPSHOTS_RECEIPT" "$TRAINING_ROOT" "$EXACT_VM_ID" "$PROTECTED_DISK_ID" "$TRAINING_HF_CACHE" "$TRAINING_PYTHON" "$TRAINING_UV" "$LEROBOT_WHEEL" "$RUNTIME_IMAGE_ID" "$RESUME_PARTIAL" "$RESUME_CHECKPOINT" "$RESUME_STEP" "$RESUME_ATTEMPT_ID" "$RECOVER_COMPLETED_12K" <<'SH'
 set -euo pipefail
-root="$1"; source_root="$2"; source_receipt="$3"; snapshots="$4"; training_root="$5"; vm_id="$6"; disk_id="$7"; hf_cache="$8"; python_bin="$9"; uv_bin="${10}"; wheel="${11}"; runtime_image_id="${12}"; resume_partial="${13}"; resume_checkpoint="${14}"; resume_step="${15}"; resume_attempt_id="${16}"
+root="$1"; source_root="$2"; source_receipt="$3"; snapshots="$4"; training_root="$5"; vm_id="$6"; disk_id="$7"; hf_cache="$8"; python_bin="$9"; uv_bin="${10}"; wheel="${11}"; runtime_image_id="${12}"; resume_partial="${13}"; resume_checkpoint="${14}"; resume_step="${15}"; resume_attempt_id="${16}"; recovery_only="${17}"
 upstream_output="$source_root/outputs/train/groot_four_types_merged_batch64_lr2e-4"
 staging_root="${training_root}.evidence-staging"
 resume_name=""
@@ -1406,7 +1424,7 @@ repair_completed_output_ownership() {
   ! pgrep -f '/opt/lehome-challenge/.venv/bin/lerobot-train([[:space:]]|$)' >/dev/null
   ! pgrep -f "$root/rollout_appliance/run_public_n15_pipeline_remote.sh" >/dev/null
   sudo -n python3 - "$source_root" "$training_root" "$staging_root" "$upstream_output" "$topology" "$(id -u)" "$(id -g)" <<'PY'
-import os, stat, sys
+import ctypes, errno, os, platform, resource, stat, sys
 from pathlib import Path
 
 source, training, staging, upstream = map(Path, sys.argv[1:5])
@@ -1462,24 +1480,104 @@ if any(metadata.st_dev != parent_metadata.st_dev for _, _, metadata, _ in target
 expected_device = parent_metadata.st_dev
 directory_flag = getattr(os, "O_DIRECTORY", 0)
 nofollow = os.O_NOFOLLOW
+cloexec = getattr(os, "O_CLOEXEC", 0)
+
+# A same-device bind mount is not distinguishable with st_dev.  Linux
+# openat2's RESOLVE_NO_XDEV makes the kernel reject both mount crossings and
+# symlink traversal while resolving every mutable entry below the exact root.
+# Never silently degrade this in production.  The narrowly scoped test
+# fallback is required only for portable unit tests on macOS.
+TEST_FALLBACK = (
+    os.environ.get("LEHOME_N15_TEST_ALLOW_UNSAFE_OPENAT2") == "1"
+    and os.environ.get("PYTEST_CURRENT_TEST", "").startswith(
+        "tests/infrastructure/test_public_n15_pipeline_remote.py::"
+    )
+)
+RESOLVE_NO_XDEV = 0x01
+RESOLVE_NO_SYMLINKS = 0x04
+RESOLVE_BENEATH = 0x08
+AT_EMPTY_PATH = 0x1000
+AT_SYMLINK_NOFOLLOW = 0x100
+
+class OpenHow(ctypes.Structure):
+    _fields_ = [("flags", ctypes.c_ulonglong), ("mode", ctypes.c_ulonglong), ("resolve", ctypes.c_ulonglong)]
+
+libc = ctypes.CDLL(None, use_errno=True)
+openat2_number = 437 if platform.machine().lower() in {"x86_64", "amd64", "aarch64", "arm64"} else None
+
+def openat2(parent, name, flags):
+    if openat2_number is None or platform.system() != "Linux":
+        if TEST_FALLBACK:
+            return os.open(name, flags | nofollow, dir_fd=parent)
+        raise SystemExit("safe completed-output ownership repair requires Linux openat2")
+    how = OpenHow(flags | nofollow | cloexec, 0, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV)
+    result = libc.syscall(openat2_number, parent, os.fsencode(name), ctypes.byref(how), ctypes.sizeof(how))
+    if result < 0:
+        error = ctypes.get_errno()
+        if error in {errno.ENOSYS, errno.EINVAL}:
+            raise SystemExit("safe completed-output ownership repair requires Linux openat2")
+        raise OSError(error, os.strerror(error), name)
+    return result
 
 def same_entry(before, after):
-    return (
-        before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode)
-    ) == (
-        after.st_dev, after.st_ino, stat.S_IFMT(after.st_mode)
-    )
+    return (before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode)) == (after.st_dev, after.st_ino, stat.S_IFMT(after.st_mode))
+
+def require_safe_name(name):
+    if name in {"", ".", ".."} or "/" in name:
+        raise SystemExit("completed-output ownership repair entry is unsafe")
 
 def open_directory(parent, name):
+    require_safe_name(name)
     before = os.stat(name, dir_fd=parent, follow_symlinks=False)
     if not stat.S_ISDIR(before.st_mode) or before.st_dev != expected_device:
         raise SystemExit("completed-output ownership repair entry is unsafe")
-    descriptor = os.open(name, os.O_RDONLY | directory_flag | nofollow, dir_fd=parent)
+    descriptor = openat2(parent, name, os.O_RDONLY | directory_flag)
     after = os.fstat(descriptor)
-    if not same_entry(before, after):
+    if not same_entry(before, after) or after.st_dev != expected_device:
         os.close(descriptor)
         raise SystemExit("completed-output ownership repair entry changed")
     return descriptor
+
+def open_regular(parent, name):
+    require_safe_name(name)
+    before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or before.st_dev != expected_device or before.st_nlink != 1:
+        raise SystemExit("completed-output ownership repair entry is unsafe")
+    descriptor = openat2(parent, name, os.O_RDONLY)
+    after = os.fstat(descriptor)
+    if not same_entry(before, after) or after.st_dev != expected_device or after.st_nlink != 1:
+        os.close(descriptor)
+        raise SystemExit("completed-output ownership repair entry changed")
+    return descriptor
+
+def open_link(parent, name):
+    require_safe_name(name)
+    before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if not stat.S_ISLNK(before.st_mode) or before.st_dev != expected_device:
+        raise SystemExit("completed-output ownership repair entry is unsafe")
+    if TEST_FALLBACK and not hasattr(os, "O_PATH"):
+        # Portable unit tests cannot acquire a descriptor for a symlink inode.
+        # They still exercise exact argv/scope and link rejection; Linux
+        # production never reaches this branch.
+        return -1
+    # O_PATH + O_NOFOLLOW authenticates the link inode itself rather than its
+    # target.  The parent descriptor was already opened beneath the root.
+    descriptor = os.open(name, getattr(os, "O_PATH", os.O_RDONLY) | nofollow | cloexec, dir_fd=parent)
+    after = os.fstat(descriptor)
+    if not same_entry(before, after) or after.st_dev != expected_device:
+        os.close(descriptor)
+        raise SystemExit("completed-output ownership repair entry changed")
+    return descriptor
+
+def fchown_link(descriptor):
+    if platform.system() != "Linux":
+        if TEST_FALLBACK:
+            return
+        raise SystemExit("safe completed-output link ownership repair requires Linux")
+    result = libc.fchownat(descriptor, ctypes.c_char_p(b""), uid, gid, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW)
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
 
 def exact_completed_boundary(root):
     try:
@@ -1491,38 +1589,49 @@ def exact_completed_boundary(root):
             last = os.stat("last", dir_fd=checkpoints, follow_symlinks=False)
         except FileNotFoundError:
             return False
-        if not stat.S_ISLNK(last.st_mode):
-            return False
-        return os.readlink("last", dir_fd=checkpoints) == "012000"
+        return stat.S_ISLNK(last.st_mode) and os.readlink("last", dir_fd=checkpoints) == "012000"
     finally:
         os.close(checkpoints)
 
 opened_roots = []
+planned = []
 try:
+    # Open roots from the authenticated protected parent, not by a mutable
+    # absolute string.  RESOLVE_NO_XDEV rejects a root replaced by a bind mount.
     for label, path, metadata, allow_last in target_roots:
-        descriptor = os.open(path, os.O_RDONLY | directory_flag | nofollow)
-        current = os.fstat(descriptor)
-        if not same_entry(metadata, current) or current.st_dev != expected_device:
-            os.close(descriptor)
-            raise SystemExit("completed-output ownership repair root changed")
-        opened_roots.append((label, descriptor, allow_last))
+        parent_fd = os.open(path.parent, os.O_RDONLY | directory_flag | nofollow | cloexec)
+        try:
+            descriptor = open_directory(parent_fd, path.name)
+            current = os.fstat(descriptor)
+            if not same_entry(metadata, current) or current.st_dev != expected_device:
+                os.close(descriptor)
+                raise SystemExit("completed-output ownership repair root changed")
+            opened_roots.append((label, descriptor, allow_last))
+        finally:
+            os.close(parent_fd)
     if not exact_completed_boundary(opened_roots[0][1]):
         raise SystemExit(3)
 
-    def walk(parent, parts, *, allow_last, change_owner):
+    # Validate the whole graph first and retain only authenticated descriptors.
+    # This deliberately fails before the first fchown if a late unsafe entry,
+    # hardlink, or bind mount is found.
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit != resource.RLIM_INFINITY and soft_limit < 64:
+        raise SystemExit("completed-output ownership repair descriptor limit is unsafe")
+
+    def plan_entry(kind, relative, descriptor, metadata):
+        if soft_limit != resource.RLIM_INFINITY and len(planned) + len(opened_roots) + 16 >= soft_limit:
+            os.close(descriptor)
+            raise SystemExit("completed-output ownership repair cannot retain an authenticated tree")
+        planned.append((kind, relative, descriptor, metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)))
+
+    def validate_walk(parent, parts, *, allow_last):
         metadata = os.fstat(parent)
         if not stat.S_ISDIR(metadata.st_mode) or metadata.st_dev != expected_device:
             raise SystemExit("completed-output ownership repair crosses filesystems")
-        if change_owner:
-            os.fchown(parent, uid, gid)
-        elif metadata.st_uid != uid:
-            raise SystemExit("completed-output ownership repair did not take ownership")
-        # scandir() owns its supplied descriptor, so use a duplicate and retain
-        # the authenticated parent descriptor for all child operations.
         with os.scandir(os.dup(parent)) as entries:
             for entry in entries:
-                if entry.name in {"", ".", ".."} or "/" in entry.name:
-                    raise SystemExit("completed-output ownership repair entry is unsafe")
+                require_safe_name(entry.name)
                 relative = "/".join((*parts, entry.name))
                 metadata = entry.stat(follow_symlinks=False)
                 if metadata.st_dev != expected_device:
@@ -1530,39 +1639,52 @@ try:
                 if stat.S_ISLNK(metadata.st_mode):
                     if not (allow_last and relative == "checkpoints/last" and os.readlink(entry.name, dir_fd=parent) == "012000"):
                         raise SystemExit("completed-output ownership repair symlink is unsafe")
-                    if change_owner:
-                        os.chown(entry.name, uid, gid, dir_fd=parent, follow_symlinks=False)
-                    elif metadata.st_uid != uid:
-                        raise SystemExit("completed-output ownership repair did not take ownership")
-                    continue
-                if stat.S_ISDIR(metadata.st_mode):
+                    plan_entry("link", relative, open_link(parent, entry.name), metadata)
+                elif stat.S_ISDIR(metadata.st_mode):
                     child = open_directory(parent, entry.name)
-                    try:
-                        walk(child, (*parts, entry.name), allow_last=allow_last, change_owner=change_owner)
-                    finally:
-                        os.close(child)
-                    continue
-                if not stat.S_ISREG(metadata.st_mode):
+                    plan_entry("directory", relative, child, metadata)
+                    validate_walk(child, (*parts, entry.name), allow_last=allow_last)
+                elif stat.S_ISREG(metadata.st_mode):
+                    if metadata.st_nlink != 1:
+                        raise SystemExit("completed-output ownership repair regular hardlink is unsafe")
+                    plan_entry("regular", relative, open_regular(parent, entry.name), metadata)
+                else:
                     raise SystemExit("completed-output ownership repair entry is unsafe")
-                descriptor = os.open(entry.name, os.O_RDONLY | nofollow, dir_fd=parent)
-                try:
-                    current = os.fstat(descriptor)
-                    if not same_entry(metadata, current) or current.st_dev != expected_device:
-                        raise SystemExit("completed-output ownership repair entry changed")
-                    if change_owner:
-                        os.fchown(descriptor, uid, gid)
-                    elif current.st_uid != uid:
-                        raise SystemExit("completed-output ownership repair did not take ownership")
-                finally:
-                    os.close(descriptor)
 
-    for _, descriptor, allow_last in opened_roots:
-        walk(descriptor, (), allow_last=allow_last, change_owner=True)
-    for _, descriptor, allow_last in opened_roots:
-        walk(descriptor, (), allow_last=allow_last, change_owner=False)
+    for label, descriptor, allow_last in opened_roots:
+        root_metadata = os.fstat(descriptor)
+        planned.append(("directory", "", descriptor, root_metadata.st_dev, root_metadata.st_ino, stat.S_IFMT(root_metadata.st_mode)))
+        validate_walk(descriptor, (), allow_last=allow_last)
+
+    # Every descriptor in `planned` was authenticated before mutation.  A
+    # later pathname swap cannot redirect fchown outside this exact tree.
+    for kind, relative, descriptor, device, inode, mode in planned:
+        if kind == "link" and descriptor == -1 and TEST_FALLBACK:
+            continue
+        current = os.fstat(descriptor)
+        if (current.st_dev, current.st_ino, stat.S_IFMT(current.st_mode)) != (device, inode, mode):
+            raise SystemExit("completed-output ownership repair authenticated entry changed")
+        if kind == "link":
+            fchown_link(descriptor)
+        else:
+            os.fchown(descriptor, uid, gid)
+        current = os.fstat(descriptor)
+        if current.st_uid != uid or current.st_gid != gid:
+            raise SystemExit("completed-output ownership repair did not take ownership")
 finally:
+    closed = set()
+    for _, _, descriptor, *_ in planned:
+        if descriptor < 0:
+            continue
+        if descriptor not in closed:
+            closed.add(descriptor)
+            try: os.close(descriptor)
+            except OSError: pass
     for _, descriptor, _ in opened_roots:
-        os.close(descriptor)
+        if descriptor not in closed:
+            closed.add(descriptor)
+            try: os.close(descriptor)
+            except OSError: pass
 PY
 }
 has_exact_completed_12k_boundary() {
@@ -1613,6 +1735,26 @@ PY
 }
 if [[ -d "${training_root}.finalizing" || -f "$staging_root/training-finalization.json" || -f "${training_root}.finalizing/evidence/training-finalization.json" ]]; then
   python3 "$root/scripts/run_public_n15_reproduction.py" finalize-training-output \
+    --checkout "$source_root" --source-receipt "$source_receipt" \
+    --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" \
+    --training-root "$training_root" --staging-root "$staging_root" \
+    --upstream-output "$upstream_output" >/dev/null
+  exit 0
+fi
+# Recovery admission is deliberately checked before any generic topology
+# handling.  If the preserved canonical output is absent, incomplete, or
+# unsafe, this remote paid stage fails and the outer controller stops the VM;
+# it can never fall through into fresh or partial trainer invocation.
+if [[ "$recovery_only" == 1 ]]; then
+  [[ "$resume_partial" == 0 ]] || { echo "completed-output recovery forbids partial resume" >&2; exit 2; }
+  [[ -e "$training_root" && ! -L "$training_root" ]] \
+    || { echo "completed-output recovery canonical training root is absent or unsafe" >&2; exit 2; }
+  [[ ! -e "$upstream_output" && ! -L "$upstream_output" && ! -e "$staging_root" && ! -L "$staging_root" ]] \
+    || { echo "completed-output recovery topology is ambiguous" >&2; exit 2; }
+  repair_completed_output_ownership canonical
+  has_exact_completed_12k_boundary "$training_root" \
+    || { echo "completed-output recovery does not contain exact 012000 boundary" >&2; exit 2; }
+  python3 "$root/scripts/run_public_n15_reproduction.py" adopt-unsealed-training-output \
     --checkout "$source_root" --source-receipt "$source_receipt" \
     --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" \
     --training-root "$training_root" --staging-root "$staging_root" \
@@ -2609,7 +2751,13 @@ SH
 }
 
 run_pipeline_after_runtime() {
-  if ! remote_file_exists "$TRAINING_IDENTITY_RECEIPT"; then run_paid_stage train "$TRAIN_TIMEOUT_SECONDS" train_stage; fi
+  if ! remote_file_exists "$TRAINING_IDENTITY_RECEIPT"; then
+    if [[ "$RECOVER_COMPLETED_12K" == 1 ]]; then
+      run_paid_stage completed_12k_recovery "$TRAIN_TIMEOUT_SECONDS" train_stage
+    else
+      run_paid_stage train "$TRAIN_TIMEOUT_SECONDS" train_stage
+    fi
+  fi
   verify_remote_training_chain || fail "training receipt chain failed"
   if ! remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; then publish_training_readback || fail "training publication/readback failed"; fi
   verify_remote_training_publication || fail "training publication chain failed"
@@ -2655,12 +2803,20 @@ post_start_lifecycle() {
   wait_for_ssh_readiness || fail "exact VM did not become SSH-ready"
   wait_for_remote_runtime || fail "runtime/cloud-init/workspace/GPU/upstream gate failed"
   reconcile_remote_stage_seals
-  reconciled_stage="$(host_next_unfinished_stage)" \
-    || fail "reconciled host-sealed stage is invalid"
+  # A recovery-only boot begins without a host training seal by design.  Do
+  # not translate that pre-existing "train" state back into the expired train
+  # deadline after the VM has started; train_stage will authenticate the exact
+  # canonical 12K directory and either seal it or fail closed.
+  if [[ "$RECOVER_COMPLETED_12K" == 1 && "$PRESTART_ADMITTED_STAGE" == completed_12k_recovery ]]; then
+    reconciled_stage=completed_12k_recovery
+  else
+    reconciled_stage="$(host_next_unfinished_stage)" \
+      || fail "reconciled host-sealed stage is invalid"
+  fi
   if [[ "$reconciled_stage" != "$PRESTART_ADMITTED_STAGE" ]]; then
     PRESTART_ADMITTED_STAGE="$reconciled_stage"
     case "$PRESTART_ADMITTED_STAGE" in
-      train) admitted_timeout="$TRAIN_TIMEOUT_SECONDS" ;;
+      train|completed_12k_recovery) admitted_timeout="$TRAIN_TIMEOUT_SECONDS" ;;
       focused_gate) admitted_timeout="$FOCUSED_TIMEOUT_SECONDS" ;;
       harvest) admitted_timeout="$HARVEST_TIMEOUT_SECONDS" ;;
       *) fail "reconciled host-sealed stage is invalid" ;;
@@ -2670,8 +2826,12 @@ post_start_lifecycle() {
     verify_conservative_task_budget "$DEADLINE_RECEIPT" \
       || fail "conservative provider budget admission failed"
     (( $(date +%s) < aggregate_deadline )) || fail "aggregate paid deadline has expired"
-    admitted_deadline="$(initialize_stage_deadline "$PRESTART_ADMITTED_STAGE" "$admitted_timeout" "$aggregate_deadline")" \
-      || fail "$PRESTART_ADMITTED_STAGE deadline receipt is invalid"
+    if [[ "$PRESTART_ADMITTED_STAGE" == completed_12k_recovery ]]; then
+      admitted_deadline="$aggregate_deadline"
+    else
+      admitted_deadline="$(initialize_stage_deadline "$PRESTART_ADMITTED_STAGE" "$admitted_timeout" "$aggregate_deadline")" \
+        || fail "$PRESTART_ADMITTED_STAGE deadline receipt is invalid"
+    fi
     (( $(date +%s) < admitted_deadline )) \
       || fail "$PRESTART_ADMITTED_STAGE deadline has expired"
   fi
@@ -2806,6 +2966,10 @@ PY
 main() {
 [[ $# -eq 0 ]] || fail "this wrapper accepts no positional arguments"
 [[ "$RESUME_PARTIAL" == 0 || "$RESUME_PARTIAL" == 1 ]] || fail "resume-partial mode must be explicitly 0 or 1"
+[[ "$RECOVER_COMPLETED_12K" == 0 || "$RECOVER_COMPLETED_12K" == 1 ]] || fail "completed-output recovery mode must be explicitly 0 or 1"
+if [[ "$RECOVER_COMPLETED_12K" == 1 && "$RESUME_PARTIAL" != 0 ]]; then
+  fail "completed-output recovery forbids partial resume"
+fi
 if [[ "$RESUME_PARTIAL" == 1 ]]; then
   [[ "$RESUME_STEP" =~ ^[0-9]+$ && "$RESUME_CHECKPOINT" == "$SOURCE_ROOT/outputs/train/groot_four_types_merged_batch64_lr2e-4/checkpoints/$(printf '%06d' "$RESUME_STEP")" ]] || fail "resume requires the exact configured checkpoint path and step"
   (( RESUME_STEP > 0 && RESUME_STEP < 12000 && RESUME_STEP % 1500 == 0 )) || fail "resume step is not a valid checkpoint boundary"
@@ -2853,17 +3017,29 @@ verify_conservative_task_budget "$DEADLINE_RECEIPT" \
 (( $(date +%s) < aggregate_deadline )) || fail "aggregate paid deadline has expired"
 PRESTART_ADMITTED_STAGE="$(host_next_unfinished_stage)" \
   || fail "host-sealed next unfinished stage is invalid"
+if [[ "$RECOVER_COMPLETED_12K" == 1 ]]; then
+  [[ "$PRESTART_ADMITTED_STAGE" == train ]] \
+    || fail "completed-output recovery requires an unsealed training stage"
+  # This is the sole, explicit exception to the expired historical train
+  # deadline.  The aggregate deadline remains immutable and binding, and the
+  # remote stage has no trainer fallback when this mode is set.
+  PRESTART_ADMITTED_STAGE=completed_12k_recovery
+fi
 if [[ "$RESUME_PARTIAL" == 1 && "$PRESTART_ADMITTED_STAGE" != train ]]; then
   fail "explicit partial resume is inconsistent with the host-sealed next stage"
 fi
 case "$PRESTART_ADMITTED_STAGE" in
-  train) admitted_timeout="$TRAIN_TIMEOUT_SECONDS" ;;
+  train|completed_12k_recovery) admitted_timeout="$TRAIN_TIMEOUT_SECONDS" ;;
   focused_gate) admitted_timeout="$FOCUSED_TIMEOUT_SECONDS" ;;
   harvest) admitted_timeout="$HARVEST_TIMEOUT_SECONDS" ;;
   *) fail "host-sealed next unfinished stage is invalid" ;;
 esac
-admitted_deadline="$(initialize_stage_deadline "$PRESTART_ADMITTED_STAGE" "$admitted_timeout" "$aggregate_deadline")" \
-  || fail "$PRESTART_ADMITTED_STAGE deadline receipt is invalid"
+if [[ "$PRESTART_ADMITTED_STAGE" == completed_12k_recovery ]]; then
+  admitted_deadline="$aggregate_deadline"
+else
+  admitted_deadline="$(initialize_stage_deadline "$PRESTART_ADMITTED_STAGE" "$admitted_timeout" "$aggregate_deadline")" \
+    || fail "$PRESTART_ADMITTED_STAGE deadline receipt is invalid"
+fi
 (( $(date +%s) < admitted_deadline )) \
   || fail "$PRESTART_ADMITTED_STAGE deadline has expired"
 # A provider STOPPED observation is also the fail-closed proof that no trainer
