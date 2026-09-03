@@ -1553,7 +1553,7 @@ def open_regular(parent, name):
 def open_link(parent, name):
     require_safe_name(name)
     before = os.stat(name, dir_fd=parent, follow_symlinks=False)
-    if not stat.S_ISLNK(before.st_mode) or before.st_dev != expected_device:
+    if not stat.S_ISLNK(before.st_mode) or before.st_dev != expected_device or before.st_nlink != 1:
         raise SystemExit("completed-output ownership repair entry is unsafe")
     if TEST_FALLBACK and not hasattr(os, "O_PATH"):
         # Portable unit tests cannot acquire a descriptor for a symlink inode.
@@ -1564,7 +1564,7 @@ def open_link(parent, name):
     # target.  The parent descriptor was already opened beneath the root.
     descriptor = os.open(name, getattr(os, "O_PATH", os.O_RDONLY) | nofollow | cloexec, dir_fd=parent)
     after = os.fstat(descriptor)
-    if not same_entry(before, after) or after.st_dev != expected_device:
+    if not same_entry(before, after) or after.st_dev != expected_device or after.st_nlink != 1:
         os.close(descriptor)
         raise SystemExit("completed-output ownership repair entry changed")
     return descriptor
@@ -1637,7 +1637,7 @@ try:
                 if metadata.st_dev != expected_device:
                     raise SystemExit("completed-output ownership repair crosses filesystems")
                 if stat.S_ISLNK(metadata.st_mode):
-                    if not (allow_last and relative == "checkpoints/last" and os.readlink(entry.name, dir_fd=parent) == "012000"):
+                    if metadata.st_nlink != 1 or not (allow_last and relative == "checkpoints/last" and os.readlink(entry.name, dir_fd=parent) == "012000"):
                         raise SystemExit("completed-output ownership repair symlink is unsafe")
                     plan_entry("link", relative, open_link(parent, entry.name), metadata)
                 elif stat.S_ISDIR(metadata.st_mode):
@@ -1658,12 +1658,29 @@ try:
 
     # Every descriptor in `planned` was authenticated before mutation.  A
     # later pathname swap cannot redirect fchown outside this exact tree.
-    for kind, relative, descriptor, device, inode, mode in planned:
+    # Change leaf files/links first, then directories deepest-first, and each
+    # target root last.  In particular, a root-owned 0700 root is not made
+    # writable by the controller until every descendant is already repaired.
+    def mutation_order(item):
+        kind, relative = item[:2]
+        if kind in {"regular", "link"}:
+            return (0, 0, relative)
+        if relative:
+            return (1, -len(relative.split("/")), relative)
+        return (2, 0, relative)
+
+    trace_path = os.environ.get("LEHOME_N15_TEST_OWNERSHIP_ORDER_TRACE")
+    for kind, relative, descriptor, device, inode, mode in sorted(planned, key=mutation_order):
         if kind == "link" and descriptor == -1 and TEST_FALLBACK:
             continue
         current = os.fstat(descriptor)
         if (current.st_dev, current.st_ino, stat.S_IFMT(current.st_mode)) != (device, inode, mode):
             raise SystemExit("completed-output ownership repair authenticated entry changed")
+        if kind in {"regular", "link"} and current.st_nlink != 1:
+            raise SystemExit("completed-output ownership repair hardlink changed after validation")
+        if trace_path and TEST_FALLBACK:
+            with open(trace_path, "a", encoding="ascii") as stream:
+                stream.write(f"{kind}:{relative}\n")
         if kind == "link":
             fchown_link(descriptor)
         else:
@@ -1733,14 +1750,6 @@ finally:
     os.close(parent)
 PY
 }
-if [[ -d "${training_root}.finalizing" || -f "$staging_root/training-finalization.json" || -f "${training_root}.finalizing/evidence/training-finalization.json" ]]; then
-  python3 "$root/scripts/run_public_n15_reproduction.py" finalize-training-output \
-    --checkout "$source_root" --source-receipt "$source_receipt" \
-    --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" \
-    --training-root "$training_root" --staging-root "$staging_root" \
-    --upstream-output "$upstream_output" >/dev/null
-  exit 0
-fi
 # Recovery admission is deliberately checked before any generic topology
 # handling.  If the preserved canonical output is absent, incomplete, or
 # unsafe, this remote paid stage fails and the outer controller stops the VM;
@@ -1755,6 +1764,17 @@ if [[ "$recovery_only" == 1 ]]; then
   has_exact_completed_12k_boundary "$training_root" \
     || { echo "completed-output recovery does not contain exact 012000 boundary" >&2; exit 2; }
   python3 "$root/scripts/run_public_n15_reproduction.py" adopt-unsealed-training-output \
+    --checkout "$source_root" --source-receipt "$source_receipt" \
+    --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" \
+    --training-root "$training_root" --staging-root "$staging_root" \
+    --upstream-output "$upstream_output" >/dev/null
+  exit 0
+fi
+# Generic finalization state is intentionally handled only after recovery-only
+# admission.  A stale or attacker-created .finalizing directory must not turn
+# an explicit canonical-12K recovery into a different mutable code path.
+if [[ -d "${training_root}.finalizing" || -f "$staging_root/training-finalization.json" || -f "${training_root}.finalizing/evidence/training-finalization.json" ]]; then
+  python3 "$root/scripts/run_public_n15_reproduction.py" finalize-training-output \
     --checkout "$source_root" --source-receipt "$source_receipt" \
     --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" \
     --training-root "$training_root" --staging-root "$staging_root" \

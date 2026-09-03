@@ -574,6 +574,92 @@ def test_completed_12k_recovery_rejects_hardlinked_artifact_before_mutating(
     assert trace.count("native:/opt/lehome-challenge/.venv/bin/lerobot-train") == 1
 
 
+def test_completed_12k_recovery_rejects_hardlinked_last_symlink_before_mutating(
+    tmp_path: Path,
+) -> None:
+    env, _contract, training, staging, upstream = _remote_train_fixture(tmp_path)
+    interrupted = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-last-hardlink", interrupt_point="after-trainer", complete=True,
+    )
+    assert interrupted.returncode == 130, interrupted.stderr
+    last = upstream / "checkpoints/last"
+    external = tmp_path / "outside-last-hardlink"
+    try:
+        os.link(last, external, follow_symlinks=False)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"filesystem cannot create a hardlink to a symlink: {error}")
+    before = last.lstat()
+    recovered = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-last-hardlink-recovery", complete=False,
+    )
+    assert recovered.returncode != 0
+    after = last.lstat()
+    assert (before.st_uid, before.st_gid, before.st_ino, before.st_nlink) == (
+        after.st_uid, after.st_gid, after.st_ino, after.st_nlink
+    )
+    assert not training.exists() and upstream.is_dir() and staging.is_dir()
+    assert Path(env["FAKE_TRACE"]).read_text(encoding="utf-8").count(
+        "native:/opt/lehome-challenge/.venv/bin/lerobot-train"
+    ) == 1
+
+
+def test_completed_12k_recovery_rejects_a_late_unsafe_entry_before_any_mutation(
+    tmp_path: Path,
+) -> None:
+    """The authenticated plan must finish before it changes even a safe leaf."""
+    env, _contract, training, staging, upstream = _remote_train_fixture(tmp_path)
+    interrupted = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-late-unsafe", interrupt_point="after-trainer", complete=True,
+    )
+    assert interrupted.returncode == 130, interrupted.stderr
+
+    # `staging` is scanned after the completed upstream tree.  The entry is
+    # deliberately late in its directory order so a mutating preorder walk
+    # would have already touched the upstream output.
+    (staging / "zz-late-unsafe-entry").symlink_to("/dev")
+    trace = tmp_path / "ownership-order"
+    upstream_before = upstream.stat()
+    recovered = _run_actual_remote_train_stage(
+        {**env, "LEHOME_N15_TEST_OWNERSHIP_ORDER_TRACE": str(trace)},
+        attempt_id="attempt-late-unsafe-recovery", complete=False,
+    )
+
+    assert recovered.returncode != 0
+    assert not trace.exists(), "no authenticated descriptor may be fchown'd"
+    upstream_after = upstream.stat()
+    assert (upstream_after.st_uid, upstream_after.st_gid, upstream_after.st_ino) == (
+        upstream_before.st_uid, upstream_before.st_gid, upstream_before.st_ino,
+    )
+    assert not training.exists() and upstream.is_dir() and staging.is_dir()
+    assert Path(env["FAKE_TRACE"]).read_text(encoding="utf-8").count(
+        "native:/opt/lehome-challenge/.venv/bin/lerobot-train"
+    ) == 1
+
+
+def test_completed_12k_recovery_mutates_leaf_descriptors_before_directories(
+    tmp_path: Path,
+) -> None:
+    env, _contract, training, staging, upstream = _remote_train_fixture(tmp_path)
+    interrupted = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-order", interrupt_point="after-trainer", complete=True,
+    )
+    assert interrupted.returncode == 130, interrupted.stderr
+    order = tmp_path / "ownership-order"
+    recovered = _run_actual_remote_train_stage(
+        {**env, "LEHOME_N15_TEST_OWNERSHIP_ORDER_TRACE": str(order)},
+        attempt_id="attempt-order-recovery", complete=False,
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    rows = order.read_text(encoding="ascii").splitlines()
+    directory_rows = [index for index, row in enumerate(rows) if row.startswith("directory:")]
+    assert directory_rows
+    assert all(not row.startswith("directory:") for row in rows[:directory_rows[0]])
+    # Roots are encoded as an empty relative path and must be repaired last,
+    # after nested 0700 directories have become accessible.
+    assert rows[-2:] == ["directory:", "directory:"]
+    assert any(row.startswith("directory:checkpoints/012000") for row in rows[:-2])
+
+
 @pytest.mark.skipif(
     platform.system() != "Linux" or os.geteuid() != 0,
     reason="requires a Linux root mount namespace",
@@ -673,6 +759,42 @@ def test_recovery_only_mode_rejects_absent_canonical_output_without_trainer(
     assert result.returncode != 0
     assert not training.exists() and staging.is_dir() and upstream.is_dir()
     assert not Path(env["FAKE_TRACE"]).exists()
+
+
+def test_recovery_only_rejects_generic_finalizing_state_without_finalizer_or_trainer(
+    tmp_path: Path,
+) -> None:
+    env, _contract, training, staging, upstream = _remote_train_fixture(tmp_path)
+    # This stale generic state used to be checked before recovery-only
+    # admission.  It must not redirect an explicit canonical recovery into a
+    # finalizer that may consume the split topology.
+    finalizing = Path(f"{training}.finalizing")
+    finalizing.mkdir()
+    trace = tmp_path / "python-invocations"
+    shim = tmp_path / "python-shim"; shim.mkdir()
+    _write_executable(
+        shim / "python3",
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$FAKE_PYTHON_TRACE\"\nexec \"$REAL_PYTHON\" \"$@\"\n",
+    )
+    result = _run_actual_remote_train_stage(
+        {
+            **env,
+            "LEHOME_N15_RECOVER_COMPLETED_12K": "1",
+            "LEHOME_N15_RESUME_PARTIAL": "0",
+            "LEHOME_N15_RESUME_STEP": "",
+            "LEHOME_N15_RESUME_CHECKPOINT": "",
+            "LEHOME_N15_RESUME_ATTEMPT_ID": "",
+            "PATH": f"{shim}:{env['PATH']}",
+            "FAKE_PYTHON_TRACE": str(trace),
+            "REAL_PYTHON": sys.executable,
+        },
+        attempt_id="attempt-recovery-finalizing", complete=False,
+    )
+    assert result.returncode != 0
+    assert "canonical training root is absent" in result.stderr
+    assert not trace.exists() or "finalize-training-output" not in trace.read_text(encoding="utf-8")
+    assert not Path(env["FAKE_TRACE"]).exists()
+    assert finalizing.is_dir() and staging.is_dir() and upstream.is_dir()
 
 
 def test_recovery_only_main_bypasses_only_expired_train_stage_deadline(
