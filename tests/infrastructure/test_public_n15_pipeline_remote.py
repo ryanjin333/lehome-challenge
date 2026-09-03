@@ -1803,13 +1803,14 @@ run_paid_stage train 60 train_stage
     child_pid: int | None = None
     try:
         deadline = time.monotonic() + 5
-        while (
-            (not window.exists() or not descendant_pid.exists() or not lock_path.exists())
-            and time.monotonic() < deadline
-        ):
+        while time.monotonic() < deadline:
+            if window.exists() and descendant_pid.exists() and lock_path.exists():
+                raw_pid = descendant_pid.read_text(encoding="ascii").strip()
+                if raw_pid.isdecimal():
+                    child_pid = int(raw_pid)
+                    break
             time.sleep(0.02)
-        assert window.exists() and descendant_pid.exists() and lock_path.exists()
-        child_pid = int(descendant_pid.read_text(encoding="ascii"))
+        assert child_pid is not None
         assert not stage_entered.exists()
 
         os.kill(process.pid, signal.SIGTERM)
@@ -1823,8 +1824,21 @@ run_paid_stage train 60 train_stage
         assert not lock_path.exists()
     finally:
         if process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.communicate(timeout=3)
+            os.kill(process.pid, signal.SIGTERM)
+            try:
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                for ready_file in Path(env["LEHOME_N15_PIPELINE_ROOT"]).glob(
+                    ".stage-launcher-train.*/ready"
+                ):
+                    ready_pid = ready_file.read_text(encoding="ascii").strip()
+                    if ready_pid.isdecimal():
+                        try:
+                            os.killpg(int(ready_pid), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=3)
         if child_pid is not None:
             try:
                 os.kill(child_pid, signal.SIGKILL)
@@ -2089,6 +2103,8 @@ def test_training_publication_adopts_verified_upload_after_local_receipt_crash(
     fake_site = tmp_path / "fake-site"; fake_site.mkdir()
     remote_store = tmp_path / "hf-store"; remote_store.mkdir()
     upload_log = tmp_path / "uploads.log"
+    download_log = tmp_path / "downloads.log"
+    training_cache = tmp_path / "training-hf-cache"; training_cache.mkdir(mode=0o700)
     (fake_site / "huggingface_hub.py").write_text(
         r'''import os, shutil
 from pathlib import Path
@@ -2122,7 +2138,14 @@ class HfApi:
             raise RuntimeError("simulated response loss after upload")
         return SimpleNamespace(oid=revision)
 
-def hf_hub_download(*, filename, revision, **kwargs):
+def hf_hub_download(*, filename, revision, cache_dir, token, **kwargs):
+    cache = Path(cache_dir)
+    expected = Path(os.environ["FAKE_HF_DOWNLOAD_CACHE"])
+    assert token is False
+    assert cache == expected
+    assert cache.is_dir() and not cache.is_symlink()
+    with Path(os.environ["FAKE_HF_DOWNLOAD_LOG"]).open("a") as stream:
+        stream.write(f"{filename}\t{cache}\n")
     return str(Path(os.environ["FAKE_HF_STORE"]) / revision / filename)
 ''',
         encoding="utf-8",
@@ -2139,6 +2162,9 @@ def hf_hub_download(*, filename, revision, **kwargs):
         "LEHOME_N15_HF_TOKEN_FILE": str(token),
         "FAKE_HF_STORE": str(remote_store),
         "FAKE_HF_UPLOAD_LOG": str(upload_log),
+        "FAKE_HF_DOWNLOAD_LOG": str(download_log),
+        "FAKE_HF_DOWNLOAD_CACHE": str(training_cache / "training-publication-readback"),
+        "LEHOME_N15_TRAINING_HF_CACHE_ROOT": str(training_cache),
         "PYTHONPATH": f"{fake_site}:{ROOT / 'source/lehome'}",
     })
     harness = 'source "$WRAPPER_PATH"; remote() { command "$@"; }; publish_training_readback'
@@ -2172,6 +2198,18 @@ def hf_hub_download(*, filename, revision, **kwargs):
     receipt = json.loads((training / "training-publication.json").read_text())
     assert receipt["immutable_revision"] == "a" * 40
     assert receipt["anonymous_byte_readback_verified"] is True
+    verifier = subprocess.run(
+        ["bash", "-c", 'source "$WRAPPER_PATH"; remote() { command "$@"; }; verify_remote_training_publication'],
+        cwd=ROOT, env={**env, "WRAPPER_PATH": str(WRAPPER)},
+        text=True, capture_output=True,
+    )
+    assert verifier.returncode == 0, verifier.stderr
+    entries = receipt["entries"]
+    download_rows = download_log.read_text(encoding="utf-8").splitlines()
+    assert len(download_rows) == len(entries) * 3
+    assert {
+        row.split("\t", 1)[1] for row in download_rows
+    } == {str(training_cache / "training-publication-readback")}
 
     verify_harness = (
         'source "$WRAPPER_PATH"; remote() { command "$@"; }; '
@@ -2222,6 +2260,28 @@ def hf_hub_download(*, filename, revision, **kwargs):
     original_remote = remote_artifact.read_bytes()
     remote_artifact.write_bytes(original_remote + b"tampered")
     assert verify_publication().returncode != 0
+    remote_artifact.write_bytes(original_remote)
+
+    readback_cache = training_cache / "training-publication-readback"
+    readback_cache.rmdir()
+    symlink_target = tmp_path / "root-volume-cache"; symlink_target.mkdir()
+    readback_cache.symlink_to(symlink_target, target_is_directory=True)
+    before_unsafe = download_log.read_bytes()
+    assert verify_publication().returncode != 0
+    assert download_log.read_bytes() == before_unsafe
+
+    assert os.stat("/dev").st_dev != training.stat().st_dev
+    outside_mount = subprocess.run(
+        ["bash", "-c", verify_harness], cwd=ROOT,
+        env={
+            **env,
+            "WRAPPER_PATH": str(WRAPPER),
+            "LEHOME_N15_TRAINING_HF_CACHE_ROOT": "/dev",
+        },
+        text=True, capture_output=True,
+    )
+    assert outside_mount.returncode != 0
+    assert download_log.read_bytes() == before_unsafe
 
 
 def test_fetch_remote_immutable_cleans_partial_transfer_and_retries(

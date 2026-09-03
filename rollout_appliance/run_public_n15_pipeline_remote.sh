@@ -766,14 +766,15 @@ SH
 }
 
 verify_remote_training_publication() {
-  remote bash -s -- "$TRAINING_PUBLICATION_RECEIPT" "$PUBLIC_REPOSITORY" "n15-public/$RUN_ID/training" "$TRAINING_ROOT" <<'SH'
+  remote bash -s -- "$TRAINING_PUBLICATION_RECEIPT" "$PUBLIC_REPOSITORY" "n15-public/$RUN_ID/training" "$TRAINING_ROOT" "$TRAINING_HF_CACHE" <<'SH'
 set -euo pipefail
-python3 - "$1" "$2" "$3" "$4" <<'PY'
-import hashlib, json, re, stat, sys
+python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
+import hashlib, json, os, re, stat, sys
 from pathlib import Path, PurePosixPath
 from huggingface_hub import HfApi, hf_hub_download
 
-receipt, repository, prefix, training = Path(sys.argv[1]), sys.argv[2], sys.argv[3], Path(sys.argv[4])
+receipt, repository, prefix = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+training, cache_root = map(Path, sys.argv[4:6])
 receipt_metadata = receipt.lstat()
 training_metadata = training.lstat()
 if (
@@ -782,6 +783,28 @@ if (
     or training.is_symlink() or not stat.S_ISDIR(training_metadata.st_mode)
 ):
     raise SystemExit("training publication receipt or root is unsafe")
+cache_metadata = cache_root.lstat()
+if (
+    not cache_root.is_absolute() or cache_root.is_symlink()
+    or not stat.S_ISDIR(cache_metadata.st_mode)
+    or cache_root.resolve(strict=True) != cache_root
+    or cache_metadata.st_dev != training_metadata.st_dev
+):
+    raise SystemExit("training publication cache root is not on the protected training filesystem")
+readback_cache = cache_root / "training-publication-readback"
+try:
+    readback_cache.mkdir(mode=0o700)
+except FileExistsError:
+    pass
+readback_metadata = readback_cache.lstat()
+if (
+    readback_cache.is_symlink() or not stat.S_ISDIR(readback_metadata.st_mode)
+    or readback_cache.resolve(strict=True) != readback_cache
+    or readback_metadata.st_dev != training_metadata.st_dev
+    or readback_metadata.st_uid != os.getuid()
+    or stat.S_IMODE(readback_metadata.st_mode) & 0o077
+):
+    raise SystemExit("training publication readback cache is unsafe")
 raw = receipt.read_bytes(); value = json.loads(raw)
 if raw != (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii"):
     raise SystemExit("training publication is not canonical")
@@ -838,7 +861,7 @@ if remote_paths != set(expected):
 for relative, digest in expected.items():
     fetched = hf_hub_download(
         repo_id=repository, repo_type="model", filename=prefix + "/" + relative,
-        revision=revision, token=False,
+        revision=revision, token=False, cache_dir=str(readback_cache),
     )
     if hashlib.sha256(Path(fetched).read_bytes()).hexdigest() != digest:
         raise SystemExit("immutable publication revision byte mismatch")
@@ -1688,16 +1711,43 @@ SH
 
 publish_training_readback() {
   # The remote publisher uses a fresh, immutable prefix and anonymous byte readback.
-  remote bash -s -- "$TRAINING_ROOT" "$PUBLIC_REPOSITORY" "n15-public/$RUN_ID/training" "$HF_TOKEN_FILE" <<'SH'
+  remote bash -s -- "$TRAINING_ROOT" "$PUBLIC_REPOSITORY" "n15-public/$RUN_ID/training" "$HF_TOKEN_FILE" "$TRAINING_HF_CACHE" <<'SH'
 set -euo pipefail
-root="$1"; repository="$2"; prefix="$3"; token_file="$4"; test -f "$token_file" && test ! -L "$token_file"; export HF_TOKEN="$(cat "$token_file")"
-python3 - "$root" "$repository" "$prefix" <<'PY'
+root="$1"; repository="$2"; prefix="$3"; token_file="$4"; cache_root="$5"; test -f "$token_file" && test ! -L "$token_file"; export HF_TOKEN="$(cat "$token_file")"
+python3 - "$root" "$repository" "$prefix" "$cache_root" <<'PY'
 import hashlib, json, os, re, sys, tempfile
+import stat
 from pathlib import Path
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError
-root, repository, prefix = sys.argv[1:]; directory = Path(root); receipt = directory / "training-publication.json"
+root, repository, prefix, cache_root = sys.argv[1:]
+directory, cache_root = Path(root), Path(cache_root)
+receipt = directory / "training-publication.json"
 if receipt.exists(): raise SystemExit("training publication receipt already exists")
+directory_metadata = directory.lstat()
+cache_metadata = cache_root.lstat()
+if (
+    directory.is_symlink() or not stat.S_ISDIR(directory_metadata.st_mode)
+    or not cache_root.is_absolute() or cache_root.is_symlink()
+    or not stat.S_ISDIR(cache_metadata.st_mode)
+    or cache_root.resolve(strict=True) != cache_root
+    or cache_metadata.st_dev != directory_metadata.st_dev
+):
+    raise SystemExit("training publication cache root is not on the protected training filesystem")
+readback_cache = cache_root / "training-publication-readback"
+try:
+    readback_cache.mkdir(mode=0o700)
+except FileExistsError:
+    pass
+readback_metadata = readback_cache.lstat()
+if (
+    readback_cache.is_symlink() or not stat.S_ISDIR(readback_metadata.st_mode)
+    or readback_cache.resolve(strict=True) != readback_cache
+    or readback_metadata.st_dev != directory_metadata.st_dev
+    or readback_metadata.st_uid != os.getuid()
+    or stat.S_IMODE(readback_metadata.st_mode) & 0o077
+):
+    raise SystemExit("training publication readback cache is unsafe")
 for scratch in directory.glob(".training-publication.json.*"):
     scratch.unlink(missing_ok=True)
 entries = [{"path": str(path.relative_to(directory)), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()} for path in sorted(directory.rglob("*")) if path.is_file() and path != receipt]
@@ -1717,7 +1767,10 @@ def verify_revision(revision):
     if remote_paths != set(expected):
         return False
     for relative, digest in expected.items():
-        fetched = hf_hub_download(repo_id=repository, repo_type="model", filename=prefix + "/" + relative, revision=revision, token=False)
+        fetched = hf_hub_download(
+            repo_id=repository, repo_type="model", filename=prefix + "/" + relative,
+            revision=revision, token=False, cache_dir=str(readback_cache),
+        )
         if hashlib.sha256(Path(fetched).read_bytes()).hexdigest() != digest:
             return False
     return True
