@@ -296,7 +296,26 @@ PY
 }
 
 terminate_active_paid_stage() {
-  local attempt
+  local attempt discovered_pgid=""
+  if [[ -z "$ACTIVE_PAID_STAGE_PGID" && -n "$ACTIVE_PAID_STAGE_PID" ]]; then
+    discovered_pgid="$(python3 - "$ACTIVE_PAID_STAGE_PID" <<'PY' || true
+import os
+import sys
+
+pid = int(sys.argv[1])
+try:
+    pgid = os.getpgid(pid)
+    session = os.getsid(pid)
+except ProcessLookupError:
+    raise SystemExit(0)
+if pgid == pid and session == pid:
+    print(pgid)
+PY
+)"
+    if [[ "$discovered_pgid" == "$ACTIVE_PAID_STAGE_PID" ]]; then
+      ACTIVE_PAID_STAGE_PGID="$discovered_pgid"
+    fi
+  fi
   if [[ -n "$ACTIVE_PAID_STAGE_PGID" ]]; then
     kill -TERM -- "-$ACTIVE_PAID_STAGE_PGID" 2>/dev/null || true
     for (( attempt = 1; attempt <= 25; attempt++ )); do
@@ -458,7 +477,7 @@ PY
 }
 run_paid_stage() {
   local label="$1" limit_seconds="$2" stage_function="$3"
-  local aggregate_deadline now stage_deadline pid status launcher_root launcher_ready ready_pid attempt
+  local aggregate_deadline now stage_deadline pid status launcher_root launcher_ready launcher_ack launcher_acknowledged ready_pid acknowledged_pid attempt
   case "$stage_function" in train_stage|focused_stage|harvest_stage) ;; *) fail "unknown paid stage dispatcher" ;; esac
   if [[ -n "$PRESTART_ADMITTED_STAGE" && "$label" != "$PRESTART_ADMITTED_STAGE" ]]; then
     fail "$label is not the host-sealed next unfinished stage"
@@ -474,17 +493,71 @@ run_paid_stage() {
   export REMOTE_ROOT SSH_TARGET HF_TOKEN_FILE RUNTIME_REVISION SOURCE_ROOT SOURCE_RECEIPT SNAPSHOTS_RECEIPT TRAINING_ROOT EXACT_VM_ID PROTECTED_DISK_ID TRAINING_HF_CACHE TRAINING_PYTHON TRAINING_UV LEROBOT_WHEEL RUNTIME_IMAGE_ID RESUME_PARTIAL RESUME_CHECKPOINT RESUME_STEP RESUME_ATTEMPT_ID ASSETS_ROOT METADATA_ROOT REFERENCE_CHECKPOINT REFERENCE_SANITIZED_CONFIG REFERENCE_COMPATIBILITY NATIVE_RUNTIME_EVIDENCE NATIVE_DEPENDENCIES FOCUSED_HF_CACHE FOCUSED_OUTPUT_ROOT PUBLIC_REPOSITORY ROLLOUT_IMAGE_RECEIPT REMOTE_PIPELINE_ROOT
   launcher_root="$(mktemp -d "$PIPELINE_ROOT/.stage-launcher-${label}.XXXXXX")"
   launcher_ready="$launcher_root/ready"
-  python3 - "$stage_function" "$launcher_ready" <<'PY' &
+  launcher_ack="$launcher_root/ack"
+  launcher_acknowledged="$launcher_root/acknowledged"
+  python3 - "$stage_function" "$launcher_ready" "$launcher_ack" "$launcher_acknowledged" <<'PY' &
 import os
 from pathlib import Path
+import signal
 import sys
+import time
+
 os.setsid()
 ready = Path(sys.argv[2])
+
+# Deterministically exercise the otherwise tiny post-setsid/pre-readiness
+# interruption window without letting a paid-stage dispatcher run.
+test_window = os.environ.get("LEHOME_N15_TEST_SETSID_WINDOW")
+if (
+    test_window
+    and os.environ.get("PYTEST_CURRENT_TEST", "").startswith(
+        "tests/infrastructure/test_public_n15_pipeline_remote.py::"
+    )
+):
+    child = os.fork()
+    if child == 0:
+        stopped = Path(os.environ["DESCENDANT_STOPPED"])
+        pid_path = Path(os.environ["DESCENDANT_PID"])
+
+        def finish(_signum, _frame):
+            stopped.write_text("stopped\n", encoding="ascii")
+            os._exit(0)
+
+        signal.signal(signal.SIGTERM, finish)
+        pid_path.write_text(f"{os.getpid()}\n", encoding="ascii")
+        while True:
+            signal.pause()
+    Path(test_window).write_text("post-setsid\n", encoding="ascii")
+    while True:
+        signal.pause()
+
 descriptor = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 with os.fdopen(descriptor, "w", encoding="ascii") as stream:
     stream.write(f"{os.getpid()}\n")
     stream.flush()
     os.fsync(stream.fileno())
+ack = Path(sys.argv[3])
+acknowledged = Path(sys.argv[4])
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    try:
+        acknowledgement = ack.read_text(encoding="ascii")
+    except FileNotFoundError:
+        acknowledgement = ""
+    if acknowledgement == f"{os.getpid()}\n":
+        descriptor = os.open(
+            acknowledged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+            stream.write(f"{os.getpid()}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        break
+    if acknowledgement:
+        raise SystemExit(74)
+    time.sleep(0.01)
+else:
+    raise SystemExit(75)
 os.execvpe(
     "bash",
     ["bash", "-c", 'case "$1" in train_stage) train_stage ;; focused_stage) focused_stage ;; harvest_stage) harvest_stage ;; *) exit 64 ;; esac', "bash", sys.argv[1]],
@@ -515,7 +588,25 @@ PY
     sleep 0.02
   done
   [[ "$ready_pid" == "$pid" ]] || { terminate_active_paid_stage || true; rm -rf -- "$launcher_root"; fail "$label launcher setsid handshake failed"; }
-  ACTIVE_PAID_STAGE_PGID="$pid"
+  ( umask 077; set -o noclobber; printf '%s\n' "$pid" > "$launcher_ack" ) \
+    || { terminate_active_paid_stage || true; rm -rf -- "$launcher_root"; fail "$label launcher acknowledgement failed"; }
+  acknowledged_pid=""
+  for (( attempt = 1; attempt <= 200; attempt++ )); do
+    if [[ -f "$launcher_acknowledged" && ! -L "$launcher_acknowledged" ]]; then
+      IFS= read -r acknowledged_pid < "$launcher_acknowledged"
+      [[ "$acknowledged_pid" == "$pid" ]] || { terminate_active_paid_stage || true; rm -rf -- "$launcher_root"; fail "$label launcher acknowledgement identity mismatch"; }
+      break
+    fi
+    if ! kill -0 -- "-$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true; ACTIVE_PAID_STAGE_PID=""; ACTIVE_PAID_STAGE_PGID=""; rm -rf -- "$launcher_root"; fail "$label launcher exited before controller acknowledgement"
+    fi
+    now="$(date +%s)"
+    if (( now >= stage_deadline )); then
+      terminate_active_paid_stage || true; rm -rf -- "$launcher_root"; fail "$label launcher acknowledgement exceeded its paid timeout"
+    fi
+    sleep 0.02
+  done
+  [[ "$acknowledged_pid" == "$pid" ]] || { terminate_active_paid_stage || true; rm -rf -- "$launcher_root"; fail "$label launcher acknowledgement handshake failed"; }
   rm -rf -- "$launcher_root"
   while kill -0 -- "-$pid" 2>/dev/null; do
     now="$(date +%s)"

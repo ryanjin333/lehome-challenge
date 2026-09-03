@@ -1417,6 +1417,87 @@ run_paid_stage train 60 train_stage
             process.communicate(timeout=3)
 
 
+def test_interrupt_in_post_setsid_handshake_reaps_descendant_before_stop_and_unlock(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, "n15-paid-handshake-interrupt")
+    window = tmp_path / "setsid-window"
+    descendant_pid = tmp_path / "descendant-pid"
+    descendant_stopped = tmp_path / "descendant-stopped"
+    stage_entered = tmp_path / "stage-entered"
+    stage_pid = tmp_path / "stage-pid"
+    trace = tmp_path / "trace"
+    harness = r'''
+source "$WRAPPER_PATH"
+initialize_deadline() { echo "$(( $(date +%s) + 60 ))"; }
+initialize_stage_deadline() { echo "$(( $(date +%s) + 60 ))"; }
+train_stage() { printf '%s\n' "$$" > "$STAGE_PID"; touch "$STAGE_ENTERED"; while :; do /bin/sleep 1; done; }
+stop_exact_vm() {
+  child="$(cat "$DESCENDANT_PID")"
+  if kill -0 "$child" 2>/dev/null; then
+    printf 'stop-before-descendant-reap\n' >> "$TRACE"
+    return 1
+  fi
+  test -f "$DESCENDANT_STOPPED"
+  printf 'stopped\n' >> "$TRACE"
+}
+acquire_controller_lock
+PROVIDER_CLEANUP_REQUIRED=1
+trap controller_cleanup EXIT
+run_paid_stage train 60 train_stage
+'''
+    process = subprocess.Popen(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env, "WRAPPER_PATH": str(WRAPPER), "TRACE": str(trace),
+            "STAGE_ENTERED": str(stage_entered),
+            "STAGE_PID": str(stage_pid),
+            "DESCENDANT_PID": str(descendant_pid),
+            "DESCENDANT_STOPPED": str(descendant_stopped),
+            "LEHOME_N15_TEST_SETSID_WINDOW": str(window),
+        },
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    lock_path = _controller_lock_path(env)
+    child_pid: int | None = None
+    try:
+        deadline = time.monotonic() + 5
+        while (
+            (not window.exists() or not descendant_pid.exists() or not lock_path.exists())
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+        assert window.exists() and descendant_pid.exists() and lock_path.exists()
+        child_pid = int(descendant_pid.read_text(encoding="ascii"))
+        assert not stage_entered.exists()
+
+        os.kill(process.pid, signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode != 0, (stdout, stderr)
+        assert descendant_stopped.is_file()
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        assert not stage_entered.exists()
+        assert trace.read_text(encoding="utf-8").splitlines() == ["stopped"]
+        assert not lock_path.exists()
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=3)
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if stage_pid.exists():
+            try:
+                os.killpg(int(stage_pid.read_text(encoding="ascii")), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
 def test_stale_controller_lock_is_reclaimed_without_killing_a_process(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"; fake_bin.mkdir()
     trace = tmp_path / "trace"
