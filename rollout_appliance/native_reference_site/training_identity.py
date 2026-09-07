@@ -184,7 +184,7 @@ def _executable(path: Path, label: str) -> Path:
     if (
         not (stat.S_ISREG(link_metadata.st_mode) or stat.S_ISLNK(link_metadata.st_mode))
         or not stat.S_ISREG(target_metadata.st_mode)
-        or target_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or target_metadata.st_mode & stat.S_IWOTH
         or not os.access(resolved, os.X_OK)
     ):
         raise TrainingIdentityError(f"{label} is unavailable or unsafe")

@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import zipfile
@@ -1927,8 +1928,9 @@ def test_verify_training_output_requires_step_12000_receipts_logs_and_checksums(
     assert resumed == receipt
 
 
-def test_verify_training_output_accepts_a_venv_python_executable_symlink(
-    tmp_path: Path,
+@pytest.mark.parametrize(("target_mode", "accepted"), [(0o775, True), (0o777, False)])
+def test_verify_training_output_validates_a_venv_python_executable_symlink(
+    tmp_path: Path, target_mode: int, accepted: bool,
 ) -> None:
     from lehome import n15_reproduction as reproduction
     from rollout_appliance.native_reference_site.training_identity import (
@@ -1954,12 +1956,28 @@ def test_verify_training_output_accepts_a_venv_python_executable_symlink(
     runtime_receipt = root / "evidence/runtime-receipt.json"
     runtime = json.loads(runtime_receipt.read_text(encoding="ascii"))
     interpreter = Path(runtime["python_executable"])
+    group_writable_interpreter = tmp_path / "uv-python/bin/python3.11"
+    group_writable_interpreter.parent.mkdir(parents=True)
+    group_writable_interpreter.write_text(
+        "#!/bin/sh\nexec " + shlex.quote(str(interpreter)) + ' "$@"\n',
+        encoding="ascii",
+    )
+    group_writable_interpreter.chmod(target_mode)
     venv_python = tmp_path / "venv/bin/python"
     venv_python.parent.mkdir(parents=True)
-    venv_python.symlink_to(interpreter)
+    venv_python.symlink_to(group_writable_interpreter)
     runtime["python_executable"] = str(venv_python)
     runtime_receipt.write_bytes(_canonical(runtime))
     _write_training_checksums(root)
+
+    if not accepted:
+        with pytest.raises(reproduction.ReproductionError, match="unavailable or unsafe"):
+            reproduction.verify_training_output(
+                verified=verified,
+                training_root=root,
+                contract=contract,
+            )
+        return
 
     receipt = reproduction.verify_training_output(
         verified=verified,
