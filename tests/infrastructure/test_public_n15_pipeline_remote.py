@@ -184,7 +184,7 @@ if [[ "${1:-}" == - && $# -eq 4 && "$2" == */source/lehome ]]; then
   printf '%s\n' "$FAKE_DATASET_BLOBS"
   exit 0
 fi
-if [[ "${1:-}" == - && $# -eq 12 ]]; then
+if [[ "${1:-}" == - && $# -eq 13 ]]; then
   cp "$FAKE_STAGING/evidence/runtime-receipt.json" "$4"
   chmod 0444 "$4"
   if [[ "${FAKE_INTERRUPT_POINT:-}" == runtime-receipt ]]; then
@@ -1040,6 +1040,10 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert "grep -Eq '^(disk|part|lvm|crypt)$'" in text
     assert 'lsblk -ndo MAJ:MIN /dev/disk/by-id/virtio-lehome' in text
     assert '"$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin"' in text
+    assert "materialize-lerobot-package" in text
+    assert '--package-root "$staging_root/runtime/site-packages/lerobot"' in text
+    assert '"$training_root/runtime/site-packages/lerobot" <<\'PY\'' in text
+    assert 'package = Path(importlib.util.find_spec("lerobot").origin).parent' not in text
     compatibility_install = text.index('"$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin"')
     assert compatibility_install < text.index('test -x "$(dirname -- "$python_bin")/lerobot-train"')
     assert compatibility_install < text.index('"$python_bin" -I -c \'import lerobot; from pathlib import Path; assert Path(lerobot.__file__).is_file()\'')

@@ -1990,6 +1990,10 @@ python3 "$root/scripts/run_public_n15_reproduction.py" verify-compatible-wheel \
   --upstream-wheel "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" \
   --wheel "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" \
   --receipt "$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json" >/dev/null
+mkdir -m 0700 -p "$staging_root/runtime/site-packages"
+python3 "$root/scripts/run_public_n15_reproduction.py" materialize-lerobot-package \
+  --wheel "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" \
+  --package-root "$staging_root/runtime/site-packages/lerobot" >/dev/null
 "$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin" \
   "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" >/dev/null
 test -x "$(dirname -- "$python_bin")/lerobot-train"
@@ -2176,14 +2180,13 @@ if [[ "$resume_partial" == 1 ]]; then
 fi
 generated_runtime_receipt="$staging_root/evidence/runtime-receipt.json"
 if [[ "$resume_partial" == 1 ]]; then generated_runtime_receipt="$resume_scratch_root/runtime-receipt.json"; fi
-"$python_bin" - "$root" "$source_root/configs/train_groot.yaml" "$generated_runtime_receipt" "$staging_root/evidence/uv.lock" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json" "$training_root/evidence/uv.lock" "$training_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-compatibility-receipt.json" <<'PY'
-import hashlib, importlib.util, json, os, sys
+"$python_bin" - "$root" "$source_root/configs/train_groot.yaml" "$generated_runtime_receipt" "$staging_root/evidence/uv.lock" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json" "$training_root/evidence/uv.lock" "$training_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-compatibility-receipt.json" "$training_root/runtime/site-packages/lerobot" <<'PY'
+import hashlib, json, os, sys
 from pathlib import Path
-root, config, output, staged_lock, staged_upstream, staged_wheel, staged_compatibility, final_lock, final_upstream, final_wheel, final_compatibility = map(Path, sys.argv[1:])
+root, config, output, staged_lock, staged_upstream, staged_wheel, staged_compatibility, final_lock, final_upstream, final_wheel, final_compatibility, final_package = map(Path, sys.argv[1:])
 sys.path.insert(0, str(root / "source/lehome"))
 from lehome.n15_reproduction import resolve_groot_scheduler_from_yaml
-package = Path(importlib.util.find_spec("lerobot").origin).parent
-value = {"schema_version": 1, "kind": "lehome_public_n15_training_runtime_v1", "python_executable": sys.executable, "upstream_lerobot_wheel_path": str(final_upstream), "upstream_lerobot_wheel_sha256": hashlib.sha256(staged_upstream.read_bytes()).hexdigest(), "compatibility_wheel_path": str(final_wheel), "compatibility_wheel_sha256": hashlib.sha256(staged_wheel.read_bytes()).hexdigest(), "compatibility_wheel_receipt_path": str(final_compatibility), "compatibility_wheel_receipt_sha256": hashlib.sha256(staged_compatibility.read_bytes()).hexdigest(), "lerobot_package_root": str(package), "dependency_lock_path": str(final_lock), "dependency_lock_sha256": hashlib.sha256(staged_lock.read_bytes()).hexdigest(), "scheduler": resolve_groot_scheduler_from_yaml(config.read_text(encoding="utf-8"))}
+value = {"schema_version": 1, "kind": "lehome_public_n15_training_runtime_v1", "python_executable": sys.executable, "upstream_lerobot_wheel_path": str(final_upstream), "upstream_lerobot_wheel_sha256": hashlib.sha256(staged_upstream.read_bytes()).hexdigest(), "compatibility_wheel_path": str(final_wheel), "compatibility_wheel_sha256": hashlib.sha256(staged_wheel.read_bytes()).hexdigest(), "compatibility_wheel_receipt_path": str(final_compatibility), "compatibility_wheel_receipt_sha256": hashlib.sha256(staged_compatibility.read_bytes()).hexdigest(), "lerobot_package_root": str(final_package), "dependency_lock_path": str(final_lock), "dependency_lock_sha256": hashlib.sha256(staged_lock.read_bytes()).hexdigest(), "scheduler": resolve_groot_scheduler_from_yaml(config.read_text(encoding="utf-8"))}
 with output.open("x", encoding="ascii") as stream: stream.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
 os.chmod(output, 0o444)
 PY

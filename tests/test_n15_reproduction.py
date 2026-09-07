@@ -1076,6 +1076,118 @@ def _write_training_checksums(root: Path) -> None:
     (root / "checksums.sha256").write_text("".join(lines), encoding="ascii")
 
 
+def test_adopt_unsealed_training_repairs_legacy_missing_runtime_package(
+    tmp_path: Path,
+) -> None:
+    from lehome import n15_reproduction as reproduction
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout,
+        source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id,
+        disk_id=contract.disk_id,
+        contract=contract,
+    )
+    training_root = _materialize_training_output(
+        tmp_path, verified=verified, contract=contract
+    )
+    shutil.rmtree(training_root / "runtime")
+    runtime_receipt = training_root / "evidence/runtime-receipt.json"
+    runtime = json.loads(runtime_receipt.read_text(encoding="ascii"))
+    runtime["lerobot_package_root"] = str(
+        tmp_path / "training-tools/venv/lib/python3.11/site-packages/lerobot"
+    )
+    runtime_receipt.write_bytes(_canonical(runtime))
+    _write_training_checksums(training_root)
+
+    identity = reproduction.adopt_unsealed_training_output(
+        verified=verified,
+        training_root=training_root,
+        staging_root=Path(f"{training_root}.evidence-staging"),
+        upstream_output=(
+            verified.checkout / "outputs/train/groot_four_types_merged_batch64_lr2e-4"
+        ),
+        contract=contract,
+    )
+
+    package_root = training_root / "runtime/site-packages/lerobot"
+    repaired = json.loads(runtime_receipt.read_text(encoding="ascii"))
+    assert repaired["lerobot_package_root"] == str(package_root.resolve())
+    assert package_root.is_dir() and not package_root.is_symlink()
+    assert (training_root / "evidence/runtime-receipt.precanonical.json").is_file()
+    assert (training_root / "evidence/checksums.pre-runtime-repair.sha256").is_file()
+    assert (training_root / "evidence/runtime-recovery.json").is_file()
+    assert identity["training_root"] == str(training_root.resolve())
+    assert (training_root / "training-identity.json").is_file()
+
+
+def test_adopt_unsealed_training_resumes_interrupted_runtime_repair(
+    tmp_path: Path,
+) -> None:
+    from lehome import n15_reproduction as reproduction
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout,
+        source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id,
+        disk_id=contract.disk_id,
+        contract=contract,
+    )
+    training_root = _materialize_training_output(
+        tmp_path, verified=verified, contract=contract
+    )
+    shutil.rmtree(training_root / "runtime")
+    evidence = training_root / "evidence"
+    runtime_receipt = evidence / "runtime-receipt.json"
+    legacy_receipt = evidence / "runtime-receipt.precanonical.json"
+    historical_checksums = evidence / "checksums.pre-runtime-repair.sha256"
+    runtime = json.loads(runtime_receipt.read_text(encoding="ascii"))
+    runtime["lerobot_package_root"] = str(
+        tmp_path / "training-tools/venv/lib/python3.11/site-packages/lerobot"
+    )
+    runtime_receipt.write_bytes(_canonical(runtime))
+    _write_training_checksums(training_root)
+
+    # Emulate interruption after the canonical package and receipt were written,
+    # but before the recovery receipt and new root checksum were committed.
+    (training_root / "checksums.sha256").rename(historical_checksums)
+    runtime_receipt.rename(legacy_receipt)
+    package_root = training_root / "runtime/site-packages/lerobot"
+    package_root.parent.mkdir(parents=True, mode=0o700)
+    reproduction.materialize_lerobot_package(
+        wheel=evidence / "compatibility/lerobot-0.4.3-py3-none-any.whl",
+        package_root=package_root,
+    )
+    repaired = dict(runtime)
+    repaired["lerobot_package_root"] = str(package_root.resolve(strict=True))
+    reproduction._write_atomic_json(
+        runtime_receipt, repaired, "training runtime receipt"
+    )
+
+    identity = reproduction.adopt_unsealed_training_output(
+        verified=verified,
+        training_root=training_root,
+        staging_root=Path(f"{training_root}.evidence-staging"),
+        upstream_output=(
+            verified.checkout / "outputs/train/groot_four_types_merged_batch64_lr2e-4"
+        ),
+        contract=contract,
+    )
+
+    assert (evidence / "runtime-recovery.json").is_file()
+    assert (training_root / "checksums.sha256").is_file()
+    assert identity["training_root"] == str(training_root.resolve())
+    assert (training_root / "training-identity.json").is_file()
+
+
 def _materialize_partial_training(
     tmp_path: Path,
     *,

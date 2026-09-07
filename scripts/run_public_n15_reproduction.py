@@ -25,6 +25,7 @@ from lehome.n15_reproduction import (  # noqa: E402
     cleanup_resume_scratch,
     compatibility_wheel_identity,
     finalize_training_output,
+    materialize_lerobot_package,
     render_training,
     prepare_resume_scratch,
     verify_resume_checkpoint,
@@ -126,6 +127,12 @@ def _parser() -> argparse.ArgumentParser:
     compatibility_verify.add_argument("--upstream-wheel", type=Path, required=True)
     compatibility_verify.add_argument("--wheel", type=Path, required=True)
     compatibility_verify.add_argument("--receipt", type=Path, required=True)
+    materialize = commands.add_parser(
+        "materialize-lerobot-package",
+        help="atomically materialize the exact lerobot package tree from a wheel",
+    )
+    materialize.add_argument("--wheel", type=Path, required=True)
+    materialize.add_argument("--package-root", type=Path, required=True)
     lifecycle = commands.add_parser(
         "lifecycle-plan",
         help="write an immutable, pre-paid N1.5 lifecycle plan",
@@ -262,6 +269,10 @@ def main(
                 receipt=args.receipt,
                 upstream_wheel=args.upstream_wheel,
                 expected_upstream_sha256=contract.lerobot_wheel_sha256,
+            )
+        elif args.command == "materialize-lerobot-package":
+            result = materialize_lerobot_package(
+                wheel=args.wheel, package_root=args.package_root
             )
         elif args.command == "prepare-resume-scratch":
             path = prepare_resume_scratch(

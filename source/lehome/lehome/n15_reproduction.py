@@ -624,6 +624,87 @@ def _installed_package_tree_identity(root: Path) -> tuple[int, str]:
     return _tree_identity(files)
 
 
+def _lerobot_package_files_from_wheel(wheel: bytes) -> dict[str, bytes]:
+    files = {
+        name.removeprefix("lerobot/"): payload
+        for name, payload in _safe_wheel_entries(wheel).items()
+        if name.startswith("lerobot/")
+    }
+    if not files or any(not name for name in files):
+        raise ReproductionError("LeRobot wheel contains no package tree")
+    return files
+
+
+def materialize_lerobot_package(
+    *, wheel: Path | str, package_root: Path | str
+) -> dict[str, object]:
+    """Atomically materialize the exact ``lerobot/`` tree from a sealed wheel."""
+
+    wheel_path = _regular_file(Path(wheel), "compatible LeRobot wheel")
+    destination = Path(package_root)
+    if (
+        not destination.is_absolute()
+        or destination.name != "lerobot"
+        or ".." in destination.parts
+    ):
+        raise ReproductionError("installed LeRobot package root is invalid")
+    parent = _regular_directory(
+        destination.parent, "installed LeRobot package parent"
+    )
+    files = _lerobot_package_files_from_wheel(wheel_path.read_bytes())
+    expected_count, expected_tree = _tree_identity(files)
+    scratch = parent / ".lerobot.materializing"
+    if destination.exists() or destination.is_symlink():
+        if scratch.exists() or scratch.is_symlink():
+            raise ReproductionError("installed LeRobot package state is ambiguous")
+        installed = _regular_directory(destination, "installed LeRobot package root")
+        count, tree = _installed_package_tree_identity(installed)
+        if (count, tree) != (expected_count, expected_tree):
+            raise ReproductionError(
+                "installed LeRobot package differs from the compatible wheel"
+            )
+        return {
+            "package_root": str(installed),
+            "package_file_count": count,
+            "package_tree_sha256": tree,
+        }
+    if scratch.exists() or scratch.is_symlink():
+        installed = _regular_directory(scratch, "LeRobot package materialization")
+        count, tree = _installed_package_tree_identity(installed)
+        if (count, tree) != (expected_count, expected_tree):
+            raise ReproductionError("LeRobot package materialization is invalid")
+    else:
+        scratch.mkdir(mode=0o700)
+        for relative, payload in sorted(files.items()):
+            pure = PurePosixPath(relative)
+            target = scratch.joinpath(*pure.parts)
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            descriptor = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o444,
+            )
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+                os.fchmod(stream.fileno(), 0o444)
+        count, tree = _installed_package_tree_identity(scratch)
+        if (count, tree) != (expected_count, expected_tree):
+            raise ReproductionError("LeRobot package materialization is invalid")
+    scratch.rename(destination)
+    descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return {
+        "package_root": str(destination.resolve(strict=True)),
+        "package_file_count": expected_count,
+        "package_tree_sha256": expected_tree,
+    }
+
+
 def _regular_file(path: Path, label: str) -> Path:
     if not path.is_absolute():
         raise ReproductionError(f"{label} path is unsafe")
@@ -2655,6 +2736,158 @@ def finalize_training_output(
     return identity
 
 
+def _repair_unsealed_training_runtime(
+    *, assembled: Path, verified: VerifiedInputs, contract: ReproductionContract
+) -> bool:
+    """Recover the one legacy producer state that omitted the sealed package tree."""
+
+    evidence = _regular_directory(assembled / "evidence", "training evidence root")
+    runtime_receipt = evidence / "runtime-receipt.json"
+    legacy_receipt = evidence / "runtime-receipt.precanonical.json"
+    recovery_receipt = evidence / "runtime-recovery.json"
+    historical_checksums = evidence / "checksums.pre-runtime-repair.sha256"
+    canonical_package = assembled / "runtime/site-packages/lerobot"
+
+    current: dict[str, object] | None = None
+    if runtime_receipt.exists() or runtime_receipt.is_symlink():
+        _, _, current = _load_receipt(runtime_receipt, "training runtime receipt")
+        if (
+            current.get("lerobot_package_root") == str(canonical_package)
+            and canonical_package.is_dir()
+            and not canonical_package.is_symlink()
+        ):
+            repair_markers = (
+                legacy_receipt,
+                recovery_receipt,
+                historical_checksums,
+            )
+            if not any(path.exists() or path.is_symlink() for path in repair_markers):
+                return False
+
+    # Before any repair mutation, authenticate the self-consistent unsealed
+    # preimage and preserve its checksum manifest as evidence.  On a retry the
+    # preserved manifest is the durable state-machine marker.
+    checksum_path = assembled / "checksums.sha256"
+    if not historical_checksums.exists() and not historical_checksums.is_symlink():
+        artifacts = _artifact_files(assembled)
+        checksum = artifacts.get("checksums.sha256")
+        if checksum is None:
+            raise ReproductionError("legacy runtime repair checksums are missing")
+        entries = _checksum_entries(checksum)
+        expected = set(artifacts) - {"checksums.sha256"}
+        if set(entries) != expected or any(
+            _sha256_file(artifacts[relative]) != digest
+            for relative, digest in entries.items()
+        ):
+            raise ReproductionError("legacy runtime repair preimage is inconsistent")
+        checksum.rename(historical_checksums)
+    else:
+        _regular_file(historical_checksums, "legacy runtime repair checksums")
+        if checksum_path.exists() or checksum_path.is_symlink():
+            raise ReproductionError("legacy runtime repair checksum state is ambiguous")
+
+    legacy: dict[str, object]
+    if legacy_receipt.exists() or legacy_receipt.is_symlink():
+        _, _, legacy = _load_receipt(
+            legacy_receipt, "precanonical training runtime receipt"
+        )
+        if current is not None and current.get("lerobot_package_root") != str(
+            canonical_package
+        ):
+            raise ReproductionError("legacy runtime repair receipt state is ambiguous")
+    else:
+        if current is None or current.get("lerobot_package_root") == str(canonical_package):
+            raise ReproductionError("legacy runtime repair receipt is unavailable")
+        runtime_receipt.rename(legacy_receipt)
+        legacy = current
+        current = None
+
+    upstream_wheel = _regular_file(
+        assembled / "evidence/upstream/lerobot-0.4.3-py3-none-any.whl",
+        "upstream training LeRobot wheel",
+    )
+    wheel = _regular_file(
+        assembled / "evidence/compatibility/lerobot-0.4.3-py3-none-any.whl",
+        "compatible training LeRobot wheel",
+    )
+    compatibility_receipt = _regular_file(
+        assembled / "evidence/compatibility/lerobot-compatibility-receipt.json",
+        "compatible training LeRobot wheel receipt",
+    )
+    compatibility = compatibility_wheel_identity(
+        wheel=wheel,
+        receipt=compatibility_receipt,
+        upstream_wheel=upstream_wheel,
+        expected_upstream_sha256=contract.lerobot_wheel_sha256,
+    )
+    expected_paths = {
+        "upstream_lerobot_wheel_path": str(upstream_wheel),
+        "compatibility_wheel_path": str(wheel),
+        "compatibility_wheel_receipt_path": str(compatibility_receipt),
+        "dependency_lock_path": str(assembled / "evidence/uv.lock"),
+    }
+    if (
+        legacy.get("schema_version") != 1
+        or legacy.get("kind") != "lehome_public_n15_training_runtime_v1"
+        or any(legacy.get(key) != value for key, value in expected_paths.items())
+        or legacy.get("upstream_lerobot_wheel_sha256")
+        != contract.lerobot_wheel_sha256
+        or legacy.get("compatibility_wheel_sha256")
+        != compatibility["derived_wheel_sha256"]
+        or legacy.get("compatibility_wheel_receipt_sha256")
+        != _sha256_file(compatibility_receipt)
+        or legacy.get("dependency_lock_sha256") != contract.dependency_lock_sha256
+        or legacy.get("scheduler")
+        != resolve_groot_scheduler_from_yaml(
+            _safe_relative_file(
+                verified.checkout, "configs/train_groot.yaml", "pinned training config"
+            ).read_text(encoding="utf-8")
+        )
+        or not isinstance(legacy.get("lerobot_package_root"), str)
+        or not Path(str(legacy["lerobot_package_root"])).is_absolute()
+    ):
+        raise ReproductionError("legacy runtime repair receipt identity mismatch")
+
+    runtime_root = assembled / "runtime"
+    if runtime_root.exists() or runtime_root.is_symlink():
+        _regular_directory(runtime_root, "training runtime root")
+    else:
+        runtime_root.mkdir(mode=0o700)
+    site_packages = runtime_root / "site-packages"
+    if site_packages.exists() or site_packages.is_symlink():
+        _regular_directory(site_packages, "training runtime site-packages")
+    else:
+        site_packages.mkdir(mode=0o700)
+    package = materialize_lerobot_package(wheel=wheel, package_root=canonical_package)
+
+    repaired = dict(legacy)
+    repaired["lerobot_package_root"] = str(canonical_package.resolve(strict=True))
+    if current is None:
+        _write_atomic_json(runtime_receipt, repaired, "training runtime receipt")
+    elif current != repaired:
+        raise ReproductionError("repaired training runtime receipt mismatch")
+
+    recovery = {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_runtime_recovery_v1",
+        "legacy_runtime_receipt_sha256": _sha256_file(legacy_receipt),
+        "repaired_runtime_receipt_sha256": _sha256_file(runtime_receipt),
+        "preimage_checksums_sha256": _sha256_file(historical_checksums),
+        "compatibility_wheel_sha256": compatibility["derived_wheel_sha256"],
+        "package_file_count": package["package_file_count"],
+        "package_tree_sha256": package["package_tree_sha256"],
+    }
+    if recovery_receipt.exists() or recovery_receipt.is_symlink():
+        _, _, stored = _load_receipt(recovery_receipt, "training runtime recovery receipt")
+        if stored != recovery:
+            raise ReproductionError("training runtime recovery receipt mismatch")
+    else:
+        _write_atomic_json(
+            recovery_receipt, recovery, "training runtime recovery receipt"
+        )
+    return True
+
+
 def adopt_unsealed_training_output(
     *,
     verified: VerifiedInputs,
@@ -2708,6 +2941,9 @@ def adopt_unsealed_training_output(
     publication = assembled / "training-publication.json"
     if publication.exists() or publication.is_symlink():
         raise ReproductionError("unsealed training output has a publication receipt")
+    _repair_unsealed_training_runtime(
+        assembled=assembled, verified=verified, contract=contract
+    )
     artifacts = _artifact_files(assembled)
     checksum_path = assembled / "checksums.sha256"
     rows = [
