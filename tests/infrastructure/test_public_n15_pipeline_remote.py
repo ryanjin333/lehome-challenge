@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import signal
 import shutil
 import stat
@@ -35,6 +36,144 @@ def _load_cli():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("override,allowed", [
+    ({}, True),
+    ({"PUBLICATION_RECEIPT": "/mnt/lehome/public-n15-runs/test-run/publication.json"}, True),
+    ({"PUBLICATION_RECEIPT": "/outside/publication.json"}, False),
+    ({"PROMOTION_RECEIPT": "/outside/promotion.json"}, False),
+    ({"PUBLICATION_RECEIPT": "/mnt/lehome/public-n15-runs/test-run/focused/publication.json"}, False),
+    ({"PROMOTION_RECEIPT": "/mnt/lehome/public-n15-runs/test-run/focused/promotion.json"}, False),
+    ({"CANDIDATE_SANITIZED_CONFIG": "/mnt/lehome/public-n15-runs/test-run/focused/config"}, False),
+])
+def test_focused_controller_places_prepared_views_beside_new_output(
+    tmp_path: Path, override: dict[str, str], allowed: bool,
+) -> None:
+    text = WRAPPER.read_text(encoding="utf-8")
+    function = text[text.index("focused_stage() {"):text.index("harvest_stage() {")]
+    result = subprocess.run(
+        ["bash", "-c", """
+remote() { printf '%s\\n' "$@"; cat >/dev/null; }
+REMOTE_PIPELINE_ROOT=/mnt/lehome/public-n15-runs/test-run
+TRAINING_ROOT=$REMOTE_PIPELINE_ROOT/training
+""" + function + "\nfocused_stage\n"],
+        check=True, capture_output=True, text=True,
+    )
+    arguments = result.stdout.splitlines()
+    output = Path(arguments[19])
+    assert Path(arguments[11]).parent == output.parent
+    assert Path(arguments[12]).parent == output.parent
+    assert Path(arguments[21]).parent == output.parent
+    assert Path(arguments[22]).parent == output.parent
+    # Exercise the real seal, not only the shell's path predicates: terminal
+    # receipts must not add files to the already authenticated execution tree.
+    from scripts import run_official_lehome_comparison as comparison
+    bundle = tmp_path / output.name
+    bundle.mkdir()
+    receipt = bundle / "comparison-receipt.json"
+    receipt.write_text("{}\n")
+    comparison.seal_execution_bundle(bundle)
+    for argument in (arguments[21], arguments[22]):
+        terminal = tmp_path / Path(argument).relative_to(output.parent)
+        terminal.write_text("{}\n")
+    comparison.validate_sealed_execution(receipt)
+    focused = (ROOT / "rollout_appliance/run_public_n15_focused_gate.sh").read_text()
+    start = focused.index('[[ "$(dirname -- "$PUBLICATION_RECEIPT")"')
+    end = focused.index('[[ "$REPOSITORY"', start)
+    checked = subprocess.run(
+        ["bash", "-c", 'fail() { echo "$*" >&2; exit 2; };\n' + focused[start:end]],
+        env={
+            **os.environ,
+            "OUTPUT_ROOT": str(output),
+            "CANDIDATE_SANITIZED_CONFIG": arguments[11],
+            "CANDIDATE_COMPATIBILITY_RECEIPT": arguments[12],
+            "PUBLICATION_RECEIPT": arguments[21],
+            "PROMOTION_RECEIPT": arguments[22],
+            **override,
+        },
+        capture_output=True, text=True,
+    )
+    assert (checked.returncode == 0) is allowed, checked.stderr
+
+
+@pytest.mark.parametrize("wrapper_name", [
+    "run_public_n15_focused_gate.sh", "run_public_n15_harvest.sh",
+])
+@pytest.mark.parametrize("docker_status", [0, 19])
+def test_downstream_docker_calls_use_noninteractive_privilege(
+    tmp_path: Path, wrapper_name: str, docker_status: int,
+) -> None:
+    text = (ROOT / "rollout_appliance" / wrapper_name).read_text()
+    definition = re.search(r"^docker\(\) \{[^\n]+\}$", text, re.MULTILINE)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_executable(fake_bin / "sudo", '''#!/bin/bash
+[[ "$1" == -n && "$2" == docker ]] || exit 91
+shift
+export FAKE_DOCKER_AUTHORIZED=1
+exec "$@"
+''')
+    _write_executable(fake_bin / "docker", '''#!/bin/bash
+[[ "${FAKE_DOCKER_AUTHORIZED:-}" == 1 ]] || exit 77
+printf '%s\\n' "$@"
+exit "$FAKE_DOCKER_STATUS"
+''')
+    result = subprocess.run(
+        ["bash", "-c", (definition.group(0) if definition else "")
+         + '\ndocker image inspect -- "a value with spaces"'],
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}",
+             "FAKE_DOCKER_STATUS": str(docker_status)},
+        capture_output=True, text=True,
+    )
+    assert result.returncode == docker_status, result.stderr
+    assert result.stdout.splitlines() == ["image", "inspect", "--", "a value with spaces"]
+
+
+@pytest.mark.parametrize("target_kind", ["config", "output", "outside", "symlink"])
+@pytest.mark.parametrize("chown_status", [0, 23])
+@pytest.mark.parametrize("wrapper_name", ["run_public_n15_focused_gate.sh", "run_public_n15_harvest.sh"])
+def test_focused_output_handoff_is_scoped_and_propagates_failure(
+    tmp_path: Path, target_kind: str, chown_status: int, wrapper_name: str,
+) -> None:
+    text = (ROOT / "rollout_appliance" / wrapper_name).read_text()
+    definition = re.search(r"^handoff_generated_directory\(\) \{\n.*?^\}", text, re.M | re.S)
+    assert definition is not None, "generated outputs have no host ownership handoff"
+    config, output, outside = (tmp_path / name for name in ("config", "output", "outside"))
+    for path in (config, output, outside):
+        path.mkdir()
+    target = {"config": config, "output": output, "outside": outside, "symlink": config}[target_kind]
+    if target_kind == "symlink":
+        config.rmdir()
+        config.symlink_to(outside, target_is_directory=True)
+    result = subprocess.run(
+        ["bash", "-c", '''
+set -euo pipefail
+fail() { echo "$*" >&2; exit 2; }
+sudo() { printf '%s\\n' "$@"; return "$CHOWN_STATUS"; }
+''' + definition.group(0) + '\nhandoff_generated_directory "$TARGET"'],
+        env={**os.environ, "CANDIDATE_SANITIZED_CONFIG": str(config), "OUTPUT_ROOT": str(output),
+             "HARVEST_ROOT": str(output),
+             "TARGET": str(target), "CHOWN_STATUS": str(chown_status)},
+        capture_output=True, text=True,
+    )
+    harvest = wrapper_name == "run_public_n15_harvest.sh"
+    if target_kind in {"outside", "symlink"} or (harvest and target_kind == "config"):
+        assert result.returncode != 0
+        assert not result.stdout
+    else:
+        assert result.returncode == chown_status, result.stderr
+        assert result.stdout.splitlines() == [
+            "-n", "chown", "-R", "--no-dereference", "--", f"{os.getuid()}:{os.getgid()}", str(target),
+        ]
+    if not harvest:
+        assert text.index('handoff_generated_directory "$CANDIDATE_SANITIZED_CONFIG"') < text.index('readonly CANDIDATE_SANITIZED_CONFIG_SHA256_BEFORE=')
+        assert text.index('handoff_generated_directory "$OUTPUT_ROOT"') < text.index('python3 - "$PROMOTION_RECEIPT"')
+    else:
+        assert 'done\n  handoff_generated_directory "$HARVEST_ROOT"\n  python3 "$BUILDER" assess-memory' in text
+        assert 'done\n    handoff_generated_directory "$HARVEST_ROOT"\n  fi' in text
+        for wave in ("0 4", "4 40"):
+            assert f'run_wave {wave}\nhandoff_generated_directory "$HARVEST_ROOT"' in text
 
 
 def _write_host_stage_seal(
@@ -1683,12 +1822,12 @@ def test_remote_completed_stage_is_adopted_and_existing_seal_rechecks_bytes(
         "training-identity.json": _canonical_json_bytes({"receipt": "training-identity"}),
         "training-publication.json": _canonical_json_bytes({"receipt": "training-publication"}),
         "comparison-receipt.json": _canonical_json_bytes({"receipt": "comparison"}),
-        "publication.json": _canonical_json_bytes({"receipt": "focused-publication"}),
-        "promotion.json": _canonical_json_bytes({"receipt": "promotion"}),
+        "focused-publication.json": _canonical_json_bytes({"receipt": "focused-publication"}),
+        "focused-promotion.json": _canonical_json_bytes({"receipt": "promotion"}),
     }
     for name, payload in sources.items():
         if completed_stage == "training" and name in {
-            "comparison-receipt.json", "publication.json", "promotion.json",
+            "comparison-receipt.json", "focused-publication.json", "focused-promotion.json",
         }:
             continue
         (remote_receipts / name).write_bytes(payload)
@@ -1730,7 +1869,7 @@ reconcile_remote_stage_seals
             (remote_receipts / Path(item["path"]).name).read_bytes()
         ).hexdigest()
 
-    mutation = "promotion.json" if completed_stage == "focused" else "training-identity.json"
+    mutation = "focused-promotion.json" if completed_stage == "focused" else "training-identity.json"
     (remote_receipts / mutation).write_bytes(_canonical_json_bytes({"tampered": True}))
     rejected = subprocess.run(
         command, cwd=ROOT, env=command_env, text=True, capture_output=True

@@ -31,11 +31,21 @@ readonly PREP_CONTAINER="lehome-n15-focused-prepare-$$"
 readonly EVAL_CONTAINER="lehome-n15-focused-eval-$$"
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
+# Match the training host boundary without granting the login user daemon access.
+docker() { sudo -n docker "$@"; }
 require_directory() {
   [[ "$1" == /* && "$1" != *".."* && -d "$1" && ! -L "$1" ]] || fail "$2 is unavailable or unsafe"
 }
 require_file() {
   [[ "$1" == /* && "$1" != *".."* && -f "$1" && ! -L "$1" ]] || fail "$2 is unavailable or unsafe"
+}
+handoff_generated_directory() {
+  # Call only after the producing container exits. Never include input trees.
+  [[ "$1" == "$CANDIDATE_SANITIZED_CONFIG" || "$1" == "$OUTPUT_ROOT" ]] \
+    || fail "ownership handoff is outside the generated outputs"
+  [[ "$1" == /* && -d "$1" && ! -L "$1" && "$(realpath -- "$1")" == "$1" ]] \
+    || fail "ownership handoff requires a real canonical directory"
+  sudo -n chown -R --no-dereference -- "$(id -u):$(id -g)" "$1"
 }
 cleanup() {
   docker rm -f "$PREP_CONTAINER" >/dev/null 2>&1 || true
@@ -48,7 +58,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 [[ $# -eq 0 ]] || fail "this wrapper accepts no positional arguments"
-command -v docker >/dev/null 2>&1 || fail "docker is unavailable"
+type -P docker >/dev/null 2>&1 || fail "docker is unavailable"
+command -v sudo >/dev/null 2>&1 || fail "sudo is unavailable"
 command -v git >/dev/null 2>&1 || fail "git is unavailable"
 require_directory "$REPO_ROOT" "runtime repository"
 require_directory "$SOURCE_ROOT" "official source checkout"
@@ -180,6 +191,7 @@ docker run --rm --pull never --init --network none --name "$PREP_CONTAINER" \
   --entrypoint bash "$ROLLOUT_IMAGE_ID" -lc "$PREP_SCRIPT"
 require_directory "$CANDIDATE_SANITIZED_CONFIG" "prepared candidate compatibility view"
 require_file "$CANDIDATE_COMPATIBILITY_RECEIPT" "prepared candidate compatibility receipt"
+handoff_generated_directory "$CANDIDATE_SANITIZED_CONFIG"
 readonly CANDIDATE_SANITIZED_CONFIG_SHA256_BEFORE="$(sha256sum -- "$CANDIDATE_SANITIZED_CONFIG/config.json" | awk '{print $1}')"
 readonly CANDIDATE_COMPATIBILITY_RECEIPT_SHA256_BEFORE="$(sha256sum -- "$CANDIDATE_COMPATIBILITY_RECEIPT" | awk '{print $1}')"
 
@@ -286,6 +298,7 @@ docker run --rm --pull never \
     --publication-receipt "$PUBLICATION_RECEIPT" \
     --promotion-receipt "$PROMOTION_RECEIPT"
 
+handoff_generated_directory "$OUTPUT_ROOT"
 python3 - "$PROMOTION_RECEIPT" <<'PY'
 import json, sys
 from pathlib import Path

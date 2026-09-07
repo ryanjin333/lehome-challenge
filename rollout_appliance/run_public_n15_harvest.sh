@@ -43,6 +43,15 @@ readonly DEFER_PROVIDER_STOP="${LEHOME_N15_DEFER_PROVIDER_STOP:-0}"
 HARVEST_TERMINAL_COMPLETE=0
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
+# Match the training host boundary without granting the login user daemon access.
+docker() { sudo -n docker "$@"; }
+handoff_generated_directory() {
+  # All producers must be joined before returning their outputs to the host.
+  [[ "$1" == "$HARVEST_ROOT" ]] || fail "ownership handoff is outside the harvest output"
+  [[ "$1" == /* && -d "$1" && ! -L "$1" && "$(realpath -- "$1")" == "$1" ]] \
+    || fail "ownership handoff requires a real canonical directory"
+  sudo -n chown -R --no-dereference -- "$(id -u):$(id -g)" "$1"
+}
 require_dir() {
   [[ "$1" == /* && "$1" != *".."* && -d "$1" && ! -L "$1" ]] \
     || fail "$2 is unavailable or unsafe"
@@ -108,7 +117,8 @@ trap 'exit 130' INT TERM
 
 [[ $# -eq 0 ]] || fail "this wrapper accepts no positional arguments"
 [[ "$DEFER_PROVIDER_STOP" == 0 || "$DEFER_PROVIDER_STOP" == 1 ]] || fail "defer provider stop must be exactly 0 or 1"
-command -v docker >/dev/null 2>&1 || fail "docker is unavailable"
+type -P docker >/dev/null 2>&1 || fail "docker is unavailable"
+command -v sudo >/dev/null 2>&1 || fail "sudo is unavailable"
 command -v git >/dev/null 2>&1 || fail "git is unavailable"
 command -v nebius >/dev/null 2>&1 || fail "Nebius CLI is unavailable"
 require_file "$BUILDER" "checked-in harvest contract builder"
@@ -291,6 +301,7 @@ run_admission_count() {
     if wait "${pids[$worker]}"; then code=0; else code=$?; fi
     printf '%s\t%s\n' "$worker" "$code" >>"$root/memory-status.tsv"
   done
+  handoff_generated_directory "$HARVEST_ROOT"
   python3 "$BUILDER" assess-memory --evidence-root "$root" --worker-count "$count" \
     --output "$root/memory-receipt.json" >/dev/null
   local passed
@@ -311,6 +322,7 @@ run_admission_count() {
       if wait "${pids[$worker]}"; then code=0; else code=$?; fi
       printf '%s\t%s\n' "$worker" "$code" >>"$root/smoke-status.tsv"
     done
+    handoff_generated_directory "$HARVEST_ROOT"
   fi
 }
 
@@ -432,6 +444,7 @@ run_wave() {
 }
 
 run_wave 0 4
+handoff_generated_directory "$HARVEST_ROOT"
 python3 "$BUILDER" build-process-status --tsv "$PROCESS_STATUS_TSV" \
   --expected-process-count 4 --output "$FIRST_PROCESS_STATUS" >/dev/null
 inspect_success_datasets_in_runtime 100 "$FIRST_SUCCESS_DATASETS"
@@ -443,6 +456,7 @@ python3 "$BUILDER" first-100 --manifest "$MANIFEST" \
   --outcomes "$FIRST_100_OUTCOMES" --output "$FIRST_100_GATE" >/dev/null
 
 run_wave 4 40
+handoff_generated_directory "$HARVEST_ROOT"
 chmod 0444 "$PROCESS_STATUS_TSV"
 python3 "$BUILDER" build-process-status --tsv "$PROCESS_STATUS_TSV" \
   --expected-process-count 40 --output "$FINAL_PROCESS_STATUS" >/dev/null

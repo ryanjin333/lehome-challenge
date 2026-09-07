@@ -67,7 +67,8 @@ readonly HOST_FOCUSED_STAGE_RECEIPT="$PIPELINE_ROOT/host-stage-focused-complete.
 readonly TRAINING_IDENTITY_RECEIPT="$TRAINING_ROOT/training-identity.json"
 readonly TRAINING_PUBLICATION_RECEIPT="$TRAINING_ROOT/training-publication.json"
 readonly FOCUSED_OUTPUT_ROOT="$REMOTE_PIPELINE_ROOT/focused"
-readonly FOCUSED_PROMOTION_RECEIPT="$FOCUSED_OUTPUT_ROOT/promotion.json"
+readonly FOCUSED_PUBLICATION_RECEIPT="$REMOTE_PIPELINE_ROOT/focused-publication.json"
+readonly FOCUSED_PROMOTION_RECEIPT="$REMOTE_PIPELINE_ROOT/focused-promotion.json"
 readonly HARVEST_ROOT="$REMOTE_PIPELINE_ROOT/harvest"
 readonly HARVEST_MANIFEST_RECEIPT="$PIPELINE_ROOT/harvest-manifest-receipt.json"
 readonly HARVEST_MANIFEST="$PIPELINE_ROOT/harvest-manifest.json"
@@ -1019,7 +1020,7 @@ SH
 }
 
 verify_remote_focused_chain() {
-  remote bash -s -- "$REMOTE_ROOT" "$FOCUSED_OUTPUT_ROOT" "$FOCUSED_OUTPUT_ROOT/publication.json" "$FOCUSED_PROMOTION_RECEIPT" <<'SH'
+  remote bash -s -- "$REMOTE_ROOT" "$FOCUSED_OUTPUT_ROOT" "$FOCUSED_PUBLICATION_RECEIPT" "$FOCUSED_PROMOTION_RECEIPT" <<'SH'
 set -euo pipefail
 root="$1"; output="$2"; publication="$3"; promotion="$4"; temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-verify-focused.XXXXXX")"; temporary="$temporary_root/receipt.json"; trap 'rm -rf -- "$temporary_root"' EXIT
 python3 "$root/scripts/run_official_lehome_comparison.py" verify-n15-focused --receipt "$output/comparison-receipt.json" --publication-receipt "$publication" --promotion-receipt "$temporary" >/dev/null
@@ -1107,7 +1108,7 @@ PY
 host_next_unfinished_stage() {
   python3 - "$HOST_TRAINING_STAGE_RECEIPT" "$HOST_FOCUSED_STAGE_RECEIPT" "$RUN_ID" \
     "$TRAINING_IDENTITY_RECEIPT" "$TRAINING_PUBLICATION_RECEIPT" \
-    "$FOCUSED_OUTPUT_ROOT/comparison-receipt.json" "$FOCUSED_OUTPUT_ROOT/publication.json" "$FOCUSED_PROMOTION_RECEIPT" <<'PY'
+    "$FOCUSED_OUTPUT_ROOT/comparison-receipt.json" "$FOCUSED_PUBLICATION_RECEIPT" "$FOCUSED_PROMOTION_RECEIPT" <<'PY'
 import json, re, stat, sys
 from pathlib import Path
 
@@ -1257,7 +1258,7 @@ reconcile_remote_stage_seals() {
     verify_remote_focused_chain || fail "remote focused completion is invalid"
     record_host_stage_completion focused "$HOST_FOCUSED_STAGE_RECEIPT" \
       "$FOCUSED_OUTPUT_ROOT/comparison-receipt.json" \
-      "$FOCUSED_OUTPUT_ROOT/publication.json" "$FOCUSED_PROMOTION_RECEIPT"
+      "$FOCUSED_PUBLICATION_RECEIPT" "$FOCUSED_PROMOTION_RECEIPT"
   elif [[ -e "$HOST_FOCUSED_STAGE_RECEIPT" || -L "$HOST_FOCUSED_STAGE_RECEIPT" ]]; then
     fail "host focused completion seal has no matching remote completion"
   fi
@@ -2853,7 +2854,7 @@ PY
 SH
 }
 focused_stage() {
-  remote bash -s -- "$REMOTE_ROOT" "$HF_TOKEN_FILE" "$RUNTIME_REVISION" "$SOURCE_ROOT" "$ASSETS_ROOT" "$METADATA_ROOT" "$TRAINING_ROOT/checkpoints/012000/pretrained_model" "$TRAINING_ROOT/training-identity.json" "$REMOTE_PIPELINE_ROOT/focused/candidate-config" "$REMOTE_PIPELINE_ROOT/focused/candidate-compatibility.json" "$REFERENCE_CHECKPOINT" "$REFERENCE_SANITIZED_CONFIG" "$REFERENCE_COMPATIBILITY" "$NATIVE_RUNTIME_EVIDENCE" "$NATIVE_DEPENDENCIES" "$FOCUSED_HF_CACHE" "$REMOTE_PIPELINE_ROOT/focused" "$PUBLIC_REPOSITORY" "$REMOTE_PIPELINE_ROOT/focused/publication.json" "$REMOTE_PIPELINE_ROOT/focused/promotion.json" <<'SH'
+  remote bash -s -- "$REMOTE_ROOT" "$HF_TOKEN_FILE" "$RUNTIME_REVISION" "$SOURCE_ROOT" "$ASSETS_ROOT" "$METADATA_ROOT" "$TRAINING_ROOT/checkpoints/012000/pretrained_model" "$TRAINING_ROOT/training-identity.json" "$REMOTE_PIPELINE_ROOT/focused-candidate-config" "$REMOTE_PIPELINE_ROOT/focused-candidate-compatibility.json" "$REFERENCE_CHECKPOINT" "$REFERENCE_SANITIZED_CONFIG" "$REFERENCE_COMPATIBILITY" "$NATIVE_RUNTIME_EVIDENCE" "$NATIVE_DEPENDENCIES" "$FOCUSED_HF_CACHE" "$REMOTE_PIPELINE_ROOT/focused" "$PUBLIC_REPOSITORY" "$REMOTE_PIPELINE_ROOT/focused-publication.json" "$REMOTE_PIPELINE_ROOT/focused-promotion.json" <<'SH'
 set -euo pipefail
 root="$1"; token="$2"; shift 2; test -f "$token" && test ! -L "$token"; export HF_TOKEN="$(cat "$token")"
 export LEHOME_OFFICIAL_RUNTIME_REVISION="$1" LEHOME_OFFICIAL_SOURCE_ROOT="$2" LEHOME_OFFICIAL_ASSETS_ROOT="$3" LEHOME_OFFICIAL_METADATA_ROOT="$4"
@@ -2889,7 +2890,7 @@ run_pipeline_after_runtime() {
   verify_remote_focused_chain || fail "focused receipt chain failed"
   record_host_stage_completion focused "$HOST_FOCUSED_STAGE_RECEIPT" \
     "$FOCUSED_OUTPUT_ROOT/comparison-receipt.json" \
-    "$FOCUSED_OUTPUT_ROOT/publication.json" "$FOCUSED_PROMOTION_RECEIPT"
+    "$FOCUSED_PUBLICATION_RECEIPT" "$FOCUSED_PROMOTION_RECEIPT"
   advance_paid_stage_admission_from_host_seals focused
   if [[ ! -e "$HARVEST_TERMINAL_RECEIPT" ]]; then
     if ! remote_file_exists "$REMOTE_PIPELINE_ROOT/harvest.publication.json"; then
