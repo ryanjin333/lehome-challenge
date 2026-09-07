@@ -1017,6 +1017,9 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert "compute image create" not in text
     assert "trap controller_cleanup EXIT" in text
     assert text.count("StrictHostKeyChecking=accept-new") == 2
+    assert "readonly SSH_READINESS_ATTEMPTS=36" in text
+    assert "readonly REMOTE_RUNTIME_ATTEMPTS=18" in text
+    assert "attempt <= REMOTE_RUNTIME_ATTEMPTS" in text
     assert "LEHOME_N15_MAX_BUDGET_USD" in text
     assert "LEHOME_N15_ESTIMATED_COST_USD" not in text
     assert "PROVIDER_HOURLY_CEILING_USD=3" in text

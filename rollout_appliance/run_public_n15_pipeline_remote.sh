@@ -25,7 +25,8 @@ readonly PROVIDER_HOURLY_CEILING_USD=3
 readonly TRAIN_TIMEOUT_SECONDS=43200
 readonly FOCUSED_TIMEOUT_SECONDS=14400
 readonly HARVEST_TIMEOUT_SECONDS=28800
-readonly SSH_READINESS_ATTEMPTS=18
+readonly SSH_READINESS_ATTEMPTS=36
+readonly REMOTE_RUNTIME_ATTEMPTS=18
 readonly SSH_READINESS_CONNECT_TIMEOUT_SECONDS=2
 readonly SSH_READINESS_HARD_TIMEOUT_SECONDS=3
 readonly SSH_READINESS_REAP_TIMEOUT_SECONDS=1
@@ -525,8 +526,9 @@ PY
 }
 wait_for_ssh_readiness() {
   local attempt
-  # Eighteen (3s probe + at most 2s group reaping) windows and seventeen 2s
-  # intervals bound this gate to 124 seconds even when post-connect SSH hangs.
+  # Thirty-six (3s probe + at most 2s group reaping) windows and thirty-five
+  # 2s intervals bound this gate to 250 seconds even when post-connect SSH
+  # hangs. Nebius can report RUNNING before the public NAT path is reachable.
   for (( attempt = 1; attempt <= SSH_READINESS_ATTEMPTS; attempt++ )); do
     if probe_ssh_readiness; then return 0; fi
     (( attempt == SSH_READINESS_ATTEMPTS )) || sleep "$SSH_READINESS_INTERVAL_SECONDS"
@@ -1388,9 +1390,9 @@ wait_for_remote_runtime() {
   # SSH can accept the controller before cloud-init creates boot-finished.
   # Re-run the whole read-only runtime gate within the existing boot-readiness
   # budget rather than stopping a guest during that short race.
-  for (( attempt = 1; attempt <= SSH_READINESS_ATTEMPTS; attempt++ )); do
+  for (( attempt = 1; attempt <= REMOTE_RUNTIME_ATTEMPTS; attempt++ )); do
     if validate_remote_runtime; then return 0; fi
-    (( attempt == SSH_READINESS_ATTEMPTS )) || sleep "$SSH_READINESS_INTERVAL_SECONDS"
+    (( attempt == REMOTE_RUNTIME_ATTEMPTS )) || sleep "$SSH_READINESS_INTERVAL_SECONDS"
   done
   return 1
 }
