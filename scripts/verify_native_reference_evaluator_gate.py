@@ -1286,7 +1286,17 @@ def capture_provider_observation(provider: object, *, expected_state: str) -> di
             _validate_instance,
         )
         raw = provider.get(EXACT_INSTANCE_ID)  # type: ignore[attr-defined]
+        spec = raw.get("spec") if isinstance(raw, Mapping) else None
+        if (
+            not isinstance(spec, Mapping)
+            or spec.get("preemptible") != {"on_preemption": "STOP"}
+        ):
+            raise NativeReferenceGateError(
+                "provider instance is not the exact preemptible STOP policy"
+            )
         observed = _validate_instance(raw)
+    except NativeReferenceGateError:
+        raise
     except Exception as error:
         raise NativeReferenceGateError("provider exact-instance readback failed") from error
     if observed.get("state") != expected_state:

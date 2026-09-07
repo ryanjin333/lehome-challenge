@@ -965,7 +965,7 @@ def test_provider_observation_uses_exact_adapter_shape_and_state() -> None:
     raw = {
         "metadata": {"id": "computeinstance-u00t6xfqhadrcmssa2", "name": "lehome-rollout"},
         "status": {"state": "RUNNING"},
-        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}]},
+        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}], "preemptible": {"on_preemption": "STOP"}},
     }
     class Provider:
         def get(self, instance_id: str) -> dict[str, object]:
@@ -974,6 +974,38 @@ def test_provider_observation_uses_exact_adapter_shape_and_state() -> None:
     receipt = capture_provider_observation(Provider(), expected_state="RUNNING")
     assert receipt["state"] == "RUNNING"
     assert receipt["provider_response_sha256"] == hashlib.sha256(json.dumps(raw, sort_keys=True, separators=(",", ":")).encode() + b"\n").hexdigest()
+
+
+@pytest.mark.parametrize(
+    "preemptible",
+    [None, {}, {"on_preemption": "DELETE"}, {"on_preemption": "STOP", "extra": True}],
+)
+def test_provider_observation_rejects_nonexact_preemptible_policy(
+    preemptible: object,
+) -> None:
+    from scripts.verify_native_reference_evaluator_gate import (
+        NativeReferenceGateError,
+        capture_provider_observation,
+    )
+
+    raw = {
+        "metadata": {"id": "computeinstance-u00t6xfqhadrcmssa2", "name": "lehome-rollout"},
+        "status": {"state": "STOPPED"},
+        "spec": {
+            "boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}},
+            "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}],
+        },
+    }
+    if preemptible is not None:
+        raw["spec"]["preemptible"] = preemptible
+
+    class Provider:
+        def get(self, instance_id: str) -> dict[str, object]:
+            assert instance_id == "computeinstance-u00t6xfqhadrcmssa2"
+            return raw
+
+    with pytest.raises(NativeReferenceGateError, match="preemptible"):
+        capture_provider_observation(Provider(), expected_state="STOPPED")
 
 
 def test_capture_provider_direct_script_entrypoint_resolves_repository_package(tmp_path: Path) -> None:
@@ -985,6 +1017,7 @@ def test_capture_provider_direct_script_entrypoint_resolves_repository_package(t
         "spec": {
             "boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}},
             "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}],
+            "preemptible": {"on_preemption": "STOP"},
         },
     }
     nebius = fake_bin / "nebius"

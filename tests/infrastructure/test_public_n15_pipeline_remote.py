@@ -1110,6 +1110,45 @@ def test_over_budget_plan_never_starts_the_mocked_exact_vm(tmp_path: Path) -> No
     assert not log.exists()
 
 
+@pytest.mark.parametrize("preemptible", [None, {"on_preemption": "DELETE"}])
+def test_nonpreemptible_provider_never_starts_exact_vm(
+    tmp_path: Path,
+    preemptible: object,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    log = tmp_path / "nebius.log"
+    raw = {
+        "metadata": {"id": "computeinstance-u00t6xfqhadrcmssa2", "name": "lehome-rollout"},
+        "status": {"state": "STOPPED"},
+        "spec": {
+            "boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}},
+            "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}],
+        },
+    }
+    if preemptible is not None:
+        raw["spec"]["preemptible"] = preemptible
+    (fake_bin / "nebius").write_text(
+        "#!/usr/bin/env python3\nimport json, os, sys\n"
+        "open(os.environ['FAKE_NEBIUS_LOG'], 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1:4] == ['compute', 'instance', 'start']: raise SystemExit(97)\n"
+        "print(json.dumps(" + repr(raw) + "))\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "ssh").write_text("#!/usr/bin/env bash\nexit 97\n", encoding="utf-8")
+    for command in (fake_bin / "nebius", fake_bin / "ssh"): command.chmod(0o755)
+    env = _wrapper_env(tmp_path, fake_bin, "n15-preemptible-admission")
+    env["FAKE_NEBIUS_LOG"] = str(log)
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True
+    )
+
+    assert result.returncode != 0
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert any("compute instance get" in call for call in calls)
+    assert all("compute instance start" not in call for call in calls)
+
+
 @pytest.mark.parametrize("resume_step", [0, 1499, 1501, 12000])
 def test_invalid_resume_boundary_fails_before_any_provider_call(
     tmp_path: Path, resume_step: int,
@@ -1905,7 +1944,7 @@ def test_atomic_controller_singleton_rejects_second_live_controller_without_stop
     provider = {
         "metadata": {"id": "computeinstance-u00t6xfqhadrcmssa2", "name": "lehome-rollout"},
         "status": {"state": "STATE"},
-        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}]},
+        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}], "preemptible": {"on_preemption": "STOP"}},
     }
     (fake_bin / "nebius").write_text(
         "#!/usr/bin/env python3\nimport json, os, sys\nfrom pathlib import Path\n"
@@ -2248,7 +2287,7 @@ def test_stale_controller_lock_is_reclaimed_without_killing_a_process(tmp_path: 
     provider = {
         "metadata": {"id": "computeinstance-u00t6xfqhadrcmssa2", "name": "lehome-rollout"},
         "status": {"state": "STOPPED"},
-        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}]},
+        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}], "preemptible": {"on_preemption": "STOP"}},
     }
     (fake_bin / "nebius").write_text(
         "#!/usr/bin/env python3\nimport json, os, sys\nfrom pathlib import Path\n"
@@ -3064,7 +3103,7 @@ def test_running_observation_waits_for_cloud_init_after_ssh_is_ready(tmp_path: P
     provider = {
         "metadata": {"id": "computeinstance-u00t6xfqhadrcmssa2", "name": "lehome-rollout"},
         "status": {"state": "STATE"},
-        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}]},
+        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}], "preemptible": {"on_preemption": "STOP"}},
     }
     (fake_bin / "nebius").write_text(
         "#!/usr/bin/env python3\n"
@@ -3145,7 +3184,7 @@ def test_running_observation_hard_stops_a_hanging_ssh_readiness_probe(tmp_path: 
     provider = {
         "metadata": {"id": "computeinstance-u00t6xfqhadrcmssa2", "name": "lehome-rollout"},
         "status": {"state": "STATE"},
-        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}]},
+        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}], "preemptible": {"on_preemption": "STOP"}},
     }
     (fake_bin / "nebius").write_text(
         "#!/usr/bin/env python3\n"
@@ -3211,7 +3250,7 @@ def test_running_observation_reaps_a_term_ignoring_ssh_readiness_probe(tmp_path:
     provider = {
         "metadata": {"id": "computeinstance-u00t6xfqhadrcmssa2", "name": "lehome-rollout"},
         "status": {"state": "STATE"},
-        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}]},
+        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}], "preemptible": {"on_preemption": "STOP"}},
     }
     (fake_bin / "nebius").write_text(
         "#!/usr/bin/env python3\n"
