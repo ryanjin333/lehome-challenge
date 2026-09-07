@@ -2787,13 +2787,14 @@ def cached_sha256(path):
 def verify_revision(revision):
     try:
         tree = api.list_repo_tree(repo_id=repository, repo_type="model", path_in_repo=prefix, revision=revision, recursive=True)
+        # The SDK fetches pages lazily, so missing paths raise during iteration.
+        remote_paths = {
+            item.rfilename[len(prefix) + 1:]
+            for item in tree
+            if getattr(item, "size", None) is not None and item.rfilename.startswith(prefix + "/")
+        }
     except EntryNotFoundError:
         return None
-    remote_paths = {
-        item.rfilename[len(prefix) + 1:]
-        for item in tree
-        if getattr(item, "size", None) is not None and item.rfilename.startswith(prefix + "/")
-    }
     if remote_paths != set(expected):
         return False
     for relative, digest in expected.items():

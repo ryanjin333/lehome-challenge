@@ -2669,6 +2669,8 @@ def test_training_publication_adopts_verified_upload_after_local_receipt_crash(
     token = tmp_path / "hf-token"; token.write_text("test-token\n", encoding="ascii")
     fake_site = tmp_path / "fake-site"; fake_site.mkdir()
     remote_store = tmp_path / "hf-store"; remote_store.mkdir()
+    # An existing repository revision need not contain this run's upload prefix.
+    (remote_store / ("0" * 40)).mkdir()
     upload_log = tmp_path / "uploads.log"
     download_log = tmp_path / "downloads.log"
     training_cache = tmp_path / "training-hf-cache"; training_cache.mkdir(mode=0o700)
@@ -2690,7 +2692,9 @@ class HfApi:
     def list_repo_tree(self, *, path_in_repo, revision, **kwargs):
         root = Path(os.environ["FAKE_HF_STORE"]) / revision / path_in_repo
         if not root.is_dir(): raise EntryNotFoundError(path_in_repo)
-        return [SimpleNamespace(rfilename=f"{path_in_repo}/{p.relative_to(root).as_posix()}", size=p.stat().st_size) for p in sorted(root.rglob("*")) if p.is_file()]
+        for p in sorted(root.rglob("*")):
+            if p.is_file():
+                yield SimpleNamespace(rfilename=f"{path_in_repo}/{p.relative_to(root).as_posix()}", size=p.stat().st_size)
     def upload_folder(self, *, folder_path, path_in_repo, **kwargs):
         log = Path(os.environ["FAKE_HF_UPLOAD_LOG"])
         with log.open("a") as stream: stream.write(f"upload\t{folder_path}\n")
