@@ -170,6 +170,27 @@ def _regular(path: Path, label: str) -> Path:
     return path.resolve(strict=True)
 
 
+def _executable(path: Path, label: str) -> Path:
+    """Resolve a regular executable, including the standard venv symlink."""
+
+    if not path.is_absolute():
+        raise TrainingIdentityError(f"{label} is unavailable or unsafe")
+    try:
+        link_metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+        target_metadata = resolved.stat()
+    except OSError:
+        raise TrainingIdentityError(f"{label} is unavailable or unsafe") from None
+    if (
+        not (stat.S_ISREG(link_metadata.st_mode) or stat.S_ISLNK(link_metadata.st_mode))
+        or not stat.S_ISREG(target_metadata.st_mode)
+        or target_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not os.access(resolved, os.X_OK)
+    ):
+        raise TrainingIdentityError(f"{label} is unavailable or unsafe")
+    return resolved
+
+
 def _manifest(path: Path) -> dict[str, str]:
     entries: dict[str, str] = {}
     try:
@@ -884,7 +905,7 @@ def validate_training_identity_receipt(
         raise TrainingIdentityError("compatible training LeRobot wheel identity mismatch")
     if _installed_tree(Path(runtime["lerobot_package_root"])) != (wheel_count, wheel_tree):
         raise TrainingIdentityError("installed LeRobot package differs from the compatible wheel")
-    python = _regular(Path(runtime["python_executable"]), "training Python executable proof")
+    python = _executable(Path(runtime["python_executable"]), "training Python executable proof")
     try:
         probe = subprocess.run(
             [str(python), "-I", "-c", "import json,sys; print(json.dumps(list(sys.version_info[:3])))"],

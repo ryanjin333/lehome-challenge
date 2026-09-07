@@ -1927,6 +1927,57 @@ def test_verify_training_output_requires_step_12000_receipts_logs_and_checksums(
     assert resumed == receipt
 
 
+def test_verify_training_output_accepts_a_venv_python_executable_symlink(
+    tmp_path: Path,
+) -> None:
+    from lehome import n15_reproduction as reproduction
+    from rollout_appliance.native_reference_site.training_identity import (
+        validate_training_identity_receipt,
+    )
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout,
+        source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id,
+        disk_id=contract.disk_id,
+        contract=contract,
+    )
+    root = _materialize_training_output(
+        tmp_path,
+        verified=verified,
+        contract=contract,
+    )
+    runtime_receipt = root / "evidence/runtime-receipt.json"
+    runtime = json.loads(runtime_receipt.read_text(encoding="ascii"))
+    interpreter = Path(runtime["python_executable"])
+    venv_python = tmp_path / "venv/bin/python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(interpreter)
+    runtime["python_executable"] = str(venv_python)
+    runtime_receipt.write_bytes(_canonical(runtime))
+    _write_training_checksums(root)
+
+    receipt = reproduction.verify_training_output(
+        verified=verified,
+        training_root=root,
+        contract=contract,
+    )
+    identity_path = root / "training-identity.json"
+    identity_path.write_bytes(_canonical(receipt))
+    admitted = validate_training_identity_receipt(
+        identity_path,
+        expected_contract=contract,
+        expected_pretrained_root=root / "checkpoints/012000/pretrained_model",
+    )
+
+    assert receipt["step"] == 12000
+    assert admitted["step"] == 12000
+
+
 def _rewrite_task1_identity(root: Path, receipt: dict[str, object], output: Path) -> None:
     _write_training_checksums(root)
     files = {

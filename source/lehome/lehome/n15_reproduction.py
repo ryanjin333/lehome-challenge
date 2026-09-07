@@ -636,6 +636,27 @@ def _regular_file(path: Path, label: str) -> Path:
     return path.resolve(strict=True)
 
 
+def _executable_file(path: Path, label: str) -> Path:
+    """Resolve a regular executable, including the standard venv symlink."""
+
+    if not path.is_absolute():
+        raise ReproductionError(f"{label} path is unsafe")
+    try:
+        link_metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+        target_metadata = resolved.stat()
+    except OSError:
+        raise ReproductionError(f"{label} is unavailable or unsafe") from None
+    if (
+        not (stat.S_ISREG(link_metadata.st_mode) or stat.S_ISLNK(link_metadata.st_mode))
+        or not stat.S_ISREG(target_metadata.st_mode)
+        or target_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not os.access(resolved, os.X_OK)
+    ):
+        raise ReproductionError(f"{label} is unavailable or unsafe")
+    return resolved
+
+
 def _regular_directory(path: Path, label: str) -> Path:
     if not path.is_absolute():
         raise ReproductionError(f"{label} path is unsafe")
@@ -2204,7 +2225,7 @@ def verify_training_output(
         or not isinstance(runtime["scheduler"], dict)
     ):
         raise ReproductionError("training runtime identity mismatch")
-    python_executable = _regular_file(
+    python_executable = _executable_file(
         Path(runtime["python_executable"]),
         "training Python executable proof",
     )
