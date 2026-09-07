@@ -1417,6 +1417,7 @@ def _execution_env(
     sanitized_config_root: Path | None,
     compatibility_receipt: Path | None,
     cloth_fidelity_monitor: bool = False,
+    dependency_site: str | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     python_path = [
@@ -1454,6 +1455,10 @@ def _execution_env(
         from scripts.verify_native_reference_evaluator_gate import PEFT_WHEEL_PATH
 
         python_path.insert(0, str(PEFT_WHEEL_PATH))
+        if dependency_site:
+            if dependency_site != "/flash/site-packages":
+                raise ComparisonError("N1.5 dependency overlay path is not the fixed RAM site")
+            python_path.insert(0, dependency_site)
         env["PYTHONPATH"] = os.pathsep.join(python_path)
     return env
 
@@ -1611,6 +1616,7 @@ def execute_n15_focused_comparison(args: argparse.Namespace) -> Path:
                     sanitized_config_root=sanitized_root,
                     compatibility_receipt=compatibility_receipt,
                     cloth_fidelity_monitor=True,
+                    dependency_site=os.environ.get("LEHOME_N15_DEPENDENCY_SITE"),
                 )
                 with log.open("xb") as stream:
                     result = subprocess.run(

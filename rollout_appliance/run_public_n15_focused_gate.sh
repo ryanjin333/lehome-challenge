@@ -163,11 +163,8 @@ docker run --rm --pull never --gpus all --entrypoint /opt/lehome-challenge/.venv
 chmod 0444 "$EVIDENCE_ROOT/cuda-runtime.json"
 
 PREP_SCRIPT='set -euo pipefail
-uv pip install --offline --no-deps --python /opt/lehome-challenge/.venv/bin/python \
-  "$NATIVE_DEPENDENCIES_ROOT/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl" \
-  "$NATIVE_DEPENDENCIES_ROOT/dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" \
-  "$NATIVE_DEPENDENCIES_ROOT/qwen_vl_utils-0.0.14-py3-none-any.whl" \
-  "$NATIVE_DEPENDENCIES_ROOT/torchdiffeq-0.2.5-py3-none-any.whl" >/dev/null
+/opt/lehome-challenge/.venv/bin/python /runtime/scripts/prepare_n15_dependency_overlay.py
+export PYTHONPATH="/flash/site-packages:$PYTHONPATH"
 /opt/lehome-challenge/.venv/bin/python /runtime/scripts/run_official_lehome_comparison.py \
   prepare-n15-candidate-compatibility \
   --candidate-checkpoint "$CANDIDATE_CHECKPOINT" \
@@ -176,6 +173,7 @@ uv pip install --offline --no-deps --python /opt/lehome-challenge/.venv/bin/pyth
   --compatibility-receipt "$CANDIDATE_COMPATIBILITY_RECEIPT"'
 
 docker run --rm --pull never --init --network none --name "$PREP_CONTAINER" \
+  --tmpfs /flash:rw,exec,size=2g,mode=700 \
   --mount "type=bind,src=$REPO_ROOT,dst=/runtime,readonly" \
   --mount "type=bind,src=$CANDIDATE_TRAINING_ROOT,dst=$CANDIDATE_TRAINING_ROOT,readonly" \
   --mount "type=bind,src=$CANDIDATE_CHECKPOINT,dst=$CANDIDATE_CHECKPOINT,readonly" \
@@ -217,11 +215,8 @@ mounts=(
 )
 
 CONTAINER_SCRIPT='set -euo pipefail
-uv pip install --offline --no-deps --python /opt/lehome-challenge/.venv/bin/python \
-  "$NATIVE_DEPENDENCIES_ROOT/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl" \
-  "$NATIVE_DEPENDENCIES_ROOT/dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" \
-  "$NATIVE_DEPENDENCIES_ROOT/qwen_vl_utils-0.0.14-py3-none-any.whl" \
-  "$NATIVE_DEPENDENCIES_ROOT/torchdiffeq-0.2.5-py3-none-any.whl" >/dev/null
+/opt/lehome-challenge/.venv/bin/python /runtime/scripts/prepare_n15_dependency_overlay.py
+export PYTHONPATH="/flash/site-packages:$PYTHONPATH"
 /isaac-sim/python.sh -m scripts.run_official_lehome_comparison run-n15-focused \
   --profile n15-focused \
   --source-root /official/lehome \
@@ -250,6 +245,8 @@ uv pip install --offline --no-deps --python /opt/lehome-challenge/.venv/bin/pyth
 # Both policies use the same native LeRobot adapter. The Python harness executes
 # candidate-n15 completely before reference-n15 and never starts a policy server.
 docker run --rm --pull never --gpus all --init --network host --shm-size=8g \
+  --tmpfs /flash:rw,exec,size=2g,mode=700 \
+  --env LEHOME_N15_DEPENDENCY_SITE=/flash/site-packages \
   --name "$EVAL_CONTAINER" "${mounts[@]}" \
   --env PYTHONPATH=/runtime/source/lehome:/runtime \
   --env GIT_CONFIG_COUNT=2 \

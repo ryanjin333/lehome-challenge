@@ -162,7 +162,8 @@ def test_n15_focused_wrapper_runs_only_native_candidate_and_reference_sequential
     assert "GIT_CONFIG_VALUE_0=/official/lehome" in text
     assert "GIT_CONFIG_VALUE_1=/official/assets" in text
     assert "/mnt/lehome/reference-native/dependencies" in text
-    assert "uv pip install --offline --no-deps" in text
+    assert "uv pip install" not in text
+    assert "prepare_n15_dependency_overlay.py" in text
 
 
 def test_n15_focused_wrapper_builds_candidate_config_view_from_training_receipt() -> None:
