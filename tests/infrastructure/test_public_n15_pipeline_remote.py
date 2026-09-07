@@ -1120,6 +1120,37 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     subprocess.run(["bash", "-n", str(WRAPPER)], check=True)
 
 
+def test_remote_helper_preserves_empty_positional_arguments(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "ssh",
+        "#!/usr/bin/env bash\n"
+        "shift 5\n"
+        "exec bash -c \"$*\"\n",
+    )
+    command = """
+source "$1"
+remote bash -s -- alpha "" omega <<'SH'
+set -u
+printf '<%s>|<%s>|<%s>\\n' "$1" "$2" "$3"
+SH
+"""
+    result = subprocess.run(
+        ["bash", "-c", command, "_", str(WRAPPER)],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "LEHOME_N15_SSH_TARGET": "operator@example",
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "<alpha>|<>|<omega>\n"
+
+
 def test_remote_wrapper_never_runs_downstream_after_a_failed_gate() -> None:
     text = WRAPPER.read_text(encoding="utf-8")
     assert "verify_remote_training_chain" in text

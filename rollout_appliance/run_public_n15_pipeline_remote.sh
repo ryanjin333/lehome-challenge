@@ -472,7 +472,17 @@ controller_cleanup() {
   exit "$status"
 }
 
-remote() { ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$SSH_TARGET" "$@"; }
+remote() {
+  local remote_command="" argument quoted
+  # OpenSSH joins command arguments with spaces before invoking the remote
+  # shell. Quote each argument first so empty resume fields cannot disappear
+  # and shift the recovery protocol's positional contract.
+  for argument in "$@"; do
+    printf -v quoted '%q' "$argument"
+    remote_command+="${remote_command:+ }$quoted"
+  done
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$SSH_TARGET" "$remote_command"
+}
 probe_ssh_readiness() {
   python3 - "$SSH_READINESS_CONNECT_TIMEOUT_SECONDS" "$SSH_READINESS_HARD_TIMEOUT_SECONDS" "$SSH_READINESS_REAP_TIMEOUT_SECONDS" "$SSH_TARGET" <<'PY'
 import os
