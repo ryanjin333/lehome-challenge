@@ -1026,6 +1026,8 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert "PROVIDER_HOURLY_CEILING_USD=3" in text
     assert "run_public_n15_reproduction.py lifecycle-plan" in text
     assert 'readonly TRAINING_UV="${LEHOME_N15_TRAINING_UV:-}"' in text
+    assert '"$python_bin" - "$root" "$repository" "$prefix" "$cache_root" <<\'PY\'' in text
+    assert '"$python_bin" - "$1" "$2" "$3" "$4" "$5" <<\'PY\'' in text
     assert 'test -x "$uv_bin" && test ! -L "$uv_bin"' in text
     assert 'export UV_CACHE_DIR="$(dirname -- "$python_bin")/.uv-cache"' in text
     assert 'export TMPDIR="$(dirname -- "$python_bin")/.uv-tmp"' in text
@@ -2748,6 +2750,7 @@ def hf_hub_download(*, filename, revision, cache_dir, token, **kwargs):
         "FAKE_HF_DOWNLOAD_CACHE": str(training_cache / "training-publication-readback"),
         "FAKE_HF_SNAPSHOT": str(training.parent / f".{training.name}.publication-snapshot"),
         "LEHOME_N15_TRAINING_HF_CACHE_ROOT": str(training_cache),
+        "LEHOME_N15_TRAINING_PYTHON": str(Path(sys.executable).resolve()),
         "PYTHONPATH": f"{fake_site}:{ROOT / 'source/lehome'}",
     })
     harness = 'source "$WRAPPER_PATH"; remote() { command "$@"; }; publish_training_readback'

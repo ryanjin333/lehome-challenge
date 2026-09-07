@@ -792,9 +792,10 @@ SH
 }
 
 verify_remote_training_publication() {
-  remote bash -s -- "$TRAINING_PUBLICATION_RECEIPT" "$PUBLIC_REPOSITORY" "n15-public/$RUN_ID/training" "$TRAINING_ROOT" "$TRAINING_HF_CACHE" <<'SH'
+  remote bash -s -- "$TRAINING_PUBLICATION_RECEIPT" "$PUBLIC_REPOSITORY" "n15-public/$RUN_ID/training" "$TRAINING_ROOT" "$TRAINING_HF_CACHE" "$TRAINING_PYTHON" <<'SH'
 set -euo pipefail
-python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
+python_bin="$6"; test -x "$python_bin"
+"$python_bin" - "$1" "$2" "$3" "$4" "$5" <<'PY'
 import hashlib, json, os, re, stat, sys
 from pathlib import Path, PurePosixPath
 from huggingface_hub import HfApi, hf_hub_download
@@ -2330,10 +2331,10 @@ SH
 
 publish_training_readback() {
   # The remote publisher uses a fresh, immutable prefix and anonymous byte readback.
-  remote bash -s -- "$TRAINING_ROOT" "$PUBLIC_REPOSITORY" "n15-public/$RUN_ID/training" "$HF_TOKEN_FILE" "$TRAINING_HF_CACHE" <<'SH'
+  remote bash -s -- "$TRAINING_ROOT" "$PUBLIC_REPOSITORY" "n15-public/$RUN_ID/training" "$HF_TOKEN_FILE" "$TRAINING_HF_CACHE" "$TRAINING_PYTHON" <<'SH'
 set -euo pipefail
-root="$1"; repository="$2"; prefix="$3"; token_file="$4"; cache_root="$5"; test -f "$token_file" && test ! -L "$token_file"; export HF_TOKEN="$(cat "$token_file")"
-python3 - "$root" "$repository" "$prefix" "$cache_root" <<'PY'
+root="$1"; repository="$2"; prefix="$3"; token_file="$4"; cache_root="$5"; python_bin="$6"; test -f "$token_file" && test ! -L "$token_file"; test -x "$python_bin"; export HF_TOKEN="$(cat "$token_file")"
+"$python_bin" - "$root" "$repository" "$prefix" "$cache_root" <<'PY'
 import hashlib, json, os, re, shutil, stat, sys, tempfile
 from pathlib import Path, PurePosixPath
 from huggingface_hub import HfApi, hf_hub_download
