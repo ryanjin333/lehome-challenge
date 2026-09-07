@@ -211,13 +211,19 @@ def _manifest(path: Path) -> dict[str, str]:
     return entries
 
 
-def _json(path: Path, label: str) -> dict[str, object]:
+def _json(path: Path, label: str, *, canonical: bool = True) -> dict[str, object]:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value = dict(pairs)
+        if len(value) != len(pairs):
+            raise TrainingIdentityError(f"{label} contains duplicate JSON keys")
+        return value
+
     raw = _regular(path, label).read_bytes()
     try:
-        value = json.loads(raw)
+        value = json.loads(raw, object_pairs_hook=unique_object)
     except (UnicodeError, json.JSONDecodeError):
         raise TrainingIdentityError(f"{label} is invalid JSON") from None
-    if not isinstance(value, dict) or raw != _canonical(value):
+    if not isinstance(value, dict) or (canonical and raw != _canonical(value)):
         raise TrainingIdentityError(f"{label} is not canonical JSON")
     return value
 
@@ -602,8 +608,15 @@ def validate_training_identity_receipt(
     }
     if not required_state.issubset(state_names):
         raise TrainingIdentityError("upstream training-state structure is incomplete")
-    step_receipt = _json(training_state / "training_step.json", "training-step evidence")
-    if set(step_receipt) != {"step"} or step_receipt.get("step") != 12000:
+    # Upstream LeRobot writes indented JSON; the checksum manifest binds its bytes.
+    step_receipt = _json(
+        training_state / "training_step.json", "training-step evidence", canonical=False
+    )
+    if (
+        set(step_receipt) != {"step"}
+        or type(step_receipt.get("step")) is not int
+        or step_receipt["step"] != 12000
+    ):
         raise TrainingIdentityError("training-step evidence does not prove step 12000")
     if validated_lineage:
         scheduler = _json(

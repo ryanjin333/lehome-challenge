@@ -2108,6 +2108,52 @@ def test_verify_training_output_validates_a_venv_python_executable_symlink(
     assert admitted["step"] == 12000
 
 
+@pytest.mark.parametrize("raw,valid", [
+    (json.dumps({"step": 12000}, indent=4).encode(), True),
+    (b'{"step":11999,"step":12000}', False),
+    (b'{"step":1.2e4}', False),
+])
+def test_candidate_identity_validates_upstream_step_json(
+    tmp_path: Path, raw: bytes, valid: bool,
+) -> None:
+    from lehome import n15_reproduction as reproduction
+    from rollout_appliance.native_reference_site.training_identity import (
+        TrainingIdentityError,
+        validate_training_identity_receipt,
+    )
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout, source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id, disk_id=contract.disk_id, contract=contract,
+    )
+    root = _materialize_training_output(tmp_path, verified=verified, contract=contract)
+    step_path = root / "checkpoints/012000/training_state/training_step.json"
+    step_path.write_bytes(raw)
+    _write_training_checksums(root)
+    receipt = reproduction.verify_training_output(
+        verified=verified, training_root=root, contract=contract,
+    )
+    identity_path = root / "training-identity.json"
+    identity_path.write_bytes(_canonical(receipt))
+    if not valid:
+        with pytest.raises(TrainingIdentityError, match="training-step evidence"):
+            validate_training_identity_receipt(
+                identity_path, expected_contract=contract,
+                expected_pretrained_root=root / "checkpoints/012000/pretrained_model",
+            )
+        return
+    admitted = validate_training_identity_receipt(
+        identity_path, expected_contract=contract,
+        expected_pretrained_root=root / "checkpoints/012000/pretrained_model",
+    )
+    assert admitted["step"] == 12000
+    assert step_path.read_bytes() == raw
+
+
 def _rewrite_task1_identity(root: Path, receipt: dict[str, object], output: Path) -> None:
     _write_training_checksums(root)
     files = {
