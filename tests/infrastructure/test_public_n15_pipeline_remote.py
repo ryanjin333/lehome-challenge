@@ -717,9 +717,19 @@ def test_completed_12k_canonical_unsealed_topology_is_sealed_without_retraining(
         (staging / component).rename(training / component)
     staging.rmdir()
     training.chmod(0o700)
-    (training / "wandb/run").mkdir(parents=True, exist_ok=True)
-    debug_log = training / "wandb/run/debug-core.log"
-    debug_log.write_text("permission topology", encoding="utf-8")
+    wandb_run = "offline-run-20260903_070403-ybfzdp6h"
+    wandb_logs = training / "wandb" / wandb_run / "logs"
+    wandb_logs.mkdir(parents=True, exist_ok=True)
+    (wandb_logs / "debug.log").write_text("debug", encoding="utf-8")
+    (wandb_logs / "debug-internal.log").write_text("internal", encoding="utf-8")
+    (training / "wandb/latest-run").symlink_to(wandb_run)
+    (training / "wandb/debug.log").symlink_to(f"{wandb_run}/logs/debug.log")
+    (training / "wandb/debug-internal.log").symlink_to(
+        f"{wandb_run}/logs/debug-internal.log"
+    )
+    (wandb_logs / "debug-core.log").symlink_to(
+        "/root/.cache/wandb/logs/core-debug-20260903_070405.log"
+    )
     (training / "wandb").chmod(0o700)
     sudo_trace = tmp_path / "canonical-sudo-argv.json"
 
@@ -740,9 +750,95 @@ def test_completed_12k_canonical_unsealed_topology_is_sealed_without_retraining(
     assert training.is_dir() and not upstream.exists() and not staging.exists()
     assert (training / "checksums.sha256").is_file()
     assert (training / "training-identity.json").is_file()
+    assert (wandb_logs / "debug.log").is_file()
+    assert (wandb_logs / "debug-internal.log").is_file()
+    for transient in (
+        training / "wandb/latest-run",
+        training / "wandb/debug.log",
+        training / "wandb/debug-internal.log",
+        wandb_logs / "debug-core.log",
+    ):
+        assert not transient.is_symlink()
     assert json.loads(sudo_trace.read_text(encoding="utf-8"))[7] == "canonical"
     trace = Path(env["FAKE_TRACE"]).read_text(encoding="utf-8")
     assert trace.count("native:/opt/lehome-challenge/.venv/bin/lerobot-train") == 1
+
+
+def test_completed_12k_recovery_rejects_spoofed_wandb_symlink_before_mutation(
+    tmp_path: Path,
+) -> None:
+    env, _contract, training, staging, upstream = _remote_train_fixture(tmp_path)
+    interrupted = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-spoofed-wandb", interrupt_point="after-trainer",
+        complete=True,
+    )
+    assert interrupted.returncode == 130, interrupted.stderr
+    shutil.rmtree(staging / "eagle-home")
+    upstream.rename(training)
+    for component in ("evidence", "logs", "runtime"):
+        (staging / component).rename(training / component)
+    staging.rmdir()
+    (training / "wandb").mkdir(exist_ok=True)
+    (training / "wandb/debug.log").symlink_to("../../outside")
+    order = tmp_path / "spoofed-wandb-order"
+
+    recovered = _run_actual_remote_train_stage(
+        {
+            **env,
+            "LEHOME_N15_TEST_OWNERSHIP_ORDER_TRACE": str(order),
+            "LEHOME_N15_RECOVER_COMPLETED_12K": "1",
+        },
+        attempt_id="attempt-spoofed-wandb-recovery", complete=False,
+    )
+
+    assert recovered.returncode != 0
+    assert not order.exists(), "unsafe W&B link must fail before any mutation"
+    assert (training / "wandb/debug.log").is_symlink()
+    assert not (training / "training-identity.json").exists()
+    assert Path(env["FAKE_TRACE"]).read_text(encoding="utf-8").count(
+        "native:/opt/lehome-challenge/.venv/bin/lerobot-train"
+    ) == 1
+
+
+def test_completed_12k_split_recovery_rejects_duplicate_wandb_sets_before_mutation(
+    tmp_path: Path,
+) -> None:
+    env, _contract, training, staging, upstream = _remote_train_fixture(tmp_path)
+    interrupted = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-duplicate-wandb", interrupt_point="after-trainer",
+        complete=True,
+    )
+    assert interrupted.returncode == 130, interrupted.stderr
+
+    wandb_run = "offline-run-20260903_070403-ybfzdp6h"
+    for root in (upstream, staging):
+        logs = root / "wandb" / wandb_run / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / "debug.log").write_text("debug", encoding="utf-8")
+        (logs / "debug-internal.log").write_text("internal", encoding="utf-8")
+        (root / "wandb/latest-run").symlink_to(wandb_run)
+        (root / "wandb/debug.log").symlink_to(f"{wandb_run}/logs/debug.log")
+        (root / "wandb/debug-internal.log").symlink_to(
+            f"{wandb_run}/logs/debug-internal.log"
+        )
+        (logs / "debug-core.log").symlink_to(
+            "/root/.cache/wandb/logs/core-debug-20260903_070405.log"
+        )
+    order = tmp_path / "duplicate-wandb-order"
+
+    recovered = _run_actual_remote_train_stage(
+        {**env, "LEHOME_N15_TEST_OWNERSHIP_ORDER_TRACE": str(order)},
+        attempt_id="attempt-duplicate-wandb-recovery", complete=False,
+    )
+
+    assert recovered.returncode != 0
+    assert not order.exists(), "duplicate W&B sets must fail before any mutation"
+    for root in (upstream, staging):
+        assert (root / "wandb/latest-run").is_symlink()
+        assert not (root / "training-identity.json").exists()
+    assert Path(env["FAKE_TRACE"]).read_text(encoding="utf-8").count(
+        "native:/opt/lehome-challenge/.venv/bin/lerobot-train"
+    ) == 1
 
 
 def test_recovery_only_mode_rejects_absent_canonical_output_without_trainer(

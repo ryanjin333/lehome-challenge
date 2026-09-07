@@ -1424,7 +1424,7 @@ repair_completed_output_ownership() {
   ! pgrep -f '/opt/lehome-challenge/.venv/bin/lerobot-train([[:space:]]|$)' >/dev/null
   ! pgrep -f "$root/rollout_appliance/run_public_n15_pipeline_remote.sh" >/dev/null
   sudo -n python3 - "$source_root" "$training_root" "$staging_root" "$upstream_output" "$topology" "$(id -u)" "$(id -g)" <<'PY'
-import ctypes, errno, os, platform, resource, stat, sys
+import ctypes, errno, os, platform, re, resource, stat, sys
 from pathlib import Path
 
 source, training, staging, upstream = map(Path, sys.argv[1:5])
@@ -1595,6 +1595,7 @@ def exact_completed_boundary(root):
 
 opened_roots = []
 planned = []
+transient_links = []
 try:
     # Open roots from the authenticated protected parent, not by a mutable
     # absolute string.  RESOLVE_NO_XDEV rejects a root replaced by a bind mount.
@@ -1620,10 +1621,34 @@ try:
         raise SystemExit("completed-output ownership repair descriptor limit is unsafe")
 
     def plan_entry(kind, relative, descriptor, metadata):
-        if soft_limit != resource.RLIM_INFINITY and len(planned) + len(opened_roots) + 16 >= soft_limit:
+        if soft_limit != resource.RLIM_INFINITY and len(planned) + len(transient_links) + len(opened_roots) + 16 >= soft_limit:
             os.close(descriptor)
             raise SystemExit("completed-output ownership repair cannot retain an authenticated tree")
         planned.append((kind, relative, descriptor, metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)))
+
+    wandb_run = r"offline-run-[0-9]{8}_[0-9]{6}-[a-z0-9]{8}"
+    def transient_wandb_target(relative, target):
+        if relative == "wandb/latest-run" and re.fullmatch(wandb_run, target):
+            return target
+        match = re.fullmatch(r"wandb/(debug(?:-internal)?\.log)", relative)
+        if match:
+            expected_name = match.group(1)
+            run_match = re.fullmatch(rf"({wandb_run})/logs/{re.escape(expected_name)}", target)
+            return run_match.group(1) if run_match else None
+        match = re.fullmatch(rf"wandb/({wandb_run})/logs/debug-core\.log", relative)
+        if match and re.fullmatch(r"/root/\.cache/wandb/logs/core-debug-[0-9]{8}_[0-9]{6}\.log", target):
+            return match.group(1)
+        return None
+
+    def plan_transient_link(relative, descriptor, parent, name, metadata, target, run_name):
+        if soft_limit != resource.RLIM_INFINITY and len(planned) + len(transient_links) + len(opened_roots) + 16 >= soft_limit:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise SystemExit("completed-output ownership repair cannot retain an authenticated tree")
+        transient_links.append(
+            (relative, descriptor, parent, name, metadata.st_dev, metadata.st_ino,
+             stat.S_IFMT(metadata.st_mode), target, run_name)
+        )
 
     def validate_walk(parent, parts, *, allow_last):
         metadata = os.fstat(parent)
@@ -1637,9 +1662,19 @@ try:
                 if metadata.st_dev != expected_device:
                     raise SystemExit("completed-output ownership repair crosses filesystems")
                 if stat.S_ISLNK(metadata.st_mode):
-                    if metadata.st_nlink != 1 or not (allow_last and relative == "checkpoints/last" and os.readlink(entry.name, dir_fd=parent) == "012000"):
+                    target = os.readlink(entry.name, dir_fd=parent)
+                    if metadata.st_nlink != 1:
                         raise SystemExit("completed-output ownership repair symlink is unsafe")
-                    plan_entry("link", relative, open_link(parent, entry.name), metadata)
+                    if allow_last and relative == "checkpoints/last" and target == "012000":
+                        plan_entry("link", relative, open_link(parent, entry.name), metadata)
+                    else:
+                        run_name = transient_wandb_target(relative, target)
+                        if run_name is None:
+                            raise SystemExit("completed-output ownership repair symlink is unsafe")
+                        plan_transient_link(
+                            relative, open_link(parent, entry.name), parent, entry.name,
+                            metadata, target, run_name,
+                        )
                 elif stat.S_ISDIR(metadata.st_mode):
                     child = open_directory(parent, entry.name)
                     plan_entry("directory", relative, child, metadata)
@@ -1656,6 +1691,50 @@ try:
         planned.append(("directory", "", descriptor, root_metadata.st_dev, root_metadata.st_ino, stat.S_IFMT(root_metadata.st_mode)))
         validate_walk(descriptor, (), allow_last=allow_last)
 
+    if transient_links:
+        if len(transient_links) != 4:
+            raise SystemExit("completed-output transient W&B symlink count is invalid")
+        runs = {item[8] for item in transient_links}
+        if len(runs) != 1:
+            raise SystemExit("completed-output transient W&B symlinks are inconsistent")
+        run_name = next(iter(runs))
+        expected_transient = {
+            "wandb/latest-run",
+            "wandb/debug.log",
+            "wandb/debug-internal.log",
+            f"wandb/{run_name}/logs/debug-core.log",
+        }
+        if {item[0] for item in transient_links} != expected_transient:
+            raise SystemExit("completed-output transient W&B symlink set is incomplete")
+
+    # W&B creates three convenience links plus one root-cache debug link. They
+    # are neither model state nor training evidence, and the canonical output
+    # contract forbids them. Remove only this fully authenticated, coherent
+    # four-link set after the entire graph has passed validation.
+    trace_path = os.environ.get("LEHOME_N15_TEST_OWNERSHIP_ORDER_TRACE")
+    for relative, descriptor, parent, name, device, inode, mode, target, _ in transient_links:
+        before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (
+            (before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode)) != (device, inode, mode)
+            or before.st_nlink != 1
+            or os.readlink(name, dir_fd=parent) != target
+        ):
+            raise SystemExit("completed-output transient W&B symlink changed")
+        if descriptor >= 0:
+            current = os.fstat(descriptor)
+            if (
+                (current.st_dev, current.st_ino, stat.S_IFMT(current.st_mode)) != (device, inode, mode)
+                or current.st_nlink != 1
+            ):
+                raise SystemExit("completed-output transient W&B symlink changed")
+        elif not TEST_FALLBACK:
+            raise SystemExit("completed-output transient W&B symlink descriptor is unavailable")
+        if trace_path and TEST_FALLBACK:
+            with open(trace_path, "a", encoding="ascii") as stream:
+                stream.write(f"unlink:{relative}\n")
+        os.unlink(name, dir_fd=parent)
+        os.fsync(parent)
+
     # Every descriptor in `planned` was authenticated before mutation.  A
     # later pathname swap cannot redirect fchown outside this exact tree.
     # Change leaf files/links first, then directories deepest-first, and each
@@ -1669,7 +1748,6 @@ try:
             return (1, -len(relative.split("/")), relative)
         return (2, 0, relative)
 
-    trace_path = os.environ.get("LEHOME_N15_TEST_OWNERSHIP_ORDER_TRACE")
     for kind, relative, descriptor, device, inode, mode in sorted(planned, key=mutation_order):
         if kind == "link" and descriptor == -1 and TEST_FALLBACK:
             continue
@@ -1690,6 +1768,11 @@ try:
             raise SystemExit("completed-output ownership repair did not take ownership")
 finally:
     closed = set()
+    for _, descriptor, *_ in transient_links:
+        if descriptor >= 0 and descriptor not in closed:
+            closed.add(descriptor)
+            try: os.close(descriptor)
+            except OSError: pass
     for _, _, descriptor, *_ in planned:
         if descriptor < 0:
             continue
