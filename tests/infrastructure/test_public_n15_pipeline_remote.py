@@ -1017,7 +1017,8 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert "compute image create" not in text
     assert "trap controller_cleanup EXIT" in text
     assert text.count("StrictHostKeyChecking=accept-new") == 2
-    assert "readonly SSH_READINESS_ATTEMPTS=36" in text
+    assert "readonly SSH_READINESS_ATTEMPTS=24" in text
+    assert "readonly SSH_READINESS_HARD_TIMEOUT_SECONDS=8" in text
     assert "readonly REMOTE_RUNTIME_ATTEMPTS=18" in text
     assert "attempt <= REMOTE_RUNTIME_ATTEMPTS" in text
     assert "LEHOME_N15_MAX_BUDGET_USD" in text
@@ -3328,11 +3329,11 @@ def test_running_observation_hard_stops_a_hanging_ssh_readiness_probe(tmp_path: 
     started = time.monotonic()
     process = subprocess.Popen(["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     try:
-        _, stderr = process.communicate(timeout=8)
+        _, stderr = process.communicate(timeout=14)
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL); process.communicate()
         pytest.fail("readiness probe exceeded the test wall-clock bound")
-    assert time.monotonic() - started < 8
+    assert time.monotonic() - started < 14
     assert process.returncode != 0
     assert "exact VM did not become SSH-ready" in stderr
     assert trace.read_text(encoding="utf-8").splitlines()[0] == "start"

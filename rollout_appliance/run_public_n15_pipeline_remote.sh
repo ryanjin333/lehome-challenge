@@ -25,10 +25,10 @@ readonly PROVIDER_HOURLY_CEILING_USD=3
 readonly TRAIN_TIMEOUT_SECONDS=43200
 readonly FOCUSED_TIMEOUT_SECONDS=14400
 readonly HARVEST_TIMEOUT_SECONDS=28800
-readonly SSH_READINESS_ATTEMPTS=36
+readonly SSH_READINESS_ATTEMPTS=24
 readonly REMOTE_RUNTIME_ATTEMPTS=18
 readonly SSH_READINESS_CONNECT_TIMEOUT_SECONDS=2
-readonly SSH_READINESS_HARD_TIMEOUT_SECONDS=3
+readonly SSH_READINESS_HARD_TIMEOUT_SECONDS=8
 readonly SSH_READINESS_REAP_TIMEOUT_SECONDS=1
 readonly SSH_READINESS_INTERVAL_SECONDS=2
 readonly ESTIMATED_COST_USD=72
@@ -526,9 +526,10 @@ PY
 }
 wait_for_ssh_readiness() {
   local attempt
-  # Thirty-six (3s probe + at most 2s group reaping) windows and thirty-five
-  # 2s intervals bound this gate to 250 seconds even when post-connect SSH
-  # hangs. Nebius can report RUNNING before the public NAT path is reachable.
+  # Twenty-four (8s probe + at most 2s group reaping) windows and twenty-three
+  # 2s intervals bound this gate to 286 seconds even when post-connect SSH
+  # hangs. Nebius can report RUNNING before the public NAT path is reachable,
+  # and a healthy handshake can exceed the connect-only timeout end to end.
   for (( attempt = 1; attempt <= SSH_READINESS_ATTEMPTS; attempt++ )); do
     if probe_ssh_readiness; then return 0; fi
     (( attempt == SSH_READINESS_ATTEMPTS )) || sleep "$SSH_READINESS_INTERVAL_SECONDS"
