@@ -257,6 +257,7 @@ docker run --rm --pull never --gpus all --init --network host --shm-size=8g \
   --tmpfs /flash:rw,exec,size=2g,mode=700 \
   --env LEHOME_N15_DEPENDENCY_SITE=/flash/site-packages \
   --name "$EVAL_CONTAINER" "${mounts[@]}" \
+  --env "TMPDIR=$(dirname -- "$OUTPUT_ROOT")" \
   --env PYTHONPATH=/runtime/source/lehome:/runtime \
   --env GIT_CONFIG_COUNT=2 \
   --env GIT_CONFIG_KEY_0=safe.directory --env GIT_CONFIG_VALUE_0=/official/lehome \

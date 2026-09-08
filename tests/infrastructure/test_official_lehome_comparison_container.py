@@ -202,3 +202,7 @@ def test_n15_focused_wrapper_publishes_then_verifies_readback_before_pass() -> N
     assert "LEHOME_N15_FOCUSED_REPOSITORY" in text
     assert "nebius" not in text.lower()
     assert "computeinstance-" not in text
+def test_focused_lfs_scratch_uses_workspace_not_container_root() -> None:
+    from pathlib import Path
+    text = Path("rollout_appliance/run_public_n15_focused_gate.sh").read_text()
+    assert '--env "TMPDIR=$(dirname -- "$OUTPUT_ROOT")"' in text
