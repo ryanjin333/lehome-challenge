@@ -169,14 +169,17 @@ def _tree_sha256(root: Path, *, exclude_assets_mount: bool = False) -> str:
 def _git_output(root: Path, *arguments: str) -> str:
     environment = os.environ.copy()
     environment["GIT_OPTIONAL_LOCKS"] = "0"
-    result = subprocess.run(
-        ["git", "-C", str(root), *arguments],
-        env=environment,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    # LFS clean filters write scratch objects even for `git status`. Keep those
+    # writes outside the immutable checkout without disabling content filtering.
+    with tempfile.TemporaryDirectory(prefix="lehome-lfs-") as storage:
+        result = subprocess.run(
+            ["git", "-c", f"lfs.storage={storage}", "-C", str(root), *arguments],
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
     if result.returncode != 0:
         raise ComparisonError(f"git identity check failed for {root}: {result.stderr.strip()}")
     return result.stdout.strip()

@@ -208,6 +208,73 @@ def test_checkout_identity_excludes_only_independently_verified_assets_mount(
         checkout_identity(source, revision, label="official source")
 
 
+def test_checkout_identity_gives_filters_isolated_storage(tmp_path: Path) -> None:
+    """Exercise real Git filtering without allowing writes into the checkout."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    def git(*args: str) -> str:
+        return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    (root / ".gitattributes").write_text("*.bin filter=scratch\n")
+    (root / "asset.bin").write_text("original\n")
+    git("add", ".")
+    git("commit", "-qm", "fixture")
+    revision = git("rev-parse", "HEAD")
+    git("config", "filter.scratch.required", "true")
+    git("config", "filter.scratch.clean",
+        'storage=$(git config lfs.storage) && test -d "$storage" && cat')
+    # Change stat information so Git must actually run the clean filter.
+    (root / "asset.bin").unlink()
+    (root / "asset.bin").write_text("original\n")
+    checkout_identity(root, revision, label="assets")
+    (root / "asset.bin").write_text("tampered\n")
+    with pytest.raises(ComparisonError, match="checkout is modified"):
+        checkout_identity(root, revision, label="assets")
+    assert git("config", "--get-regexp", "filter.scratch")
+    assert not (root / ".git/lfs").exists()
+
+
+def test_checkout_identity_real_lfs_read_only(tmp_path: Path) -> None:
+    if subprocess.run(["git", "lfs", "version"], capture_output=True).returncode:
+        pytest.skip("git-lfs required")
+    root = tmp_path / "lfs-repo"
+    root.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    git("lfs", "install", "--local")
+    git("lfs", "track", "*.bin")
+    asset = root / "asset.bin"
+    asset.write_bytes(b"original asset\n" * 100)
+    git("add", ".")
+    git("commit", "-qm", "lfs fixture")
+    revision = git("rev-parse", "HEAD")
+    asset.unlink()
+    asset.write_bytes(b"original asset\n" * 100)
+    paths = [root, *root.rglob("*")]
+    modes = {path: path.stat().st_mode & 0o777 for path in paths}
+    try:
+        for path in paths:
+            path.chmod(0o555 if path.is_dir() else 0o444)
+        before = checkout_identity(root, revision, label="LFS assets")
+        asset.chmod(0o644)
+        asset.write_bytes(b"tampered asset\n")
+        asset.chmod(0o444)
+        with pytest.raises(ComparisonError, match="checkout is modified"):
+            checkout_identity(root, revision, label="LFS assets")
+        assert before["revision"] == revision
+    finally:
+        for path, mode in modes.items():
+            path.chmod(mode)
+
+
 def _assets(root: Path) -> Path:
     base = root / "objects" / "Challenge_Garment" / "Release"
     for category, directory in CATEGORIES.items():
