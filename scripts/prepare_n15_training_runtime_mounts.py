@@ -8,11 +8,13 @@ import sys
 def runtime_mounts(
     executable: Path, prefix: Path, base_prefix: Path, *,
     allowed_root: Path = Path('/mnt/lehome/public-n15-tools'),
+    allowed_base: Path = Path('/home/ubuntu/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu'),
 ) -> list[str]:
     roots = list(dict.fromkeys((prefix, base_prefix)))
     for root in roots:
         if (not root.is_absolute() or root == allowed_root
-                or not root.is_relative_to(allowed_root)
+                or not (root.is_relative_to(allowed_root)
+                        or (root == base_prefix == allowed_base and root != prefix))
                 or any(char in str(root) for char in ',\n\r')):
             raise ValueError('training runtime mount is outside the allowed tools subtree')
         if root.is_symlink() or root.resolve(strict=True) != root or not root.is_dir():

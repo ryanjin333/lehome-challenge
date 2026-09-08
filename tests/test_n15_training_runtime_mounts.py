@@ -36,6 +36,25 @@ def test_runtime_mounts_reject_escape(tmp_path):
                        allowed_root=tmp_path)
 
 
+def test_exact_external_base_runtime_is_allowed_without_mounting_home(tmp_path):
+    from scripts.prepare_n15_training_runtime_mounts import runtime_mounts
+    tools = tmp_path / 'tools'
+    venv = tools / 'venv'
+    base = tmp_path / 'home/ubuntu/.local/share/uv/python/cpython-3.11.16'
+    (venv / 'bin').mkdir(parents=True)
+    (base / 'bin').mkdir(parents=True)
+    executable = base / 'bin/python3.11'
+    executable.write_text('fixture')
+    (venv / 'bin/python').symlink_to(executable)
+    mounts = runtime_mounts(venv / 'bin/python', venv, base,
+                            allowed_root=tools, allowed_base=base)
+    assert mounts == [f'type=bind,src={venv},dst={venv},readonly',
+                      f'type=bind,src={base},dst={base},readonly']
+    with pytest.raises(ValueError, match='outside'):
+        runtime_mounts(venv / 'bin/python', venv, base.parent,
+                       allowed_root=tools, allowed_base=base)
+
+
 def test_runtime_mounts_reject_root_mount(tmp_path):
     from scripts.prepare_n15_training_runtime_mounts import runtime_mounts
     with pytest.raises(ValueError, match="outside"):
