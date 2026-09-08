@@ -62,6 +62,7 @@ readonly FOCUSED_HF_CACHE="${LEHOME_N15_FOCUSED_HF_CACHE_ROOT:-}"
 readonly ROLLOUT_IMAGE_RECEIPT="${LEHOME_N15_ROLLOUT_IMAGE_RECEIPT:-}"
 readonly PLAN_RECEIPT="$PIPELINE_ROOT/lifecycle-plan.json"
 readonly DEADLINE_RECEIPT="$PIPELINE_ROOT/paid-deadline.json"
+readonly APPROVED_WINDOW="${LEHOME_N15_APPROVED_WINDOW:-}"
 readonly HOST_TRAINING_STAGE_RECEIPT="$PIPELINE_ROOT/host-stage-training-complete.json"
 readonly HOST_FOCUSED_STAGE_RECEIPT="$PIPELINE_ROOT/host-stage-focused-complete.json"
 readonly TRAINING_IDENTITY_RECEIPT="$TRAINING_ROOT/training-identity.json"
@@ -90,6 +91,10 @@ fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
 require_abs_dir() { [[ "$1" == /* && "$1" != *".."* && -d "$1" && ! -L "$1" ]] || fail "$2 is unavailable or unsafe"; }
 require_abs_file() { [[ "$1" == /* && "$1" != *".."* && -f "$1" && ! -L "$1" ]] || fail "$2 is unavailable or unsafe"; }
 verify_conservative_task_budget() {
+  if [[ -n "$APPROVED_WINDOW" ]]; then
+    approved_window_deadline >/dev/null
+    return
+  fi
   python3 - "$MAX_BUDGET_USD" "$PROVIDER_HOURLY_CEILING_USD" "${1:-}" <<'PY'
 import json, math, stat, sys, time
 from pathlib import Path
@@ -547,7 +552,53 @@ wait_for_ssh_readiness() {
   done
   return 1
 }
+approved_window_deadline() {
+  # Explicitly selected supplementary approval; never modify historical receipts.
+  case "$(host_next_unfinished_stage)" in
+    focused_gate|harvest) ;;
+    *) fail "approved evaluation window requires completed training" ;;
+  esac
+  python3 - "$APPROVED_WINDOW" "$DEADLINE_RECEIPT" "$PLAN_RECEIPT" "$RUN_ID" "$MAX_BUDGET_USD" <<'PY'
+import hashlib, json, math, stat, sys, time
+from pathlib import Path
+approval, historical, plan = map(Path, sys.argv[1:4])
+run_id, budget = sys.argv[4], float(sys.argv[5])
+def read(path):
+    metadata = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o444:
+        raise SystemExit('approved window inputs must be immutable regular files')
+    return json.loads(path.read_bytes())
+value, old = read(approval), read(historical)
+read(plan)
+expected_old = dict(schema_version=1, kind='lehome_public_n15_paid_deadline_v1',
+                    run_id=run_id, lifecycle_plan_sha256=hashlib.sha256(plan.read_bytes()).hexdigest(),
+                    started_unix_seconds=old.get('started_unix_seconds'),
+                    deadline_unix_seconds=old.get('deadline_unix_seconds'))
+if (old != expected_old or type(old['started_unix_seconds']) is not int
+        or old['deadline_unix_seconds'] != old['started_unix_seconds'] + 86400):
+    raise SystemExit('historical paid deadline is invalid')
+expected_keys = {'run_id', 'started_unix_seconds', 'deadline_unix_seconds', 'budget_usd',
+                 'prior_reserved_usd', 'hourly_ceiling_usd', 'new_window_max_usd', 'authorization'}
+start, end = value.get('started_unix_seconds'), value.get('deadline_unix_seconds')
+if (set(value) != expected_keys or value['run_id'] != run_id
+        or not math.isfinite(budget) or not 0 < budget <= 100
+        or value['budget_usd'] != budget or value['prior_reserved_usd'] != 72
+        or value['hourly_ceiling_usd'] != 3
+        or type(start) is not int or type(end) is not int
+        or not 0 < end - start <= 14400 or not old['deadline_unix_seconds'] <= start
+        or not start <= time.time() < end
+        or value['new_window_max_usd'] != 3 * (end - start) / 3600
+        or 72 + value['new_window_max_usd'] > budget
+        or not isinstance(value['authorization'], str) or not value['authorization'].strip()):
+    raise SystemExit('approved evaluation window is invalid or expired')
+print(end)
+PY
+}
 initialize_deadline() {
+  if [[ -n "$APPROVED_WINDOW" ]]; then
+    approved_window_deadline
+    return
+  fi
   python3 - "$PLAN_RECEIPT" "$DEADLINE_RECEIPT" "$RUN_ID" <<'PY'
 import hashlib, json, os, stat, sys, time
 from pathlib import Path
@@ -570,6 +621,11 @@ PY
 initialize_stage_deadline() {
   local label="$1" limit_seconds="$2" aggregate_deadline="$3"
   local stage_receipt="$PIPELINE_ROOT/stage-$label-deadline.json"
+  if [[ -n "$APPROVED_WINDOW" ]]; then
+    [[ "$label" == focused_gate || "$label" == harvest ]] || fail "approved window forbids training"
+    [[ "$(approved_window_deadline)" == "$aggregate_deadline" ]] || fail "approved deadline drifted"
+    stage_receipt="$PIPELINE_ROOT/stage-$label-approved-$aggregate_deadline.json"
+  fi
   python3 - "$PLAN_RECEIPT" "$stage_receipt" "$RUN_ID" "$label" "$limit_seconds" "$aggregate_deadline" <<'PY'
 import hashlib, json, os, stat, sys, time
 from pathlib import Path
