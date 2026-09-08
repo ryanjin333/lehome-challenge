@@ -172,8 +172,16 @@ PY
 )"
 readonly TRAINING_ROOT
 require_dir "$TRAINING_ROOT" "accepted Task 1 training root"
+runtime_mount_lines="$(python3 "$REPO_ROOT/scripts/prepare_n15_training_runtime_mounts.py" \
+  "$TRAINING_ROOT/evidence/runtime-receipt.json")"
+training_runtime_mounts=()
+while IFS= read -r runtime_mount; do
+  [[ -n "$runtime_mount" ]] || continue
+  training_runtime_mounts+=(--mount "$runtime_mount")
+done <<< "$runtime_mount_lines"
 
 docker run --rm --pull never --network none --init \
+  "${training_runtime_mounts[@]}" \
   --mount "type=bind,src=$REPO_ROOT,dst=/runtime,readonly" \
   --mount "type=bind,src=$SOURCE_ROOT,dst=$SOURCE_ROOT,readonly" \
   --mount "type=bind,src=$TRAINING_ROOT,dst=$TRAINING_ROOT,readonly" \

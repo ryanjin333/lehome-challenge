@@ -80,6 +80,13 @@ print(value["training_root"])
 PY
 )"
 require_directory "$CANDIDATE_TRAINING_ROOT" "candidate-n15 training output"
+runtime_mount_lines="$(python3 "$REPO_ROOT/scripts/prepare_n15_training_runtime_mounts.py" \
+  "$CANDIDATE_TRAINING_ROOT/evidence/runtime-receipt.json")"
+training_runtime_mounts=()
+while IFS= read -r runtime_mount; do
+  [[ -n "$runtime_mount" ]] || continue
+  training_runtime_mounts+=(--mount "$runtime_mount")
+done <<< "$runtime_mount_lines"
 require_directory "$REFERENCE_CHECKPOINT" "reference-n15 checkpoint"
 require_directory "$REFERENCE_SANITIZED_CONFIG" "reference-n15 compatibility view"
 require_file "$REFERENCE_COMPATIBILITY_RECEIPT" "reference-n15 compatibility receipt"
@@ -173,6 +180,7 @@ export PYTHONPATH="/flash/site-packages:$PYTHONPATH"
   --compatibility-receipt "$CANDIDATE_COMPATIBILITY_RECEIPT"'
 
 docker run --rm --pull never --init --network none --name "$PREP_CONTAINER" \
+  "${training_runtime_mounts[@]}" \
   --tmpfs /flash:rw,exec,size=2g,mode=700 \
   --mount "type=bind,src=$REPO_ROOT,dst=/runtime,readonly" \
   --mount "type=bind,src=$CANDIDATE_TRAINING_ROOT,dst=$CANDIDATE_TRAINING_ROOT,readonly" \
@@ -194,6 +202,7 @@ readonly CANDIDATE_SANITIZED_CONFIG_SHA256_BEFORE="$(sha256sum -- "$CANDIDATE_SA
 readonly CANDIDATE_COMPATIBILITY_RECEIPT_SHA256_BEFORE="$(sha256sum -- "$CANDIDATE_COMPATIBILITY_RECEIPT" | awk '{print $1}')"
 
 mounts=(
+  "${training_runtime_mounts[@]}"
   --mount "type=bind,src=$REPO_ROOT,dst=/runtime,readonly"
   --mount "type=bind,src=$SOURCE_ROOT,dst=/official/lehome,readonly"
   --mount "type=bind,src=$ASSETS_ROOT,dst=/official/assets,readonly"
