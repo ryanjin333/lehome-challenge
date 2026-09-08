@@ -24,7 +24,20 @@ def runtime_mounts(
     resolved = executable.resolve(strict=True)
     if not resolved.is_relative_to(base_prefix) or not resolved.is_file():
         raise ValueError('training executable target is outside the base runtime')
-    return [f'type=bind,src={root},dst={root},readonly' for root in roots]
+    mounts = [f'type=bind,src={root},dst={root},readonly' for root in roots]
+    if executable.is_symlink():
+        target = executable.readlink()
+        alias = target.parent.parent
+        if alias != base_prefix:
+            if (not target.is_absolute() or target.parent.name != 'bin'
+                    or alias.parent != base_prefix.parent
+                    or '..' in target.parts
+                    or any(char in str(target) for char in ',\n\r')
+                    or not alias.is_symlink()
+                    or alias.resolve(strict=True) != base_prefix):
+                raise ValueError('training interpreter alias is outside the verified base runtime')
+            mounts.append(f'type=bind,src={base_prefix},dst={alias},readonly')
+    return mounts
 
 
 def mounts_for_interpreter(executable: Path) -> list[str]:

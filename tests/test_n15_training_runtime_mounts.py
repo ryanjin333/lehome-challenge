@@ -62,6 +62,20 @@ def test_runtime_mounts_reject_root_mount(tmp_path):
                        allowed_root=tmp_path)
 
 
+def test_intermediate_uv_alias_is_mapped_to_the_verified_base(tmp_path):
+    from scripts.prepare_n15_training_runtime_mounts import runtime_mounts
+    venv = tmp_path / 'venv'
+    base = tmp_path / 'python/cpython-3.11.16'
+    alias = base.parent / 'cpython-3.11'
+    (venv / 'bin').mkdir(parents=True)
+    (base / 'bin').mkdir(parents=True)
+    (base / 'bin/python3.11').write_text('fixture')
+    alias.symlink_to(base, target_is_directory=True)
+    (venv / 'bin/python').symlink_to(alias / 'bin/python3.11')
+    mounts = runtime_mounts(venv / 'bin/python', venv, base, allowed_root=tmp_path)
+    assert f'type=bind,src={base},dst={alias},readonly' in mounts
+
+
 def test_launchers_supply_runtime_mounts_to_identity_consumers():
     root = Path(__file__).resolve().parents[1] / 'rollout_appliance'
     focused = (root / 'run_public_n15_focused_gate.sh').read_text()
@@ -70,3 +84,17 @@ def test_launchers_supply_runtime_mounts_to_identity_consumers():
     assert focused.count('"${training_runtime_mounts[@]}"') == 2
     assert 'prepare_n15_training_runtime_mounts.py' in harvest
     assert '"${training_runtime_mounts[@]}"' in harvest
+
+
+def test_alias_outside_base_parent_is_rejected(tmp_path):
+    from scripts.prepare_n15_training_runtime_mounts import runtime_mounts
+    venv = tmp_path / 'venv'
+    base = tmp_path / 'python/cpython-3.11.16'
+    alias = tmp_path / 'unrelated-alias'
+    (venv / 'bin').mkdir(parents=True)
+    (base / 'bin').mkdir(parents=True)
+    (base / 'bin/python3.11').write_text('fixture')
+    alias.symlink_to(base, target_is_directory=True)
+    (venv / 'bin/python').symlink_to(alias / 'bin/python3.11')
+    with pytest.raises(ValueError, match='alias'):
+        runtime_mounts(venv / 'bin/python', venv, base, allowed_root=tmp_path)
