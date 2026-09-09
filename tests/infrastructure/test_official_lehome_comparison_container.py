@@ -149,7 +149,7 @@ def test_n15_focused_wrapper_runs_only_native_candidate_and_reference_sequential
     assert "candidate-n15" in text
     assert "reference-n15" in text
     assert text.index("candidate-n15") < text.index("reference-n15")
-    assert "--profile n15-focused" in text
+    assert '--profile "$EVAL_PROFILE"' in text
     assert "--device cpu" in text
     assert "--gpus all" in text
     assert "--seed 42" in text
@@ -164,6 +164,15 @@ def test_n15_focused_wrapper_runs_only_native_candidate_and_reference_sequential
     assert "/mnt/lehome/reference-native/dependencies" in text
     assert "uv pip install" not in text
     assert "prepare_n15_dependency_overlay.py" in text
+
+
+def test_n15_category_wrapper_exposes_an_explicit_all_category_profile() -> None:
+    text = N15_FOCUSED_WRAPPER.read_text(encoding="utf-8")
+    assert 'LEHOME_N15_EVAL_PROFILE:-n15-focused' in text
+    assert 'n15-all-categories' in text
+    assert '--profile "$EVAL_PROFILE"' in text
+    verify = text.index("verify-n15-focused")
+    assert '--profile "$EVAL_PROFILE"' in text[verify:]
 
 
 def test_n15_focused_wrapper_builds_candidate_config_view_from_training_receipt() -> None:

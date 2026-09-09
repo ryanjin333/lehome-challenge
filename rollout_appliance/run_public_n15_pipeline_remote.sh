@@ -24,6 +24,7 @@ readonly MAX_BUDGET_USD="${LEHOME_N15_MAX_BUDGET_USD:-100}"
 readonly PROVIDER_HOURLY_CEILING_USD=3
 readonly TRAIN_TIMEOUT_SECONDS=43200
 readonly FOCUSED_TIMEOUT_SECONDS=14400
+readonly ALL_CATEGORY_EVAL="${LEHOME_N15_ALL_CATEGORY_EVAL:-0}"
 readonly HARVEST_TIMEOUT_SECONDS=28800
 readonly SSH_READINESS_ATTEMPTS=24
 readonly REMOTE_RUNTIME_ATTEMPTS=18
@@ -71,6 +72,12 @@ readonly TRAINING_PUBLICATION_RECEIPT="$TRAINING_ROOT/training-publication.json"
 readonly FOCUSED_OUTPUT_ROOT="$REMOTE_PIPELINE_ROOT/focused"
 readonly FOCUSED_PUBLICATION_RECEIPT="$REMOTE_PIPELINE_ROOT/focused-publication.json"
 readonly FOCUSED_PROMOTION_RECEIPT="$REMOTE_PIPELINE_ROOT/focused-promotion.json"
+readonly ALL_CATEGORY_OUTPUT_ROOT="$REMOTE_PIPELINE_ROOT/all-category"
+readonly ALL_CATEGORY_PUBLICATION_RECEIPT="$REMOTE_PIPELINE_ROOT/all-category-publication.json"
+readonly ALL_CATEGORY_PROMOTION_RECEIPT="$REMOTE_PIPELINE_ROOT/all-category-promotion.json"
+readonly ALL_CATEGORY_COMPARISON_READBACK_RECEIPT="$PIPELINE_ROOT/all-category-comparison-receipt.json"
+readonly ALL_CATEGORY_PUBLICATION_READBACK_RECEIPT="$PIPELINE_ROOT/all-category-publication-receipt.json"
+readonly ALL_CATEGORY_PROMOTION_READBACK_RECEIPT="$PIPELINE_ROOT/all-category-promotion-receipt.json"
 readonly HARVEST_ROOT="$REMOTE_PIPELINE_ROOT/harvest"
 readonly HARVEST_MANIFEST_RECEIPT="$PIPELINE_ROOT/harvest-manifest-receipt.json"
 readonly HARVEST_MANIFEST="$PIPELINE_ROOT/harvest-manifest.json"
@@ -661,7 +668,7 @@ PY
 run_paid_stage() {
   local label="$1" limit_seconds="$2" stage_function="$3"
   local aggregate_deadline now stage_deadline pid status launcher_root launcher_ready launcher_ack launcher_acknowledged ready_pid acknowledged_pid attempt
-  case "$stage_function" in train_stage|focused_stage|harvest_stage) ;; *) fail "unknown paid stage dispatcher" ;; esac
+  case "$stage_function" in train_stage|focused_stage|all_category_stage|harvest_stage) ;; *) fail "unknown paid stage dispatcher" ;; esac
   if [[ -n "$PRESTART_ADMITTED_STAGE" && "$label" != "$PRESTART_ADMITTED_STAGE" ]]; then
     fail "$label is not the host-sealed next unfinished stage"
   fi
@@ -681,8 +688,8 @@ run_paid_stage() {
   (( now < stage_deadline )) || fail "$label has no remaining paid time"
   # macOS has no external ``setsid``. This tiny controller-owned Python
   # launcher creates the session before execing an allowlisted Bash dispatcher.
-  export -f remote train_stage focused_stage harvest_stage
-  export REMOTE_ROOT SSH_TARGET HF_TOKEN_FILE RUNTIME_REVISION SOURCE_ROOT OFFICIAL_SOURCE_ROOT SOURCE_RECEIPT SNAPSHOTS_RECEIPT TRAINING_ROOT EXACT_VM_ID PROTECTED_DISK_ID TRAINING_HF_CACHE TRAINING_PYTHON TRAINING_UV LEROBOT_WHEEL RUNTIME_IMAGE_ID RESUME_PARTIAL RESUME_CHECKPOINT RESUME_STEP RESUME_ATTEMPT_ID RECOVER_COMPLETED_12K ASSETS_ROOT METADATA_ROOT REFERENCE_CHECKPOINT REFERENCE_SANITIZED_CONFIG REFERENCE_COMPATIBILITY NATIVE_RUNTIME_EVIDENCE NATIVE_DEPENDENCIES FOCUSED_HF_CACHE FOCUSED_OUTPUT_ROOT PUBLIC_REPOSITORY ROLLOUT_IMAGE_RECEIPT REMOTE_PIPELINE_ROOT
+  export -f remote train_stage focused_stage all_category_stage harvest_stage
+  export REMOTE_ROOT SSH_TARGET HF_TOKEN_FILE RUNTIME_REVISION SOURCE_ROOT OFFICIAL_SOURCE_ROOT SOURCE_RECEIPT SNAPSHOTS_RECEIPT TRAINING_ROOT EXACT_VM_ID PROTECTED_DISK_ID TRAINING_HF_CACHE TRAINING_PYTHON TRAINING_UV LEROBOT_WHEEL RUNTIME_IMAGE_ID RESUME_PARTIAL RESUME_CHECKPOINT RESUME_STEP RESUME_ATTEMPT_ID RECOVER_COMPLETED_12K ALL_CATEGORY_EVAL ASSETS_ROOT METADATA_ROOT REFERENCE_CHECKPOINT REFERENCE_SANITIZED_CONFIG REFERENCE_COMPATIBILITY NATIVE_RUNTIME_EVIDENCE NATIVE_DEPENDENCIES FOCUSED_HF_CACHE FOCUSED_OUTPUT_ROOT ALL_CATEGORY_OUTPUT_ROOT ALL_CATEGORY_PUBLICATION_RECEIPT ALL_CATEGORY_PROMOTION_RECEIPT PUBLIC_REPOSITORY ROLLOUT_IMAGE_RECEIPT REMOTE_PIPELINE_ROOT
   launcher_root="$(mktemp -d "$PIPELINE_ROOT/.stage-launcher-${label}.XXXXXX")"
   launcher_ready="$launcher_root/ready"
   launcher_ack="$launcher_root/ack"
@@ -752,7 +759,7 @@ else:
     raise SystemExit(75)
 os.execvpe(
     "bash",
-    ["bash", "-c", 'case "$1" in train_stage) train_stage ;; focused_stage) focused_stage ;; harvest_stage) harvest_stage ;; *) exit 64 ;; esac', "bash", sys.argv[1]],
+    ["bash", "-c", 'case "$1" in train_stage) train_stage ;; focused_stage) focused_stage ;; all_category_stage) all_category_stage ;; harvest_stage) harvest_stage ;; *) exit 64 ;; esac', "bash", sys.argv[1]],
     os.environ,
 )
 PY
@@ -811,7 +818,15 @@ PY
   if wait "$pid"; then status=0; else status=$?; fi
   ACTIVE_PAID_STAGE_PID=""
   ACTIVE_PAID_STAGE_PGID=""
-  (( status == 0 )) || fail "$label failed"
+  if (( status != 0 )); then
+    # The all-category evaluator may have sealed a comparison receipt and
+    # publication before its threshold verifier deliberately returns nonzero.
+    # Only let that terminal evaluator status reach its caller so it can fetch
+    # bounded evidence; handshake, timeout, and every other stage still fail
+    # closed above.
+    [[ "$stage_function" == all_category_stage ]] && return "$status"
+    fail "$label failed"
+  fi
   if [[ "$label" == "$PRESTART_ADMITTED_STAGE" ]]; then
     PRESTART_ADMITTED_STAGE=""
   fi
@@ -1085,6 +1100,30 @@ root="$1"; output="$2"; publication="$3"; promotion="$4"; temporary_root="$(mkte
 python3 "$root/scripts/run_official_lehome_comparison.py" verify-n15-focused --receipt "$output/comparison-receipt.json" --publication-receipt "$publication" --promotion-receipt "$temporary" >/dev/null
 cmp -s "$temporary" "$promotion"
 SH
+}
+
+verify_remote_all_category_chain() {
+  remote bash -s -- "$REMOTE_ROOT" "$ALL_CATEGORY_OUTPUT_ROOT" "$ALL_CATEGORY_PUBLICATION_RECEIPT" "$ALL_CATEGORY_PROMOTION_RECEIPT" <<'SH'
+set -euo pipefail
+root="$1"; output="$2"; publication="$3"; promotion="$4"; temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-verify-all-category.XXXXXX")"; temporary="$temporary_root/receipt.json"; trap 'rm -rf -- "$temporary_root"' EXIT
+python3 "$root/scripts/run_official_lehome_comparison.py" verify-n15-focused --profile n15-all-categories --receipt "$output/comparison-receipt.json" --publication-receipt "$publication" --promotion-receipt "$temporary" >/dev/null
+cmp -s "$temporary" "$promotion"
+SH
+}
+
+fetch_remote_all_category_evidence() {
+  # Pull only the small immutable decision artifacts, never rollout media or
+  # model data.  The caller verifies promotion provenance before treating
+  # these local readbacks as a passing decision.
+  if remote_file_exists "$ALL_CATEGORY_OUTPUT_ROOT/comparison-receipt.json"; then
+    fetch_remote_immutable "$ALL_CATEGORY_OUTPUT_ROOT/comparison-receipt.json" "$ALL_CATEGORY_COMPARISON_READBACK_RECEIPT" || return 1
+  fi
+  if remote_file_exists "$ALL_CATEGORY_PUBLICATION_RECEIPT"; then
+    fetch_remote_immutable "$ALL_CATEGORY_PUBLICATION_RECEIPT" "$ALL_CATEGORY_PUBLICATION_READBACK_RECEIPT" || return 1
+  fi
+  if remote_file_exists "$ALL_CATEGORY_PROMOTION_RECEIPT"; then
+    fetch_remote_immutable "$ALL_CATEGORY_PROMOTION_RECEIPT" "$ALL_CATEGORY_PROMOTION_READBACK_RECEIPT" || return 1
+  fi
 }
 
 verify_remote_harvest_chain() {
@@ -2923,6 +2962,17 @@ export LEHOME_N15_REFERENCE_CHECKPOINT="$9" LEHOME_N15_REFERENCE_SANITIZED_CONFI
 exec "$root/rollout_appliance/run_public_n15_focused_gate.sh"
 SH
 }
+all_category_stage() {
+  : "${OFFICIAL_SOURCE_ROOT:?organizer evaluator source is required}"
+  remote bash -s -- "$REMOTE_ROOT" "$HF_TOKEN_FILE" "$RUNTIME_REVISION" "$OFFICIAL_SOURCE_ROOT" "$ASSETS_ROOT" "$METADATA_ROOT" "$TRAINING_ROOT/checkpoints/012000/pretrained_model" "$TRAINING_ROOT/training-identity.json" "$REMOTE_PIPELINE_ROOT/all-category-candidate-config" "$REMOTE_PIPELINE_ROOT/all-category-candidate-compatibility.json" "$REFERENCE_CHECKPOINT" "$REFERENCE_SANITIZED_CONFIG" "$REFERENCE_COMPATIBILITY" "$NATIVE_RUNTIME_EVIDENCE" "$NATIVE_DEPENDENCIES" "$FOCUSED_HF_CACHE" "$ALL_CATEGORY_OUTPUT_ROOT" "$PUBLIC_REPOSITORY" "$ALL_CATEGORY_PUBLICATION_RECEIPT" "$ALL_CATEGORY_PROMOTION_RECEIPT" <<'SH'
+set -euo pipefail
+root="$1"; token="$2"; shift 2; test -f "$token" && test ! -L "$token"; export HF_TOKEN="$(cat "$token")"
+export LEHOME_OFFICIAL_RUNTIME_REVISION="$1" LEHOME_OFFICIAL_SOURCE_ROOT="$2" LEHOME_OFFICIAL_ASSETS_ROOT="$3" LEHOME_OFFICIAL_METADATA_ROOT="$4"
+export LEHOME_N15_CANDIDATE_CHECKPOINT="$5" LEHOME_N15_CANDIDATE_IDENTITY_RECEIPT="$6" LEHOME_N15_CANDIDATE_SANITIZED_CONFIG_ROOT="$7" LEHOME_N15_CANDIDATE_COMPATIBILITY_RECEIPT="$8"
+export LEHOME_N15_REFERENCE_CHECKPOINT="$9" LEHOME_N15_REFERENCE_SANITIZED_CONFIG_ROOT="${10}" LEHOME_N15_REFERENCE_COMPATIBILITY_RECEIPT="${11}" LEHOME_N15_NATIVE_RUNTIME_EVIDENCE_ROOT="${12}" LEHOME_N15_NATIVE_DEPENDENCIES_ROOT="${13}" LEHOME_N15_FOCUSED_HF_CACHE_ROOT="${14}" LEHOME_N15_FOCUSED_OUTPUT_ROOT="${15}" LEHOME_N15_FOCUSED_REPOSITORY="${16}" LEHOME_N15_FOCUSED_PUBLICATION_RECEIPT="${17}" LEHOME_N15_FOCUSED_PROMOTION_RECEIPT="${18}" LEHOME_N15_EVAL_PROFILE=n15-all-categories
+exec "$root/rollout_appliance/run_public_n15_focused_gate.sh"
+SH
+}
 harvest_stage() {
   remote bash -s -- "$REMOTE_ROOT" "$HF_TOKEN_FILE" "$RUNTIME_REVISION" "$SOURCE_ROOT" "$TRAINING_ROOT/checkpoints/012000/pretrained_model" "$TRAINING_ROOT/training-identity.json" "$ROLLOUT_IMAGE_RECEIPT" "$REMOTE_PIPELINE_ROOT/harvest" "$PUBLIC_REPOSITORY" "$REMOTE_PIPELINE_ROOT/harvest.publication.json" "$REMOTE_PIPELINE_ROOT/harvest.provider-stopped.json" "$REMOTE_PIPELINE_ROOT/harvest.terminal.json" <<'SH'
 set -euo pipefail
@@ -2946,6 +2996,26 @@ run_pipeline_after_runtime() {
   record_host_stage_completion training "$HOST_TRAINING_STAGE_RECEIPT" \
     "$TRAINING_IDENTITY_RECEIPT" "$TRAINING_PUBLICATION_RECEIPT"
   advance_paid_stage_admission_from_host_seals training
+  if [[ "$ALL_CATEGORY_EVAL" == 1 ]]; then
+    # Explicit all-category admission replaces the historical focused gate for
+    # this controller run. It uses the same immutable focused-stage deadline,
+    # then stops at a published 60%-per-category decision; harvest is never
+    # started from this branch.
+    if ! remote_file_exists "$ALL_CATEGORY_PROMOTION_RECEIPT"; then
+      if ! run_paid_stage focused_gate "$FOCUSED_TIMEOUT_SECONDS" all_category_stage; then
+        # A threshold miss intentionally leaves no promotion receipt. Preserve
+        # any sealed comparison/publication evidence for the operator without
+        # converting a failed decision into a successful controller stage.
+        fetch_remote_all_category_evidence || true
+        fail "all-category evaluation stage failed; immutable decision evidence was fetched when available and harvest requires an explicit new decision"
+      fi
+    fi
+    verify_remote_all_category_chain || fail "all-category evaluation did not meet the 60% per-category decision gate; harvest requires an explicit new decision"
+    fetch_remote_all_category_evidence || fail "all-category decision readback could not be sealed locally"
+    stop_exact_vm || fail "exact VM could not be stopped after all-category evaluation"
+    PIPELINE_COMPLETE=1
+    return
+  fi
   if ! remote_file_exists "$FOCUSED_PROMOTION_RECEIPT"; then run_paid_stage focused_gate "$FOCUSED_TIMEOUT_SECONDS" focused_stage; fi
   verify_remote_focused_chain || fail "focused receipt chain failed"
   record_host_stage_completion focused "$HOST_FOCUSED_STAGE_RECEIPT" \
@@ -3149,6 +3219,7 @@ main() {
 [[ $# -eq 0 ]] || fail "this wrapper accepts no positional arguments"
 [[ "$RESUME_PARTIAL" == 0 || "$RESUME_PARTIAL" == 1 ]] || fail "resume-partial mode must be explicitly 0 or 1"
 [[ "$RECOVER_COMPLETED_12K" == 0 || "$RECOVER_COMPLETED_12K" == 1 ]] || fail "completed-output recovery mode must be explicitly 0 or 1"
+[[ "$ALL_CATEGORY_EVAL" == 0 || "$ALL_CATEGORY_EVAL" == 1 ]] || fail "all-category evaluation mode must be explicitly 0 or 1"
 if [[ "$RECOVER_COMPLETED_12K" == 1 && "$RESUME_PARTIAL" != 0 ]]; then
   fail "completed-output recovery forbids partial resume"
 fi

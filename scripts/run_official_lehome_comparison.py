@@ -52,6 +52,8 @@ N15_FOCUSED_PROFILE = "n15-focused"
 N15_FOCUSED_CATEGORIES = ("top_short", "pant_long")
 N15_FOCUSED_FLOORS = {"top_short": 18, "pant_long": 13}
 N15_FOCUSED_MAXIMUM_DEFICIT = 2
+N15_ALL_CATEGORY_PROFILE = "n15-all-categories"
+N15_ALL_CATEGORY_FLOOR = 15
 OFFICIAL_SCORER_SHA256 = "cf17ffb9e015160e9fe9b1ed273870f1cabf0222a4864fc0cd56e642ed792862"
 FROZEN_REFERENCE_MATRIX_SHA256 = "bb3c11ddb10eb53ba3cd2b189850d74bc8f2bfa45d15153812b806060b4b80b5"
 CAMERAS = ("top_rgb", "left_rgb", "right_rgb")
@@ -831,6 +833,14 @@ def load_profile_matrix(assets_root: Path, *, profile: str = DEFAULT_PROFILE) ->
         ):
             raise ComparisonError("N1.5 focused matrix category/order drift")
         return focused
+    if profile == N15_ALL_CATEGORY_PROFILE:
+        # This is the complete pinned Release matrix: 12 garments x 2
+        # episodes in each of the four native category lists.
+        if len(rows) != 96 or tuple(dict.fromkeys(row.category for row in rows)) != tuple(
+            category for category, _ in CATEGORY_DIRECTORIES
+        ):
+            raise ComparisonError("N1.5 all-category matrix category/order drift")
+        return rows
     raise ComparisonError("unknown comparison profile")
 
 
@@ -1006,10 +1016,11 @@ def compile_policy_result(
         expected_per_category = 2
     else:
         raise ComparisonError("infrastructure_invalid: comparison matrix is neither official full nor smoke")
+    measured_fidelity = fidelity_root is not None
     focused = len(matrix) == 48 and tuple(
         dict.fromkeys(row.category for row in matrix)
     ) == N15_FOCUSED_CATEGORIES
-    if focused and fidelity_root is None:
+    if focused and not measured_fidelity:
         raise ComparisonError("fidelity_invalid: focused comparison requires measured cloth evidence")
     outcomes: list[dict[str, object]] = []
     videos: list[dict[str, object]] = []
@@ -1026,7 +1037,7 @@ def compile_policy_result(
         log = Path(logs_root) / f"{policy_id}-{category}.log"
         category_outcomes = _parse_category_log(log, expected)
         outcomes.extend(category_outcomes)
-        if focused:
+        if measured_fidelity:
             from rollout_appliance.native_reference_site.cloth_fidelity import (
                 validate_cloth_fidelity_evidence,
             )
@@ -1056,7 +1067,7 @@ def compile_policy_result(
     ] != [(row.category, row.garment, row.episode_index, row.seed) for row in matrix]:
         raise ComparisonError("infrastructure_invalid: compiled outcome order drift")
     fidelity_invalid_count = int(cloth_fidelity["fidelity_invalid_count"])
-    if focused and fidelity_invalid_count:
+    if measured_fidelity and fidelity_invalid_count:
         raise ComparisonError(
             f"fidelity_invalid: measured {fidelity_invalid_count} invalid cloth episodes"
         )
@@ -1067,7 +1078,7 @@ def compile_policy_result(
         "success_count": sum(bool(row["success"]) for row in outcomes),
         "fidelity_invalid_count": fidelity_invalid_count,
         "infrastructure_invalid_count": 0,
-        "cloth_fidelity": cloth_fidelity if focused else None,
+        "cloth_fidelity": cloth_fidelity if measured_fidelity else None,
         "outcomes": outcomes,
         "retained_official_videos": videos,
         "video_scope": "official filenames overwrite per garment; retained files represent only each category's final garment",
@@ -1145,11 +1156,20 @@ def assess_n15_focused_promotion(
     receipt_sha256: str,
 ) -> dict[str, object]:
     """Return pass only after the paired gate and anonymous publication readback hold."""
+    profile = receipt.get("profile")
+    if profile == N15_FOCUSED_PROFILE:
+        profile_categories = N15_FOCUSED_CATEGORIES
+        expected_episode_count = 48
+    elif profile == N15_ALL_CATEGORY_PROFILE:
+        profile_categories = tuple(category for category, _ in CATEGORY_DIRECTORIES)
+        expected_episode_count = 96
+    else:
+        raise ComparisonError("N1.5 category receipt profile is invalid")
     if (
         receipt.get("kind") != "lehome_official_policy_comparison_v1"
         or receipt.get("status") != "valid"
         or receipt.get("mode") != "full"
-        or receipt.get("profile") != N15_FOCUSED_PROFILE
+        or receipt.get("profile") != profile
     ):
         raise ComparisonError("N1.5 focused receipt identity/status is invalid")
     required_provenance = {
@@ -1281,12 +1301,12 @@ def assess_n15_focused_promotion(
         or not isinstance(receipt.get("command_parity"), Mapping)
         or receipt["command_parity"].get("verified") is not True
         or set(receipt["command_parity"]) != {"verified", "category_common_command_sha256"}
-        or set(receipt["command_parity"]["category_common_command_sha256"]) != set(N15_FOCUSED_CATEGORIES)
+        or set(receipt["command_parity"]["category_common_command_sha256"]) != set(profile_categories)
         or any(not sha256(value) for value in receipt["command_parity"]["category_common_command_sha256"].values())
     ):
         raise ComparisonError("N1.5 focused provenance contract drift")
     matrix_payload = receipt.get("matrix")
-    if not isinstance(matrix_payload, list) or len(matrix_payload) != 48:
+    if not isinstance(matrix_payload, list) or len(matrix_payload) != expected_episode_count:
         raise ComparisonError("N1.5 focused matrix provenance is incomplete")
     try:
         matrix = [
@@ -1302,13 +1322,13 @@ def assess_n15_focused_promotion(
     except (KeyError, TypeError, ValueError):
         raise ComparisonError("N1.5 focused matrix provenance is invalid") from None
     if (
-        len(matrix) != 48
-        or tuple(dict.fromkeys(row.category for row in matrix)) != N15_FOCUSED_CATEGORIES
+        len(matrix) != expected_episode_count
+        or tuple(dict.fromkeys(row.category for row in matrix)) != profile_categories
         or any(row.seed != SEED for row in matrix)
         or receipt.get("matrix_sha256") != _sha256_bytes(_canonical_bytes(matrix_payload))
     ):
         raise ComparisonError("N1.5 focused matrix provenance drift")
-    for category in N15_FOCUSED_CATEGORIES:
+    for category in profile_categories:
         category_rows = [row for row in matrix if row.category == category]
         garments = list(dict.fromkeys(row.garment for row in category_rows))
         if (
@@ -1338,15 +1358,15 @@ def assess_n15_focused_promotion(
         outcomes = result.get("outcomes")
         if (
             result.get("status") != "valid"
-            or result.get("episode_count") != 48
+            or result.get("episode_count") != expected_episode_count
             or result.get("fidelity_invalid_count") != 0
             or result.get("infrastructure_invalid_count") != 0
             or not isinstance(outcomes, list)
-            or len(outcomes) != 48
+            or len(outcomes) != expected_episode_count
             or not isinstance(result.get("cloth_fidelity"), Mapping)
-            or result["cloth_fidelity"].get("measured_episode_count") != 48
+            or result["cloth_fidelity"].get("measured_episode_count") != expected_episode_count
             or result["cloth_fidelity"].get("fidelity_invalid_count") != 0
-            or set(result["cloth_fidelity"].get("categories", {})) != set(N15_FOCUSED_CATEGORIES)
+            or set(result["cloth_fidelity"].get("categories", {})) != set(profile_categories)
             or any(
                 not isinstance(summary, Mapping)
                 or summary.get("measured_episode_count") != 24
@@ -1368,7 +1388,7 @@ def assess_n15_focused_promotion(
         by_policy[str(result["policy_id"])] = result
 
     category_scores: dict[str, dict[str, int]] = {}
-    for category in N15_FOCUSED_CATEGORIES:
+    for category in profile_categories:
         candidate = sum(
             bool(row["success"])
             for row in by_policy["candidate-n15"]["outcomes"]
@@ -1379,10 +1399,10 @@ def assess_n15_focused_promotion(
             for row in by_policy["reference-n15"]["outcomes"]
             if row["category"] == category
         )
-        floor = N15_FOCUSED_FLOORS[category]
+        floor = N15_FOCUSED_FLOORS[category] if profile == N15_FOCUSED_PROFILE else N15_ALL_CATEGORY_FLOOR
         if candidate < floor:
             raise ComparisonError(f"{category} floor failed: {candidate}/24 < {floor}/24")
-        if reference - candidate > N15_FOCUSED_MAXIMUM_DEFICIT:
+        if profile == N15_FOCUSED_PROFILE and reference - candidate > N15_FOCUSED_MAXIMUM_DEFICIT:
             raise ComparisonError(
                 f"{category} deficit failed: candidate is {reference - candidate} behind reference"
             )
@@ -1390,8 +1410,9 @@ def assess_n15_focused_promotion(
             "candidate": candidate,
             "reference": reference,
             "floor": floor,
-            "maximum_deficit": N15_FOCUSED_MAXIMUM_DEFICIT,
         }
+        if profile == N15_FOCUSED_PROFILE:
+            category_scores[category]["maximum_deficit"] = N15_FOCUSED_MAXIMUM_DEFICIT
 
     if (
         re.fullmatch(r"[0-9a-f]{64}", receipt_sha256) is None
@@ -1404,9 +1425,13 @@ def assess_n15_focused_promotion(
         raise ComparisonError("N1.5 focused publication readback is missing or invalid")
     return {
         "schema_version": 1,
-        "kind": "lehome_public_n15_focused_promotion_v1",
+        "kind": (
+            "lehome_public_n15_focused_promotion_v1"
+            if profile == N15_FOCUSED_PROFILE
+            else "lehome_public_n15_all_category_promotion_v1"
+        ),
         "status": "pass",
-        "profile": N15_FOCUSED_PROFILE,
+        "profile": profile,
         "comparison_receipt_sha256": receipt_sha256,
         "publication_immutable_revision": publication["immutable_revision"],
         "publication_readback_verified": True,
@@ -1498,7 +1523,7 @@ def _validate_focused_rollout_image(receipt: Mapping[str, object]) -> dict[str, 
 
 
 def execute_n15_focused_comparison(args: argparse.Namespace) -> Path:
-    """Execute two native N1.5 policies sequentially on the focused matrix."""
+    """Execute the selected native N1.5 profile sequentially for both policies."""
     source_root = args.source_root.resolve(strict=True)
     canonical_assets_root = args.canonical_assets_root.resolve(strict=True)
     output_root = args.output_root
@@ -1562,7 +1587,8 @@ def execute_n15_focused_comparison(args: argparse.Namespace) -> Path:
     frozen_reference_matrix_sha = validate_reference_matrix(
         args.reference_matrix, args.reference_matrix_sha256, full_matrix
     )
-    matrix = load_profile_matrix(canonical_assets_root, profile=N15_FOCUSED_PROFILE)
+    matrix = load_profile_matrix(canonical_assets_root, profile=args.profile)
+    profile_categories = tuple(dict.fromkeys(row.category for row in matrix))
     matrix_payload = [asdict(row) for row in matrix]
     matrix_sha = _sha256_bytes(_canonical_bytes(matrix_payload))
     policies = (
@@ -1596,7 +1622,7 @@ def execute_n15_focused_comparison(args: argparse.Namespace) -> Path:
         # Tuple order is contractual: candidate finishes before the reference starts.
         for policy in policies:
             sanitized_root, compatibility_receipt = policy_views[policy.policy_id]
-            for category in N15_FOCUSED_CATEGORIES:
+            for category in profile_categories:
                 command_id = f"{policy.policy_id}-{category}"
                 video_dir = output_root / "videos" / command_id
                 video_dir.mkdir(parents=True)
@@ -1713,7 +1739,7 @@ def execute_n15_focused_comparison(args: argparse.Namespace) -> Path:
             "kind": "lehome_official_policy_comparison_v1",
             "status": "valid",
             "mode": "full",
-            "profile": N15_FOCUSED_PROFILE,
+            "profile": args.profile,
             "created_at_utc": datetime.now(timezone.utc)
             .replace(microsecond=0)
             .isoformat()
@@ -2127,6 +2153,8 @@ def publish_comparison(args: argparse.Namespace) -> Path:
 
 def verify_n15_focused_promotion(args: argparse.Namespace) -> Path:
     receipt = _load_json_object(args.receipt, "focused comparison receipt")
+    if receipt.get("profile") != args.profile:
+        raise ComparisonError("N1.5 requested profile does not match comparison receipt")
     publication = _load_json_object(args.publication_receipt, "focused publication receipt")
     decision = assess_n15_focused_promotion(
         receipt,
@@ -2185,7 +2213,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--docker-url", default="http://127.0.0.1:8080")
     run.add_argument("--python-bin", default=sys.executable)
     focused = commands.add_parser("run-n15-focused")
-    focused.add_argument("--profile", choices=(N15_FOCUSED_PROFILE,), required=True)
+    focused.add_argument(
+        "--profile", choices=(N15_FOCUSED_PROFILE, N15_ALL_CATEGORY_PROFILE), required=True
+    )
     focused.add_argument("--source-root", type=Path, required=True)
     focused.add_argument("--canonical-assets-root", type=Path, required=True)
     focused.add_argument("--metadata-root", type=Path, required=True)
@@ -2222,6 +2252,7 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--token-env", default="HF_TOKEN")
     publish.add_argument("--publication-receipt", type=Path, required=True)
     verify = commands.add_parser("verify-n15-focused")
+    verify.add_argument("--profile", choices=(N15_FOCUSED_PROFILE, N15_ALL_CATEGORY_PROFILE), default=N15_FOCUSED_PROFILE)
     verify.add_argument("--receipt", type=Path, required=True)
     verify.add_argument("--publication-receipt", type=Path, required=True)
     verify.add_argument("--promotion-receipt", type=Path, required=True)

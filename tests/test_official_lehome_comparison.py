@@ -39,6 +39,7 @@ from scripts.run_official_lehome_comparison import (
     checkout_identity,
     load_release_matrix,
     N15_FOCUSED_PROFILE,
+    N15_ALL_CATEGORY_PROFILE,
     assess_n15_focused_promotion,
     load_profile_matrix,
 )
@@ -315,6 +316,22 @@ def test_n15_focused_profile_uses_only_twelve_top_short_and_pant_long_release_ga
     assert all(row.seed == 42 for row in rows)
     assert [row.episode_index for row in rows[::2]] == [1] * 24
     assert [row.episode_index for row in rows[1::2]] == [2] * 24
+
+
+def test_n15_all_category_profile_preserves_every_release_category_and_pair(tmp_path: Path) -> None:
+    assets = _assets(tmp_path / "assets")
+    rows = load_profile_matrix(assets, profile=N15_ALL_CATEGORY_PROFILE)
+
+    assert len(rows) == 96
+    assert tuple(dict.fromkeys(row.category for row in rows)) == tuple(CATEGORIES)
+    for category in CATEGORIES:
+        category_rows = [row for row in rows if row.category == category]
+        assert len(category_rows) == 24
+        assert len({row.garment for row in category_rows}) == 12
+        assert all(
+            [row.episode_index for row in category_rows if row.garment == garment] == [1, 2]
+            for garment in {row.garment for row in category_rows}
+        )
 
 
 def test_default_profile_preserves_the_existing_four_category_matrix(tmp_path: Path) -> None:
@@ -725,6 +742,109 @@ def _focused_publication(receipt_sha256: str) -> dict[str, object]:
         "anonymous_file_set_verified": True,
         "anonymous_byte_readback_verified": True,
     }
+
+
+def _all_category_result(
+    policy_id: str, matrix: list[MatrixRow], scores: dict[str, int]
+) -> dict[str, object]:
+    remaining = dict(scores)
+    outcomes = []
+    for row in matrix:
+        success = remaining[row.category] > 0
+        if success:
+            remaining[row.category] -= 1
+        outcomes.append(
+            {"category": row.category, "garment": row.garment,
+             "episode_index": row.episode_index, "seed": row.seed, "success": success}
+        )
+    categories = tuple(dict.fromkeys(row.category for row in matrix))
+    return {
+        "policy_id": policy_id, "status": "valid", "episode_count": len(matrix),
+        "success_count": sum(scores.values()), "fidelity_invalid_count": 0,
+        "infrastructure_invalid_count": 0,
+        "cloth_fidelity": {
+            "measured_episode_count": len(matrix), "fidelity_invalid_count": 0,
+            "event_count": len(matrix) * 2,
+            "categories": {
+                category: {
+                    "measured_episode_count": 24, "fidelity_invalid_count": 0,
+                    "event_count": 48,
+                    "first_event_sha256": hashlib.sha256(f"{policy_id}-{category}-first".encode()).hexdigest(),
+                    "last_event_sha256": hashlib.sha256(f"{policy_id}-{category}-last".encode()).hexdigest(),
+                    "evidence_sha256": hashlib.sha256(f"{policy_id}-{category}-evidence".encode()).hexdigest(),
+                }
+                for category in categories
+            },
+        },
+        "outcomes": outcomes,
+    }
+
+
+def _all_category_receipt(
+    matrix: list[MatrixRow], *, candidate: int = 15, reference: int = 24
+) -> dict[str, object]:
+    receipt = _focused_receipt(
+        [row for row in matrix if row.category in ("top_short", "pant_long")]
+    )
+    categories = tuple(dict.fromkeys(row.category for row in matrix))
+    matrix_payload = [row.__dict__ for row in matrix]
+    receipt.update({
+        "profile": N15_ALL_CATEGORY_PROFILE,
+        "matrix": matrix_payload,
+        "matrix_sha256": hashlib.sha256(
+            (json.dumps(matrix_payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        ).hexdigest(),
+        "command_parity": {"verified": True, "category_common_command_sha256": {
+            category: hashlib.sha256(f"command-{category}".encode()).hexdigest()
+            for category in categories
+        }},
+        "results": [
+            _all_category_result("candidate-n15", matrix, {category: candidate for category in categories}),
+            _all_category_result("reference-n15", matrix, {category: reference for category in categories}),
+        ],
+    })
+    return receipt
+
+
+def _receipt_sha(receipt: dict[str, object]) -> str:
+    return hashlib.sha256(
+        (json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
+    ).hexdigest()
+
+
+def test_n15_all_category_promotion_requires_15_per_category_without_reference_deficit(
+    tmp_path: Path,
+) -> None:
+    matrix = load_profile_matrix(_assets(tmp_path / "assets"), profile=N15_ALL_CATEGORY_PROFILE)
+    receipt = _all_category_receipt(matrix, candidate=15, reference=24)
+    decision = assess_n15_focused_promotion(
+        receipt, publication=_focused_publication(_receipt_sha(receipt)), receipt_sha256=_receipt_sha(receipt)
+    )
+
+    assert decision["profile"] == N15_ALL_CATEGORY_PROFILE
+    assert decision["kind"] == "lehome_public_n15_all_category_promotion_v1"
+    assert set(decision["category_scores"]) == set(CATEGORIES)
+    assert all(score["candidate"] == 15 and "maximum_deficit" not in score
+               for score in decision["category_scores"].values())
+
+
+def test_n15_all_category_promotion_rejects_14_of_24_missing_category_and_invalid_fidelity(
+    tmp_path: Path,
+) -> None:
+    matrix = load_profile_matrix(_assets(tmp_path / "assets"), profile=N15_ALL_CATEGORY_PROFILE)
+    receipt = _all_category_receipt(matrix, candidate=14)
+    with pytest.raises(ComparisonError, match="floor failed: 14/24 < 15/24"):
+        assess_n15_focused_promotion(receipt, publication=_focused_publication(_receipt_sha(receipt)), receipt_sha256=_receipt_sha(receipt))
+
+    receipt = _all_category_receipt(matrix)
+    del receipt["command_parity"]["category_common_command_sha256"]["pant_short"]
+    with pytest.raises(ComparisonError, match="provenance"):
+        assess_n15_focused_promotion(receipt, publication=_focused_publication(_receipt_sha(receipt)), receipt_sha256=_receipt_sha(receipt))
+
+    receipt = _all_category_receipt(matrix)
+    receipt["results"][0]["cloth_fidelity"]["categories"]["top_long"]["fidelity_invalid_count"] = 1
+    with pytest.raises(ComparisonError, match="fidelity"):
+        assess_n15_focused_promotion(receipt, publication=_focused_publication(_receipt_sha(receipt)), receipt_sha256=_receipt_sha(receipt))
 
 
 def test_n15_focused_promotion_requires_paired_thresholds_and_published_readback(tmp_path: Path) -> None:

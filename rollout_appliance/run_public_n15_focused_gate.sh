@@ -22,6 +22,7 @@ readonly OUTPUT_ROOT="${LEHOME_N15_FOCUSED_OUTPUT_ROOT:-}"
 readonly REPOSITORY="${LEHOME_N15_FOCUSED_REPOSITORY:-}"
 readonly PUBLICATION_RECEIPT="${LEHOME_N15_FOCUSED_PUBLICATION_RECEIPT:-}"
 readonly PROMOTION_RECEIPT="${LEHOME_N15_FOCUSED_PROMOTION_RECEIPT:-}"
+readonly EVAL_PROFILE="${LEHOME_N15_EVAL_PROFILE:-n15-focused}"
 readonly ROLLOUT_IMAGE_ID="sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"
 readonly REFERENCE_MATRIX="$REPO_ROOT/configs/eval_groot_n17_public96_reference.json"
 readonly REFERENCE_MATRIX_SHA256="$REPO_ROOT/configs/eval_groot_n17_public96_reference.json.sha256"
@@ -58,6 +59,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 [[ $# -eq 0 ]] || fail "this wrapper accepts no positional arguments"
+[[ "$EVAL_PROFILE" == n15-focused || "$EVAL_PROFILE" == n15-all-categories ]] \
+  || fail "N1.5 evaluation profile is invalid"
 type -P docker >/dev/null 2>&1 || fail "docker is unavailable"
 command -v sudo >/dev/null 2>&1 || fail "sudo is unavailable"
 command -v git >/dev/null 2>&1 || fail "git is unavailable"
@@ -227,7 +230,7 @@ CONTAINER_SCRIPT='set -euo pipefail
 /opt/lehome-challenge/.venv/bin/python /runtime/scripts/prepare_n15_dependency_overlay.py
 export PYTHONPATH="/flash/site-packages:$PYTHONPATH"
 /isaac-sim/python.sh -m scripts.run_official_lehome_comparison run-n15-focused \
-  --profile n15-focused \
+  --profile "$EVAL_PROFILE" \
   --source-root /official/lehome \
   --canonical-assets-root /official/assets \
   --metadata-root "$METADATA_ROOT" \
@@ -273,6 +276,7 @@ docker run --rm --pull never --gpus all --init --network host --shm-size=8g \
   --env "REFERENCE_SANITIZED_CONFIG=$REFERENCE_SANITIZED_CONFIG" \
   --env "REFERENCE_COMPATIBILITY_RECEIPT=$REFERENCE_COMPATIBILITY_RECEIPT" \
   --env "NATIVE_RUNTIME_EVIDENCE=$NATIVE_RUNTIME_EVIDENCE" \
+  --env "EVAL_PROFILE=$EVAL_PROFILE" \
   --env HF_HOME=/tmp/lehome-n15-hf-home \
   --env HF_HUB_CACHE=/official/n15-hf-cache/hub \
   --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 \
@@ -301,7 +305,7 @@ docker run --rm --pull never \
   --mount "type=bind,src=$(dirname -- "$OUTPUT_ROOT"),dst=$(dirname -- "$OUTPUT_ROOT")" \
   --entrypoint python3 "$ROLLOUT_IMAGE_ID" \
   /runtime/scripts/run_official_lehome_comparison.py verify-n15-focused \
-    --receipt "$OUTPUT_ROOT/comparison-receipt.json" \
+    --profile "$EVAL_PROFILE" --receipt "$OUTPUT_ROOT/comparison-receipt.json" \
     --publication-receipt "$PUBLICATION_RECEIPT" \
     --promotion-receipt "$PROMOTION_RECEIPT"
 

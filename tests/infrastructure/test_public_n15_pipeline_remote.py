@@ -1148,7 +1148,7 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert '"$LEROBOT_WHEEL" "$RUNTIME_IMAGE_ID" "$RESUME_PARTIAL" "$RESUME_CHECKPOINT" "$RESUME_STEP" "$RESUME_ATTEMPT_ID" "$RECOVER_COMPLETED_12K" <<\'SH\'' in text
     assert 'runtime_image_id="${12}"' in text
     assert 'recovery_only="${17}"' in text
-    assert " LEROBOT_WHEEL RUNTIME_IMAGE_ID RESUME_PARTIAL RESUME_CHECKPOINT RESUME_STEP RESUME_ATTEMPT_ID RECOVER_COMPLETED_12K ASSETS_ROOT" in text
+    assert " LEROBOT_WHEEL RUNTIME_IMAGE_ID RESUME_PARTIAL RESUME_CHECKPOINT RESUME_STEP RESUME_ATTEMPT_ID RECOVER_COMPLETED_12K ALL_CATEGORY_EVAL ASSETS_ROOT" in text
     assert "LEHOME_N15_EXPECTED_IMAGE_ID" not in text
     assert "nebius compute instance start --id" in text
     assert "nebius compute instance stop --id" in text
@@ -1306,6 +1306,109 @@ def test_remote_wrapper_never_runs_downstream_after_a_failed_gate() -> None:
     assert "run_paid_stage harvest" in text
     assert "paid-deadline.json" in text
     assert text.index("verify_remote_focused_chain || fail") < text.rindex("run_paid_stage harvest")
+
+
+def test_remote_wrapper_has_explicit_all_category_admission_that_bypasses_focused_and_harvest() -> None:
+    text = WRAPPER.read_text(encoding="utf-8")
+    assert 'readonly ALL_CATEGORY_EVAL="${LEHOME_N15_ALL_CATEGORY_EVAL:-0}"' in text
+    assert "all_category_stage()" in text
+    assert 'run_paid_stage focused_gate "$FOCUSED_TIMEOUT_SECONDS" all_category_stage' in text
+    assert "verify_remote_all_category_chain || fail" in text
+    all_category = text[text.index('if [[ "$ALL_CATEGORY_EVAL" == 1 ]]; then'):text.index('if ! remote_file_exists "$FOCUSED_PROMOTION_RECEIPT"; then')]
+    assert "stop_exact_vm || fail" in all_category
+    assert "run_paid_stage harvest" not in all_category
+
+
+def test_all_category_stubbed_pipeline_stops_after_a_verified_decision_without_harvest(
+    tmp_path: Path,
+) -> None:
+    trace = tmp_path / "trace"
+    harness = r'''
+source "$WRAPPER_PATH"
+remote_file_exists() {
+  case "$1" in
+    "$TRAINING_IDENTITY_RECEIPT"|"$TRAINING_PUBLICATION_RECEIPT"|"$ALL_CATEGORY_PROMOTION_RECEIPT") return 0 ;;
+  esac
+  return 1
+}
+run_paid_stage() { printf 'paid:%s\n' "$1" >> "$FAKE_TRACE"; }
+record_host_stage_completion() { :; }
+advance_paid_stage_admission_from_host_seals() { :; }
+verify_remote_training_chain() { printf 'training\n' >> "$FAKE_TRACE"; }
+verify_remote_training_publication() { printf 'publication\n' >> "$FAKE_TRACE"; }
+verify_remote_all_category_chain() { printf 'all-category\n' >> "$FAKE_TRACE"; }
+fetch_remote_all_category_evidence() { printf 'readback\n' >> "$FAKE_TRACE"; }
+verify_remote_focused_chain() { printf 'focused\n' >> "$FAKE_TRACE"; return 99; }
+verify_remote_harvest_chain() { printf 'harvest\n' >> "$FAKE_TRACE"; return 99; }
+stop_exact_vm() { printf 'stop\n' >> "$FAKE_TRACE"; }
+run_pipeline_after_runtime
+[[ "$PIPELINE_COMPLETE" == 1 ]]
+'''
+    result = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **os.environ, "WRAPPER_PATH": str(WRAPPER), "FAKE_TRACE": str(trace),
+            "LEHOME_N15_ALL_CATEGORY_EVAL": "1",
+        }, text=True, capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert trace.read_text(encoding="ascii").splitlines() == [
+        "training", "publication", "all-category", "readback", "stop",
+    ]
+
+
+def test_all_category_threshold_failure_fetches_evidence_without_harvest(tmp_path: Path) -> None:
+    trace = tmp_path / "trace"
+    harness = r'''
+source "$WRAPPER_PATH"
+remote_file_exists() {
+  case "$1" in "$TRAINING_IDENTITY_RECEIPT"|"$TRAINING_PUBLICATION_RECEIPT") return 0 ;; esac
+  return 1
+}
+run_paid_stage() { printf 'paid:%s\n' "$1" >> "$FAKE_TRACE"; return 18; }
+record_host_stage_completion() { :; }
+advance_paid_stage_admission_from_host_seals() { :; }
+verify_remote_training_chain() { :; }
+verify_remote_training_publication() { :; }
+fetch_remote_all_category_evidence() { printf 'readback\n' >> "$FAKE_TRACE"; }
+verify_remote_focused_chain() { printf 'focused\n' >> "$FAKE_TRACE"; return 99; }
+verify_remote_harvest_chain() { printf 'harvest\n' >> "$FAKE_TRACE"; return 99; }
+run_pipeline_after_runtime
+'''
+    result = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **os.environ, "WRAPPER_PATH": str(WRAPPER), "FAKE_TRACE": str(trace),
+            "LEHOME_N15_ALL_CATEGORY_EVAL": "1",
+        }, text=True, capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert "harvest requires an explicit new decision" in result.stderr
+    assert trace.read_text(encoding="ascii").splitlines() == ["paid:focused_gate", "readback"]
+
+
+def test_all_category_evidence_fetch_propagates_the_first_immutable_readback_failure(
+    tmp_path: Path,
+) -> None:
+    trace = tmp_path / "trace"
+    harness = r'''
+source "$WRAPPER_PATH"
+remote_file_exists() { return 0; }
+fetch_remote_immutable() { printf '%s\n' "$1" >> "$FAKE_TRACE"; return 73; }
+fetch_remote_all_category_evidence
+'''
+    result = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={**os.environ, "WRAPPER_PATH": str(WRAPPER), "FAKE_TRACE": str(trace)},
+        text=True, capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert trace.read_text(encoding="ascii").splitlines() == [
+        "/all-category/comparison-receipt.json",
+    ]
 
 
 def test_remote_wrapper_resume_is_explicit_exact_and_preserves_immutable_evidence() -> None:
@@ -2784,6 +2887,44 @@ printf 'complete\n'
         else []
     )
     assert "1" not in sleep_calls
+
+
+@pytest.mark.parametrize(
+    ("stage_function", "stage_body", "expected_status"),
+    [
+        ("all_category_stage", "all_category_stage() { return 18; }", 18),
+        ("focused_stage", "focused_stage() { return 18; }", 2),
+    ],
+)
+def test_only_all_category_terminal_evaluator_status_returns_to_pipeline(
+    tmp_path: Path, stage_function: str, stage_body: str, expected_status: int,
+) -> None:
+    """Exercise the real setsid dispatcher, not a stubbed run_paid_stage."""
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, f"n15-terminal-status-{stage_function}")
+    harness = f'''\
+source "$WRAPPER_PATH"
+initialize_deadline() {{ echo "$(( $(date +%s) + 30 ))"; }}
+initialize_stage_deadline() {{ echo "$(( $(date +%s) + 30 ))"; }}
+{stage_body}
+set +e
+run_paid_stage focused_gate 30 {stage_function}
+status=$?
+set -e
+printf '%s\\n' "$status"
+exit "$status"
+'''
+    result = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={**env, "WRAPPER_PATH": str(WRAPPER)}, text=True, capture_output=True,
+        timeout=15,
+    )
+
+    assert result.returncode == expected_status
+    if stage_function == "all_category_stage":
+        assert result.stdout == "18\n"
+    else:
+        assert "focused_gate failed" in result.stderr
 
 
 def test_training_publication_adopts_verified_upload_after_local_receipt_crash(
