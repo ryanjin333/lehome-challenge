@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import os
 from pathlib import Path
+import re
+import shlex
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -199,6 +204,121 @@ def test_n15_focused_wrapper_remounts_prepared_candidate_view_read_only_for_eval
     assert "CANDIDATE_SANITIZED_CONFIG_SHA256_BEFORE" in text
     assert "CANDIDATE_COMPATIBILITY_RECEIPT_SHA256_BEFORE" in text
     assert "candidate compatibility view changed during evaluation" in text
+
+
+def test_n15_focused_wrapper_declares_the_pinned_offline_eagle_tokenizer_cache() -> None:
+    text = N15_FOCUSED_WRAPPER.read_text(encoding="utf-8")
+    assert 'EAGLE_REPOSITORY="$HF_CACHE_ROOT/hub/models--lerobot--eagle2hg-processor-groot-n1p5"' in text
+    assert 'EAGLE_TOKENIZER_REVISION="baf604d8a5caf26fda5cc545f141bc1814156237"' in text
+    assert 'EAGLE_SNAPSHOT="$EAGLE_REPOSITORY/snapshots/$EAGLE_TOKENIZER_REVISION"' in text
+    assert '"$EAGLE_REPOSITORY/refs/main"' in text
+    assert "eagle tokenizer cache revision mismatch" in text
+    assert 'readonly EAGLE_TOKENIZER_SNAPSHOT=/official/n15-hf-cache/hub/models--lerobot--eagle2hg-processor-groot-n1p5/snapshots/baf604d8a5caf26fda5cc545f141bc1814156237' in text
+    assert 'readonly EAGLE_CACHE="$HF_HOME/lerobot/lerobot/eagle2hg-processor-groot-n1p5"' in text
+    assert '--env HF_HOME=/tmp/lehome-n15-hf-home' in text
+    for asset in (
+        "vocab.json", "merges.txt", "added_tokens.json", "chat_template.json",
+        "special_tokens_map.json", "config.json", "generation_config.json",
+        "preprocessor_config.json", "processor_config.json", "tokenizer_config.json",
+    ):
+        assert asset in text
+
+
+def test_n15_focused_wrapper_accepts_a_trailing_slash_on_pinned_eagle_cache_root(tmp_path) -> None:
+    text = N15_FOCUSED_WRAPPER.read_text(encoding="utf-8")
+    assert 'readonly EAGLE_HUB_ROOT="$(realpath -e -- "$HF_CACHE_ROOT/hub")"' in text
+    start = text.index("for eagle_file_and_digest in \\")
+    end = text.index('\nrequire_file "$REFERENCE_MATRIX"', start)
+    validation = text[start:end]
+
+    cache = tmp_path / "cache"
+    hub = cache / "hub"
+    snapshot = hub / "models--lerobot--eagle2hg-processor-groot-n1p5/snapshots/baf604d8a5caf26fda5cc545f141bc1814156237"
+    blobs = hub / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs.mkdir()
+    assets = (
+        "processor_config.json", "tokenizer_config.json", "vocab.json", "merges.txt",
+        "added_tokens.json", "chat_template.json", "special_tokens_map.json", "config.json",
+        "generation_config.json", "preprocessor_config.json",
+    )
+    for asset in assets:
+        blob = blobs / asset
+        contents = f"pinned-{asset}".encode("ascii")
+        blob.write_bytes(contents)
+        (snapshot / asset).symlink_to(Path("../../../blobs") / asset)
+        validation = re.sub(
+            rf"(\$EAGLE_SNAPSHOT/{re.escape(asset)}:)[0-9a-f]{{64}}",
+            rf"\g<1>{hashlib.sha256(contents).hexdigest()}",
+            validation,
+        )
+
+    prologue = f'''set -euo pipefail
+fail() {{ printf '%s\\n' "$*" >&2; exit 2; }}
+realpath() {{
+  [[ "$1" == -e ]] && shift
+  [[ "$1" == -- ]] && shift
+  python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}}
+HF_CACHE_ROOT={shlex.quote(str(cache) + '/')}
+EAGLE_HUB_ROOT={shlex.quote(str(hub))}
+EAGLE_SNAPSHOT={shlex.quote(str(snapshot))}
+'''
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", prologue + validation],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_n15_focused_wrapper_seeds_offline_eagle_cache_and_rejects_missing_assets(tmp_path) -> None:
+    text = N15_FOCUSED_WRAPPER.read_text(encoding="utf-8")
+    start = text.index("# Seed the validated pinned Eagle tokenizer assets for offline LeRobot.")
+    end = text.index("# Run the native candidate/reference evaluator after the offline cache is ready.", start)
+    seed_script = text[start:end]
+    snapshot = tmp_path / "snapshot"
+    blobs = tmp_path / "blobs"
+    snapshot.mkdir()
+    blobs.mkdir()
+    assets = (
+        "vocab.json", "merges.txt", "added_tokens.json", "chat_template.json",
+        "special_tokens_map.json", "config.json", "generation_config.json",
+        "preprocessor_config.json", "processor_config.json", "tokenizer_config.json",
+    )
+    for asset in assets:
+        blob = blobs / asset
+        blob.write_bytes(f"pinned-{asset}".encode("ascii"))
+        (snapshot / asset).symlink_to(Path("../blobs") / asset)
+    seed_script = seed_script.replace(
+        "readonly EAGLE_TOKENIZER_SNAPSHOT=/official/n15-hf-cache/hub/models--lerobot--eagle2hg-processor-groot-n1p5/snapshots/baf604d8a5caf26fda5cc545f141bc1814156237",
+        f"readonly EAGLE_TOKENIZER_SNAPSHOT={shlex.quote(str(snapshot))}",
+    )
+    home = tmp_path / "hf-home"
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", seed_script],
+        check=False,
+        env={**os.environ, "HF_HOME": str(home)},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    cache = home / "lerobot/lerobot/eagle2hg-processor-groot-n1p5"
+    for asset in assets:
+        copied = cache / asset
+        assert copied.read_bytes() == f"pinned-{asset}".encode("ascii")
+        assert not copied.is_symlink()
+
+    (snapshot / "vocab.json").unlink()
+    missing = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", seed_script],
+        check=False,
+        env={**os.environ, "HF_HOME": str(tmp_path / "missing-hf-home")},
+        capture_output=True,
+        text=True,
+    )
+    assert missing.returncode != 0
 
 
 def test_n15_focused_wrapper_publishes_then_verifies_readback_before_pass() -> None:

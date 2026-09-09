@@ -96,6 +96,36 @@ require_file "$REFERENCE_COMPATIBILITY_RECEIPT" "reference-n15 compatibility rec
 require_directory "$NATIVE_RUNTIME_EVIDENCE" "native N1.5 runtime evidence"
 require_directory "$NATIVE_DEPENDENCIES_ROOT" "native N1.5 dependency wheels"
 require_directory "$HF_CACHE_ROOT" "pinned N1.5 Hugging Face cache"
+require_directory "$HF_CACHE_ROOT/hub" "pinned N1.5 Hugging Face hub cache"
+readonly EAGLE_HUB_ROOT="$(realpath -e -- "$HF_CACHE_ROOT/hub")"
+readonly EAGLE_TOKENIZER_REVISION="baf604d8a5caf26fda5cc545f141bc1814156237"
+readonly EAGLE_REPOSITORY="$HF_CACHE_ROOT/hub/models--lerobot--eagle2hg-processor-groot-n1p5"
+readonly EAGLE_SNAPSHOT="$EAGLE_REPOSITORY/snapshots/$EAGLE_TOKENIZER_REVISION"
+require_directory "$EAGLE_REPOSITORY" "pinned Eagle tokenizer repository"
+require_directory "$EAGLE_SNAPSHOT" "pinned Eagle tokenizer snapshot"
+require_file "$EAGLE_REPOSITORY/refs/main" "pinned Eagle tokenizer cache ref"
+[[ "$(<"$EAGLE_REPOSITORY/refs/main")" == "$EAGLE_TOKENIZER_REVISION" ]] \
+  || fail "eagle tokenizer cache revision mismatch"
+for eagle_file_and_digest in \
+  "$EAGLE_SNAPSHOT/processor_config.json:bef09de1f7e4ba975911576028a174d7a49b4e1c2e4a2d5f6d5f400ac4631ae5" \
+  "$EAGLE_SNAPSHOT/tokenizer_config.json:88cfe3a9605b59cfa6757797f66085f958b4cd81820781ea1a48c5ae690b8232" \
+  "$EAGLE_SNAPSHOT/vocab.json:87a257b04b17642a0688c98cd1df89c398bda4fee532d6f88b38a659ecb4ac8d" \
+  "$EAGLE_SNAPSHOT/merges.txt:8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5" \
+  "$EAGLE_SNAPSHOT/added_tokens.json:4dd6146d2eccfb4a5c8e147df8876eb92be19ed60a3e65aab4d5d3e9f51f6d6a" \
+  "$EAGLE_SNAPSHOT/chat_template.json:f4a71030443c5d03a0ef0abb9bef5c9110cacf852ddc49710b22fa2a2bd7a3b9" \
+  "$EAGLE_SNAPSHOT/special_tokens_map.json:1f7a26d4bd862741d920097c370aaac4010b483c0dec3c85e2b42954cd8ea342" \
+  "$EAGLE_SNAPSHOT/config.json:c178f5b4fb451131094d0292dcbbc78aaa458a992e5bc9302d56e033d2a3de10" \
+  "$EAGLE_SNAPSHOT/generation_config.json:f15f5de33244a61325923e99bad2c061029acb8d6dd5c57f8458b3949ddd8f97" \
+  "$EAGLE_SNAPSHOT/preprocessor_config.json:b37b7dcf753d6a4c52357c208e2d60cfeb9216681fc301b21bee65da201d2d5c"; do
+  eagle_file="${eagle_file_and_digest%%:*}"
+  eagle_digest="${eagle_file_and_digest##*:}"
+  [[ -f "$eagle_file" ]] || fail "eagle tokenizer cache file is unavailable"
+  resolved_eagle_file="$(realpath -e -- "$eagle_file")"
+  [[ "$resolved_eagle_file" == "$EAGLE_HUB_ROOT/"* && -f "$resolved_eagle_file" && ! -L "$resolved_eagle_file" ]] \
+    || fail "eagle tokenizer cache file resolves outside the pinned cache"
+  [[ "$(sha256sum -- "$resolved_eagle_file" | awk '{print $1}')" == "$eagle_digest" ]] \
+    || fail "eagle tokenizer cache file digest mismatch"
+done
 require_file "$REFERENCE_MATRIX" "frozen reference matrix"
 require_file "$REFERENCE_MATRIX_SHA256" "frozen reference matrix checksum"
 [[ "$OUTPUT_ROOT" == /* && "$OUTPUT_ROOT" != *".."* && ! -e "$OUTPUT_ROOT" && ! -L "$OUTPUT_ROOT" ]] \
@@ -229,6 +259,15 @@ mounts=(
 CONTAINER_SCRIPT='set -euo pipefail
 /opt/lehome-challenge/.venv/bin/python /runtime/scripts/prepare_n15_dependency_overlay.py
 export PYTHONPATH="/flash/site-packages:$PYTHONPATH"
+# Seed the validated pinned Eagle tokenizer assets for offline LeRobot.
+readonly EAGLE_TOKENIZER_SNAPSHOT=/official/n15-hf-cache/hub/models--lerobot--eagle2hg-processor-groot-n1p5/snapshots/baf604d8a5caf26fda5cc545f141bc1814156237
+readonly EAGLE_CACHE="$HF_HOME/lerobot/lerobot/eagle2hg-processor-groot-n1p5"
+for eagle_asset in vocab.json merges.txt added_tokens.json chat_template.json special_tokens_map.json config.json generation_config.json preprocessor_config.json processor_config.json tokenizer_config.json; do
+  [[ -f "$EAGLE_TOKENIZER_SNAPSHOT/$eagle_asset" ]] || exit 2
+done
+(umask 077; mkdir -p "$EAGLE_CACHE")
+cp -L "$EAGLE_TOKENIZER_SNAPSHOT"/{vocab.json,merges.txt,added_tokens.json,chat_template.json,special_tokens_map.json,config.json,generation_config.json,preprocessor_config.json,processor_config.json,tokenizer_config.json} "$EAGLE_CACHE/"
+# Run the native candidate/reference evaluator after the offline cache is ready.
 /isaac-sim/python.sh -m scripts.run_official_lehome_comparison run-n15-focused \
   --profile "$EVAL_PROFILE" \
   --source-root /official/lehome \
