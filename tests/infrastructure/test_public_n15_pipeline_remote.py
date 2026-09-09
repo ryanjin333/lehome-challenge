@@ -2037,6 +2037,166 @@ run_pipeline_after_runtime
     assert "seal lacks verified publication" in rejected.stderr
 
 
+def test_reconciled_complete_training_chain_is_consumed_once_then_reverified(
+    tmp_path: Path,
+) -> None:
+    """A completed-chain reconciliation is fresh only for this lifecycle child."""
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, "n15-reconciled-training-once")
+    trace = tmp_path / "trace"
+    harness = r'''
+source "$WRAPPER_PATH"
+remote_file_exists() {
+  [[ "$1" == "$TRAINING_IDENTITY_RECEIPT" || "$1" == "$TRAINING_PUBLICATION_RECEIPT" || "$1" == "$ALL_CATEGORY_PROMOTION_RECEIPT" ]]
+}
+verify_remote_training_chain() { printf 'verify-training\n' >> "$TRACE"; }
+verify_remote_training_publication() { printf 'verify-publication\n' >> "$TRACE"; }
+record_host_stage_completion() { printf 'seal:%s\n' "$1" >> "$TRACE"; }
+advance_paid_stage_admission_from_host_seals() { :; }
+verify_remote_all_category_chain() { printf 'verify-all-category\n' >> "$TRACE"; }
+fetch_remote_all_category_evidence() { :; }
+stop_exact_vm() { :; }
+reconcile_remote_stage_seals
+run_pipeline_after_runtime
+run_pipeline_after_runtime
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env,
+            "WRAPPER_PATH": str(WRAPPER),
+            "TRACE": str(trace),
+            "LEHOME_N15_ALL_CATEGORY_EVAL": "1",
+        }, text=True, capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    lines = trace.read_text(encoding="ascii").splitlines()
+    # Reconciliation authenticates and seals the remote chain. The immediate
+    # continuation must consume that fresh, in-memory result rather than
+    # repeat two expensive model/publication walks. A later call gets no
+    # unchecked cache and therefore validates again.
+    assert lines.count("verify-training") == 2
+    assert lines.count("verify-publication") == 2
+    assert lines.count("seal:training") == 2
+    assert lines[:4] == [
+        "verify-training", "verify-publication", "seal:training", "verify-all-category",
+    ]
+
+
+def test_supplementary_approved_budget_requires_explicit_bounded_authorization(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, "n15-supplementary-approved-budget")
+    pipeline = Path(env["LEHOME_N15_PIPELINE_ROOT"])
+    module = _load_cli()
+    plan = pipeline / "lifecycle-plan.json"
+    assert module.main([
+        "lifecycle-plan", "--run-id", env["LEHOME_N15_RUN_ID"],
+        "--repository", env["LEHOME_N15_PUBLIC_HF_REPOSITORY"],
+        "--remote-pipeline-root", env["LEHOME_N15_REMOTE_PIPELINE_ROOT"],
+        "--budget-usd", "100", "--estimated-cost-usd", "72", "--output", str(plan),
+    ]) == 0
+    now = int(time.time())
+    historical = {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_paid_deadline_v1",
+        "run_id": env["LEHOME_N15_RUN_ID"],
+        "lifecycle_plan_sha256": hashlib.sha256(plan.read_bytes()).hexdigest(),
+        "started_unix_seconds": now - 86401,
+        "deadline_unix_seconds": now - 1,
+    }
+    historical_path = pipeline / "paid-deadline.json"
+    historical_path.write_bytes(_canonical_json_bytes(historical)); historical_path.chmod(0o444)
+    approval = {
+        "run_id": env["LEHOME_N15_RUN_ID"],
+        "started_unix_seconds": now - 1,
+        "deadline_unix_seconds": now + 14399,
+        "budget_usd": 108,
+        "prior_reserved_usd": 96,
+        "hourly_ceiling_usd": 3,
+        "new_window_max_usd": 12,
+        "authorization": "user approved the bounded evaluation-only continuation",
+    }
+    approval_path = pipeline / "approved-window-108.json"
+    approval_path.write_bytes(_canonical_json_bytes(approval)); approval_path.chmod(0o444)
+    plan_before, historical_before = plan.read_bytes(), historical_path.read_bytes()
+    harness = r'''
+source "$WRAPPER_PATH"
+host_next_unfinished_stage() { printf '%s\n' "${LEHOME_N15_TEST_NEXT_STAGE:-focused_gate}"; }
+approved_window_deadline
+'''
+
+    rejected = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={**env, "WRAPPER_PATH": str(WRAPPER), "LEHOME_N15_APPROVED_WINDOW": str(approval_path)},
+        text=True, capture_output=True,
+    )
+    assert rejected.returncode != 0
+
+    accepted = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env,
+            "WRAPPER_PATH": str(WRAPPER),
+            "LEHOME_N15_APPROVED_WINDOW": str(approval_path),
+            "LEHOME_N15_APPROVED_BUDGET_USD": "108",
+        }, text=True, capture_output=True,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    assert accepted.stdout.strip() == str(approval["deadline_unix_seconds"])
+    assert plan.read_bytes() == plan_before
+    assert historical_path.read_bytes() == historical_before
+
+    over_cap = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env,
+            "WRAPPER_PATH": str(WRAPPER),
+            "LEHOME_N15_APPROVED_WINDOW": str(approval_path),
+            "LEHOME_N15_APPROVED_BUDGET_USD": "109",
+        }, text=True, capture_output=True,
+    )
+    assert over_cap.returncode != 0
+
+    harvest_rejected = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env,
+            "WRAPPER_PATH": str(WRAPPER),
+            "LEHOME_N15_APPROVED_WINDOW": str(approval_path),
+            "LEHOME_N15_APPROVED_BUDGET_USD": "108",
+            "LEHOME_N15_TEST_NEXT_STAGE": "harvest",
+        }, text=True, capture_output=True,
+    )
+    assert harvest_rejected.returncode != 0
+
+
+def test_failed_reconciliation_never_marks_the_training_chain_fresh(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, "n15-reconciled-training-failure")
+    harness = r'''
+source "$WRAPPER_PATH"
+remote_file_exists() { [[ "$1" == "$TRAINING_IDENTITY_RECEIPT" || "$1" == "$TRAINING_PUBLICATION_RECEIPT" ]]; }
+verify_remote_training_chain() { :; }
+verify_remote_training_publication() { return 39; }
+record_host_stage_completion() { exit 97; }
+if ( reconcile_remote_stage_seals ); then exit 91; fi
+[[ "$RECONCILED_TRAINING_CHAIN" == 0 ]]
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={**env, "WRAPPER_PATH": str(WRAPPER)}, text=True, capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_main_explicit_resume_adopts_identity_only_completion_before_publication(
     tmp_path: Path,
 ) -> None:

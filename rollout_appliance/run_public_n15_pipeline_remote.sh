@@ -19,6 +19,9 @@ readonly REMOTE_ROOT="${LEHOME_N15_REMOTE_ROOT:-}"
 readonly REMOTE_PIPELINE_ROOT="${LEHOME_N15_REMOTE_PIPELINE_ROOT:-}"
 readonly REMOTE_RUNS_BASE="${LEHOME_N15_REMOTE_RUNS_BASE:-/mnt/lehome/public-n15-runs}"
 readonly MAX_BUDGET_USD="${LEHOME_N15_MAX_BUDGET_USD:-100}"
+# A supplementary window may only be admitted with a separately supplied,
+# bounded total.  The original lifecycle plan remains bound to MAX_BUDGET_USD.
+readonly APPROVED_BUDGET_USD="${LEHOME_N15_APPROVED_BUDGET_USD:-}"
 # Code-owned conservative ceiling: 3 USD/hour times (12h train + 4h gate +
 # 8h harvest) = 72 USD. The live provider preflight must not exceed 3 USD/h.
 readonly PROVIDER_HOURLY_CEILING_USD=3
@@ -94,6 +97,11 @@ ACTIVE_LIFECYCLE_ROOT=""
 CONTROLLER_LOCK_FD=""
 CONTROLLER_LOCK_PATH=""
 PRESTART_ADMITTED_STAGE=""
+# This is intentionally process-local.  Reconciliation has just verified and
+# host-sealed the remote chain in this lifecycle child; consuming it once avoids
+# immediately repeating the same expensive walk.  A new boot/process starts at
+# zero and must authenticate the remote chain again.
+RECONCILED_TRAINING_CHAIN=0
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
 require_abs_dir() { [[ "$1" == /* && "$1" != *".."* && -d "$1" && ! -L "$1" ]] || fail "$2 is unavailable or unsafe"; }
@@ -562,15 +570,31 @@ wait_for_ssh_readiness() {
 }
 approved_window_deadline() {
   # Explicitly selected supplementary approval; never modify historical receipts.
-  case "$(host_next_unfinished_stage)" in
+  local next_stage
+  next_stage="$(host_next_unfinished_stage)"
+  case "$next_stage" in
     focused_gate|harvest) ;;
     *) fail "approved evaluation window requires completed training" ;;
   esac
-  python3 - "$APPROVED_WINDOW" "$DEADLINE_RECEIPT" "$PLAN_RECEIPT" "$RUN_ID" "$MAX_BUDGET_USD" <<'PY'
+  if [[ -n "$APPROVED_BUDGET_USD" && "$next_stage" != focused_gate ]]; then
+    fail "supplementary approved budget is limited to the evaluation gate"
+  fi
+  python3 - "$APPROVED_WINDOW" "$DEADLINE_RECEIPT" "$PLAN_RECEIPT" "$RUN_ID" "$MAX_BUDGET_USD" "$APPROVED_BUDGET_USD" <<'PY'
 import hashlib, json, math, stat, sys, time
 from pathlib import Path
 approval, historical, plan = map(Path, sys.argv[1:4])
-run_id, budget = sys.argv[4], float(sys.argv[5])
+run_id, historical_budget, supplementary_budget = sys.argv[4], float(sys.argv[5]), sys.argv[6]
+if not math.isfinite(historical_budget) or not 0 < historical_budget <= 100:
+    raise SystemExit('historical lifecycle budget is invalid')
+if supplementary_budget:
+    budget = float(supplementary_budget)
+    # The explicit waiver only admits one bounded, four-hour evaluation
+    # window. It cannot convert a historical 100 USD plan into an arbitrary
+    # unlimited budget.
+    if not math.isfinite(budget) or not historical_budget < budget <= historical_budget + 12:
+        raise SystemExit('supplementary approved budget is invalid')
+else:
+    budget = historical_budget
 def read(path):
     metadata = path.lstat()
     if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o444:
@@ -589,7 +613,7 @@ expected_keys = {'run_id', 'started_unix_seconds', 'deadline_unix_seconds', 'bud
                  'prior_reserved_usd', 'hourly_ceiling_usd', 'new_window_max_usd', 'authorization'}
 start, end = value.get('started_unix_seconds'), value.get('deadline_unix_seconds')
 if (set(value) != expected_keys or value['run_id'] != run_id
-        or not math.isfinite(budget) or not 0 < budget <= 100
+        or not math.isfinite(budget) or not 0 < budget <= historical_budget + 12
         or value['budget_usd'] != budget
         or type(value['prior_reserved_usd']) not in (int, float)
         or not 72 <= value['prior_reserved_usd'] <= budget
@@ -1332,6 +1356,7 @@ PY
 
 reconcile_remote_stage_seals() {
   local training_identity=0 training_publication=0 focused=0
+  RECONCILED_TRAINING_CHAIN=0
   remote_file_exists "$TRAINING_IDENTITY_RECEIPT" && training_identity=1
   remote_file_exists "$TRAINING_PUBLICATION_RECEIPT" && training_publication=1
   (( training_publication == 0 || training_identity == 1 )) \
@@ -1342,6 +1367,7 @@ reconcile_remote_stage_seals() {
       verify_remote_training_publication || fail "remote training publication is invalid"
       record_host_stage_completion training "$HOST_TRAINING_STAGE_RECEIPT" \
         "$TRAINING_IDENTITY_RECEIPT" "$TRAINING_PUBLICATION_RECEIPT"
+      RECONCILED_TRAINING_CHAIN=1
     elif [[ -e "$HOST_TRAINING_STAGE_RECEIPT" || -L "$HOST_TRAINING_STAGE_RECEIPT" ]]; then
       fail "host training completion seal lacks verified publication"
     fi
@@ -2990,11 +3016,19 @@ run_pipeline_after_runtime() {
       run_paid_stage train "$TRAIN_TIMEOUT_SECONDS" train_stage
     fi
   fi
-  verify_remote_training_chain || fail "training receipt chain failed"
-  if ! remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; then publish_training_readback || fail "training publication/readback failed"; fi
-  verify_remote_training_publication || fail "training publication chain failed"
-  record_host_stage_completion training "$HOST_TRAINING_STAGE_RECEIPT" \
-    "$TRAINING_IDENTITY_RECEIPT" "$TRAINING_PUBLICATION_RECEIPT"
+  if [[ "$RECONCILED_TRAINING_CHAIN" == 1 ]]; then
+    # `reconcile_remote_stage_seals` authenticated both receipts and then
+    # re-fetched their exact bytes into the immutable host seal in this same
+    # lifecycle child. Consume that result once only; this variable is never
+    # persisted and a subsequent invocation must verify remotely again.
+    RECONCILED_TRAINING_CHAIN=0
+  else
+    verify_remote_training_chain || fail "training receipt chain failed"
+    if ! remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; then publish_training_readback || fail "training publication/readback failed"; fi
+    verify_remote_training_publication || fail "training publication chain failed"
+    record_host_stage_completion training "$HOST_TRAINING_STAGE_RECEIPT" \
+      "$TRAINING_IDENTITY_RECEIPT" "$TRAINING_PUBLICATION_RECEIPT"
+  fi
   advance_paid_stage_admission_from_host_seals training
   if [[ "$ALL_CATEGORY_EVAL" == 1 ]]; then
     # Explicit all-category admission replaces the historical focused gate for
