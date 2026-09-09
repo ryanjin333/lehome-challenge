@@ -541,6 +541,11 @@ def metadata_identities(metadata_root: Path) -> dict[str, object]:
         if category_root.is_symlink() or not category_root.is_dir():
             raise ComparisonError(f"authenticated category metadata is unavailable: {category}")
         category_digests[category] = _tree_sha256(category_root)
+        for path in category_root.rglob("*"):
+            if path.is_file():
+                with path.open("rb") as stream:
+                    if stream.read(128).startswith(b"version https://git-lfs.github.com/spec/v1"):
+                        raise ComparisonError(f"unhydrated Git LFS metadata: {path}")
     return {
         "tree_sha256": _tree_sha256(root),
         "category_tree_sha256": category_digests,

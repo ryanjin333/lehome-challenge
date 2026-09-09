@@ -1010,6 +1010,18 @@ def test_metadata_identity_binds_each_category_root(tmp_path: Path) -> None:
     assert len(set(identity["category_tree_sha256"].values())) == 4
 
 
+def test_metadata_identity_rejects_unhydrated_lfs(tmp_path: Path) -> None:
+    for category in CATEGORIES:
+        root = tmp_path / f"{category}_merged" / "meta"
+        root.mkdir(parents=True)
+        (root / "tasks.parquet").write_text(
+            "version https://git-lfs.github.com/spec/v1\n"
+            + "oid sha256:" + "a" * 64 + "\nsize 2241\n"
+        )
+    with pytest.raises(ComparisonError, match="unhydrated Git LFS"):
+        metadata_identities(tmp_path)
+
+
 def _valid_smoke_receipt() -> dict[str, object]:
     return {
         "kind": "lehome_official_policy_comparison_v1",
