@@ -583,13 +583,15 @@ expected_keys = {'run_id', 'started_unix_seconds', 'deadline_unix_seconds', 'bud
 start, end = value.get('started_unix_seconds'), value.get('deadline_unix_seconds')
 if (set(value) != expected_keys or value['run_id'] != run_id
         or not math.isfinite(budget) or not 0 < budget <= 100
-        or value['budget_usd'] != budget or value['prior_reserved_usd'] != 72
+        or value['budget_usd'] != budget
+        or type(value['prior_reserved_usd']) not in (int, float)
+        or not 72 <= value['prior_reserved_usd'] <= budget
         or value['hourly_ceiling_usd'] != 3
         or type(start) is not int or type(end) is not int
         or not 0 < end - start <= 14400 or not old['deadline_unix_seconds'] <= start
         or not start <= time.time() < end
         or value['new_window_max_usd'] != 3 * (end - start) / 3600
-        or 72 + value['new_window_max_usd'] > budget
+        or value['prior_reserved_usd'] + value['new_window_max_usd'] > budget
         or not isinstance(value['authorization'], str) or not value['authorization'].strip()):
     raise SystemExit('approved evaluation window is invalid or expired')
 print(end)

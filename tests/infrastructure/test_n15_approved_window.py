@@ -63,6 +63,16 @@ def test_invalid_approval_rejected(tmp_path, override):
     assert result.returncode != 0
 
 
+def test_renewal_carries_forward_prior_reservation(tmp_path):
+    result, _ = run_window(tmp_path, {'prior_reserved_usd': 84})
+    assert result.returncode == 0, result.stderr
+
+
+def test_renewal_rejects_total_over_cap(tmp_path):
+    result, _ = run_window(tmp_path, {'prior_reserved_usd': 96})
+    assert result.returncode != 0
+
+
 def test_extension_cannot_restart_training(tmp_path):
     result, _ = run_window(tmp_path, stage='train')
     assert result.returncode != 0
